@@ -37,7 +37,7 @@ Security hardening release driven by the v1.0.0 code review.
 - `docker events` stream reconnects with backoff; `merge` aligns with the daemon on corrupt committed profiles (error, not silent skip) (review #16).
 - Kernel requirement raised to **5.19+** with an explicit startup check (the `cgroup_mkdir` tracepoint id is truncated to 32-bit before v5.19 and cannot be correlated).
 - Shared-runner hygiene (review #20): containers are profiled only from profiler start by default (`include-preexisting` opt-in, flagged partial); `compose-project` filter; ephemeral Docker event attributes no longer leak into labels/artifacts.
-- Demo media removed from the repository (review #19) — assets live on the GitHub Releases page.
+- Demo media removed entirely — the project carries no bundled media (review #19).
 - Markdown summary escapes label/image/reason content; `downloadFile` has timeouts and a redirect cap; batched `docker inspect`; control connections carry read deadlines; `sha256:`-only image names fall back to the container ID; Windows-only test transport isolated behind build tags; `statInode` uses `syscall.Stat_t` on Linux; action code de-duplicated into `action/lib.js`; fuzz tests for the approvals parser, glob matcher and event decoder.
 
 ## 1.0.0

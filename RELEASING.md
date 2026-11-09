@@ -10,7 +10,7 @@ The release flow is intentionally rigid: published assets are never overwritten,
    - `Makefile` `VERSION ?=`,
    - `CHANGELOG.md` section header (replace "unreleased").
 3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `Release` workflow runs unit tests, builds both architectures with pinned `clang-18`, signs with Cosign keyless OIDC, and publishes the release. It refuses to run for anything but tag pushes and refuses to overwrite an existing release.
-4. Copy the demo media (`docs/demo.mp4`, `demo.gif`, `demo-poster.jpg` — untracked by git) onto the release as assets.
+4. (Optional) publish the new version to the GitHub Actions Marketplace from the release page.
 
 ## Re-pin the action
 

@@ -2,7 +2,6 @@
 
 This document describes the internal architecture, kernel eBPF tracing pipeline, layered profile composition, semantic diff engine, and supply-chain verification model of `seccomp-profiler`.
 
-The demo poster/video live on the [GitHub Releases page](https://github.com/alexno10/seccomp-profiler/releases) (kept out of the repository so action runners download only source).
 
 ---
 
@@ -180,4 +179,3 @@ Unapproved syscalls that violate `fail-on` (`high-risk` or `any-new`) fail the C
 - `accepted.yml` is parsed by a deliberately minimal YAML subset (flat `accepted:` list). Nested anchors are rejected as unknown keys rather than silently ignored.
 - Runtime auto-detection for Go recognizes the `go` tool and `golang`-derived image names; statically compiled Go binaries are not recognized by filename.
 - The `tcp://` control endpoint has no authentication; it is intended for local testing. The default is a root-only unix socket.
-- Media/demo assets live in GitHub Releases, not the repository.

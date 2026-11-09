@@ -9,8 +9,3 @@ dist/
 *.so
 spec.md
 plan.md
-
-# Large demo media live in GitHub Releases, not in the repo (action runners download the full tarball for every uses:).
-docs/*.mp4
-docs/*.gif
-docs/*.jpg
