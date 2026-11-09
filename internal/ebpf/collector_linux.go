@@ -75,6 +75,8 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 		return nil
 	}
 
+	// Core hooks: without these the profiler cannot observe containers at
+	// all — a failure here is fatal.
 	if err := attach("cgroup", "cgroup_mkdir", mkdirProg); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -83,17 +85,24 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 		_ = c.Close()
 		return nil, err
 	}
-	if err := attach("sched", "sched_process_fork", forkProg); err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	if err := attach("syscalls", "sys_enter_execve", execEnterProg); err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	if err := attach("syscalls", "sys_enter_execveat", execEnterAtProg); err != nil {
-		_ = c.Close()
-		return nil, err
+
+	// Suppression-refinement hooks are best-effort: if a kernel refuses to
+	// link one of them, runtime setup syscalls of secondary "docker exec"
+	// workloads may be recorded (over-permissive profiles, never
+	// under-recording), which the summary reveals. Losing the daemon over
+	// a kernel quirk would be strictly worse.
+	for _, h := range []struct {
+		cat  string
+		name string
+		prog *cebpf.Program
+	}{
+		{"sched", "sched_process_fork", forkProg},
+		{"syscalls", "sys_enter_execve", execEnterProg},
+		{"syscalls", "sys_enter_execveat", execEnterAtProg},
+	} {
+		if err := attach(h.cat, h.name, h.prog); err != nil {
+			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: %v; runtime-suppression degraded: secondary docker exec setup syscalls may be recorded\n", err)
+		}
 	}
 
 	l3, err := link.AttachRawTracepoint(link.RawTracepointOptions{

@@ -150,14 +150,6 @@ struct trace_event_raw_sched_process_exec {
 	int old_pid;
 };
 
-struct trace_event_raw_sched_process_fork {
-	__u64 unused;
-	char parent_comm[16];
-	int parent_pid;
-	char child_comm[16];
-	int child_pid;
-};
-
 struct trace_event_raw_sys_enter {
 	__u64 unused;
 	long id;
@@ -333,14 +325,27 @@ int handle_cgroup_mkdir(struct trace_event_raw_cgroup_mkdir *ctx) {
 // Children forked by runc/crun are pre-marked so their pre-first-exec setup
 // syscalls (setns, mount, ...) inside an already-active container cgroup are
 // suppressed. The marker is cleared as soon as the child execs the workload.
+//
+// The child pid is read with bpf_probe_read_kernel instead of a direct ctx
+// access on purpose: sched_process_fork carries no dynamic data, so the
+// kernel's tracepoint-link check
+//   perf_event_set_bpf_prog(): max_ctx_offset > trace_event_get_offsets()
+// rejects ANY direct ctx read with a misleading EPERM on kernels that ship
+// it (6.8+). A probe read keeps max_ctx_offset at 0. Layout (stable across
+// 5.15..master): common(8) parent_comm[16] parent_pid child_comm[16]
+// child_pid@44.
 SEC("tracepoint/sched/sched_process_fork")
-int handle_sched_process_fork(struct trace_event_raw_sched_process_fork *ctx) {
+int handle_sched_process_fork(void *ctx) {
 	char comm[16] = {};
 	bpf_get_current_comm(comm, sizeof(comm));
 	if (!is_runtime_comm(comm)) {
 		return 0;
 	}
-	__u32 child_tid = (__u32)ctx->child_pid;
+	__s32 child_pid = 0;
+	if (bpf_probe_read_kernel(&child_pid, sizeof(child_pid), (const char *)ctx + 44) != 0) {
+		return 0;
+	}
+	__u32 child_tid = (__u32)child_pid;
 	if (child_tid == 0) {
 		return 0;
 	}
