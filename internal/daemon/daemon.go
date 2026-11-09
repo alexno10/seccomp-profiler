@@ -30,10 +30,15 @@ type Config struct {
 	RawDir            string
 	LockFile          string
 	CommittedProfile  string
+	WorkingCommitted  string
+	WorkingAllowFile  string
 	AllowFile         string
 	Targets           string
 	GroupBy           string
 	ExcludeImages     []string
+	ComposeProject    string
+	IncludePreexist   bool
+	Prune             bool
 	BaselineMode      baseline.Mode
 	RuntimeMode       string
 	ExtraAllow        []string
@@ -41,6 +46,7 @@ type Config struct {
 	FailOn            string
 	Arch              syscalls.Arch
 	Kernel            string
+	GeneratorVersion  string
 }
 
 type StopResponse struct {
@@ -55,6 +61,58 @@ type StopResponse struct {
 	MarkdownSummary  string `json:"markdownSummary"`
 }
 
+// ValidateConfig fails fast on invalid inputs instead of misbehaving after
+// the whole test suite has run (e.g. a "standrad" baseline typo silently
+// behaves like "none" and produces an over-strict profile).
+func ValidateConfig(cfg Config) error {
+	switch strings.ToLower(strings.TrimSpace(string(cfg.BaselineMode))) {
+	case "", "none", "minimal", "standard":
+	default:
+		return fmt.Errorf("invalid baseline mode %q: must be none, minimal, or standard", cfg.BaselineMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.RuntimeMode)) {
+	case "", "auto", "none", "go", "node", "python", "java":
+	default:
+		return fmt.Errorf("invalid runtime mode %q: must be auto, none, go, node, python, or java", cfg.RuntimeMode)
+	}
+	oc := strings.ToLower(strings.TrimSpace(cfg.OnChange))
+	if oc != "" && oc != "report" && oc != "fail" && oc != "update-pr" {
+		return fmt.Errorf("invalid on-change %q: must be report, fail, or update-pr", cfg.OnChange)
+	}
+	fo := strings.ToLower(strings.TrimSpace(cfg.FailOn))
+	if fo != "" && fo != "none" && fo != "high-risk" && fo != "any-new" {
+		return fmt.Errorf("invalid fail-on %q: must be none, high-risk, or any-new", cfg.FailOn)
+	}
+	for _, extra := range cfg.ExtraAllow {
+		for _, tok := range strings.FieldsFunc(extra, func(r rune) bool {
+			return r == '\n' || r == '\r' || r == ',' || r == ' ' || r == '\t'
+		}) {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			if _, ok := syscalls.NumberByName(cfg.arch(), tok); !ok {
+				if _, ok := syscalls.NumberByName(syscalls.ArchAMD64, tok); !ok {
+					if _, ok := syscalls.NumberByName(syscalls.ArchARM64, tok); !ok {
+						return fmt.Errorf("unknown syscall %q in extra-allow (not present in the amd64 or arm64 table)", tok)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (c Config) arch() syscalls.Arch {
+	if c.Arch != "" {
+		return c.Arch
+	}
+	if runtime.GOARCH == "arm64" {
+		return syscalls.ArchARM64
+	}
+	return syscalls.ArchAMD64
+}
+
 type Server struct {
 	cfg        Config
 	collector  ebpf.Collector
@@ -66,10 +124,13 @@ type Server struct {
 	stopped    bool
 	cachedResp *StopResponse
 	doneCh     chan struct{}
-	eventsDone chan struct{}
+	doneOnce   sync.Once
 }
 
-func NewServer(cfg Config, collector ebpf.Collector, correlator *docker.Correlator) *Server {
+func NewServer(cfg Config, collector ebpf.Collector, correlator *docker.Correlator) (*Server, error) {
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.ControlAddr == "" {
 		cfg.ControlAddr = "/run/seccomp-profiler/ctl.sock"
 	}
@@ -104,18 +165,14 @@ func NewServer(cfg Config, collector ebpf.Collector, correlator *docker.Correlat
 		cfg.FailOn = "high-risk"
 	}
 	if cfg.Arch == "" {
-		if runtime.GOARCH == "arm64" {
-			cfg.Arch = syscalls.ArchARM64
-		} else {
-			cfg.Arch = syscalls.ArchAMD64
-		}
+		cfg.Arch = cfg.arch()
 	}
 	return &Server{
 		cfg:        cfg,
 		collector:  collector,
 		correlator: correlator,
 		doneCh:     make(chan struct{}),
-	}
+	}, nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -139,9 +196,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	if s.collector != nil {
-		s.eventsDone = make(chan struct{})
 		go func() {
-			defer close(s.eventsDone)
 			for ev := range s.collector.Events() {
 				s.correlator.RecordKernelEvent(ev)
 			}
@@ -161,11 +216,22 @@ func (s *Server) Wait() error {
 	return nil
 }
 
+func (s *Server) closeDone() {
+	s.doneOnce.Do(func() { close(s.doneCh) })
+}
+
 func (s *Server) acceptLoop(ctx context.Context) {
 	go func() {
 		select {
 		case <-ctx.Done():
+			// SIGTERM/SIGINT: fully tear down (listener, eBPF programs) so
+			// the root daemon never outlives its parent on self-hosted
+			// runners.
 			_ = s.listener.Close()
+			if s.collector != nil {
+				_ = s.collector.Close()
+			}
+			s.closeDone()
 		case <-s.doneCh:
 		}
 	}()
@@ -181,6 +247,9 @@ func (s *Server) acceptLoop(ctx context.Context) {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
+	// Untrusted/local clients must not be able to hold control connections
+	// open forever (the tcp:// control endpoint has no authentication).
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	sc := bufio.NewScanner(conn)
 	if !sc.Scan() {
 		return
@@ -199,13 +268,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			if s.collector != nil {
 				_ = s.collector.Close()
 			}
-			s.mu.Lock()
-			select {
-			case <-s.doneCh:
-			default:
-				close(s.doneCh)
-			}
-			s.mu.Unlock()
+			s.closeDone()
 		}()
 	default:
 		_, _ = fmt.Fprintf(conn, `{"ok":false,"error":"unknown command %q"}`+"\n", cmd)
@@ -221,7 +284,20 @@ func (s *Server) executeStop() *StopResponse {
 	}
 
 	var stats map[uint64]ebpf.CgroupStats
+	var kernelErrs ebpf.ErrorStats
 	if s.collector != nil {
+		// 1. Detach programs first so no new map updates race the flush.
+		_ = s.collector.Detach()
+		// 2. Let the ring buffer drain into the correlator: wait until the
+		// event channel is empty (the channel itself only closes on Close,
+		// so waiting for it would always burn the full timeout).
+		events := s.collector.Events()
+		deadline := time.Now().Add(2 * time.Second)
+		for len(events) > 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond) // grace for one event in flight
+		// 3. Snapshot the maps.
 		var err error
 		stats, err = s.collector.Flush()
 		if err != nil {
@@ -229,19 +305,17 @@ func (s *Server) executeStop() *StopResponse {
 			s.cachedResp = resp
 			return resp
 		}
-		if s.eventsDone != nil {
-			select {
-			case <-s.eventsDone:
-			case <-time.After(50 * time.Millisecond):
-			}
+		if errs, err := s.collector.ErrorStats(); err == nil {
+			kernelErrs = errs
 		}
 	}
 
 	records := s.correlator.BuildRecords(stats)
 	selCfg := selector.Config{
-		Rules:         selector.ParseTargetsInput(s.cfg.Targets),
-		GroupBy:       s.cfg.GroupBy,
-		ExtraExcludes: s.cfg.ExcludeImages,
+		Rules:          selector.ParseTargetsInput(s.cfg.Targets),
+		GroupBy:        s.cfg.GroupBy,
+		ExtraExcludes:  s.cfg.ExcludeImages,
+		ComposeProject: s.cfg.ComposeProject,
 	}
 	matchedTargets, skipped := selector.Evaluate(selCfg, records)
 
@@ -257,11 +331,12 @@ func (s *Server) executeStop() *StopResponse {
 
 	for _, t := range matchedTargets {
 		bp, err := profile.Build(t, profile.BuildOptions{
-			Arch:         s.cfg.Arch,
-			Kernel:       s.cfg.Kernel,
-			BaselineMode: s.cfg.BaselineMode,
-			RuntimeMode:  s.cfg.RuntimeMode,
-			ExtraAllow:   s.cfg.ExtraAllow,
+			Arch:             s.cfg.Arch,
+			Kernel:           s.cfg.Kernel,
+			GeneratorVersion: s.cfg.GeneratorVersion,
+			BaselineMode:     s.cfg.BaselineMode,
+			RuntimeMode:      s.cfg.RuntimeMode,
+			ExtraAllow:       s.cfg.ExtraAllow,
 		})
 		if err != nil {
 			resp := &StopResponse{OK: false, Error: err.Error()}
@@ -304,8 +379,15 @@ func (s *Server) executeStop() *StopResponse {
 				highRiskCount++
 			}
 		}
-		// Never auto-remove syscalls or args rules present in the committed baseline.
-		profile.MergeCommittedIntoOCI(&bp.OCI, committed)
+		for _, e := range td.Escalated {
+			if !e.Approved {
+				highRiskCount++
+			}
+		}
+		if !s.cfg.Prune {
+			// Never auto-remove syscalls or args rules present in the committed baseline.
+			profile.MergeCommittedIntoOCI(&bp.OCI, committed)
+		}
 	}
 
 	writeResults, err := profile.WriteTargetFiles(s.cfg.OutputDir, s.cfg.RawDir, s.cfg.LockFile, builtProfiles)
@@ -315,6 +397,16 @@ func (s *Server) executeStop() *StopResponse {
 		return resp
 	}
 
+	var updatedPaths []string
+	if strings.EqualFold(strings.TrimSpace(s.cfg.OnChange), "update-pr") && s.cfg.WorkingCommitted != "" {
+		updatedPaths, err = profile.UpdateCommittedProfiles(s.cfg.WorkingCommitted, s.cfg.LockFile, builtProfiles)
+		if err != nil {
+			resp := &StopResponse{OK: false, Error: fmt.Sprintf("update committed profiles: %v", err)}
+			s.cachedResp = resp
+			return resp
+		}
+	}
+
 	gatePassed, gateReason, err := diff.EvaluateGate(diffs, s.cfg.OnChange, s.cfg.FailOn)
 	if err != nil {
 		resp := &StopResponse{OK: false, Error: err.Error(), GatePassed: false}
@@ -322,11 +414,40 @@ func (s *Server) executeStop() *StopResponse {
 		return resp
 	}
 
+	// Baseline drift: committed profile / approvals changed inside this PR
+	// (read from the pristine baseline ref). Report, never silently pass.
+	var driftNotes []string
+	if s.cfg.WorkingCommitted != "" && s.cfg.WorkingCommitted != s.cfg.CommittedProfile {
+		for _, bp := range builtProfiles {
+			base := diff.ResolveCommittedProfilePath(s.cfg.CommittedProfile, bp.TargetName, len(matchedTargets))
+			work := diff.ResolveCommittedProfilePath(s.cfg.WorkingCommitted, bp.TargetName, len(matchedTargets))
+			if base != "" && work != "" && diff.FileChanged(base, work) {
+				driftNotes = append(driftNotes, fmt.Sprintf("committed profile `%s` differs from `%s` in this PR — review carefully (CODEOWNERS + branch protection recommended)", work, base))
+			}
+		}
+	}
+	if s.cfg.WorkingAllowFile != "" && s.cfg.WorkingAllowFile != s.cfg.AllowFile && diff.FileChanged(s.cfg.AllowFile, s.cfg.WorkingAllowFile) {
+		driftNotes = append(driftNotes, fmt.Sprintf("syscall approvals file `%s` differs from `%s` in this PR — review carefully", s.cfg.WorkingAllowFile, s.cfg.AllowFile))
+	}
+
+	if kernelErrs.Any() {
+		summary := fmt.Sprintf("kernel error counters non-zero (%s): some containers or syscalls were not recorded, the generated profile may be incomplete", kernelErrs.String())
+		if s.cfg.FailOn != "none" {
+			gatePassed = false
+			gateReason = summary
+		}
+		driftNotes = append(driftNotes, summary)
+	}
+
 	md := report.RenderMarkdown(report.SummaryInput{
 		Profiles:     builtProfiles,
 		WriteResults: writeResults,
 		Diffs:        diffs,
 		Skipped:      skipped,
+		DriftNotes:   driftNotes,
+		UpdatedPaths: updatedPaths,
+		KernelErrors: kernelErrs,
+		Prune:        s.cfg.Prune,
 		GatePassed:   gatePassed,
 		GateReason:   gateReason,
 	})
@@ -420,80 +541,4 @@ func parseControlAddr(addr string) (string, string) {
 		return "tcp", strings.TrimPrefix(addr, "tcp://")
 	}
 	return "unix", strings.TrimPrefix(addr, "unix://")
-}
-
-var (
-	inprocMu        sync.Mutex
-	inprocListeners = make(map[string]*pipeListener)
-)
-
-type pipeAddr string
-
-func (p pipeAddr) Network() string { return "pipe" }
-func (p pipeAddr) String() string  { return string(p) }
-
-type pipeListener struct {
-	addr   string
-	ch     chan net.Conn
-	closed chan struct{}
-	once   sync.Once
-}
-
-func (l *pipeListener) Accept() (net.Conn, error) {
-	select {
-	case c := <-l.ch:
-		return c, nil
-	case <-l.closed:
-		return nil, net.ErrClosed
-	}
-}
-
-func (l *pipeListener) Close() error {
-	l.once.Do(func() {
-		close(l.closed)
-		inprocMu.Lock()
-		delete(inprocListeners, l.addr)
-		inprocMu.Unlock()
-	})
-	return nil
-}
-
-func (l *pipeListener) Addr() net.Addr { return pipeAddr(l.addr) }
-
-func listenControl(network, address string) (net.Listener, error) {
-	ln, err := net.Listen(network, address)
-	if err == nil {
-		return ln, nil
-	}
-	if runtime.GOOS != "windows" {
-		return nil, err
-	}
-	// Fallback to in-process net.Pipe listener when Windows AppContainer sandbox blocks WinSock creation.
-	pl := &pipeListener{
-		addr:   address,
-		ch:     make(chan net.Conn, 16),
-		closed: make(chan struct{}),
-	}
-	inprocMu.Lock()
-	inprocListeners[address] = pl
-	inprocMu.Unlock()
-	return pl, nil
-}
-
-func dialControl(network, address string, timeout time.Duration) (net.Conn, error) {
-	inprocMu.Lock()
-	pl, ok := inprocListeners[address]
-	inprocMu.Unlock()
-	if ok {
-		c1, c2 := net.Pipe()
-		select {
-		case pl.ch <- c1:
-			return c2, nil
-		case <-pl.closed:
-			_ = c1.Close()
-			_ = c2.Close()
-			return nil, net.ErrClosed
-		}
-	}
-	return net.DialTimeout(network, address, timeout)
 }

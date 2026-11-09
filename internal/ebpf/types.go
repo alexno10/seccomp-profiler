@@ -17,6 +17,24 @@ type CgroupStats struct {
 	Pad         uint32
 }
 
+// ErrorStats mirrors the kernel-side error counters map. Any non-zero value
+// means the profiler silently lost visibility (full map, dropped ring buffer
+// event, or an out-of-range syscall id) and the resulting profile may be
+// incomplete.
+type ErrorStats struct {
+	CgroupMapFull uint64 `json:"cgroupMapFull"`
+	RingbufDrops  uint64 `json:"ringbufDrops"`
+	OobSyscalls   uint64 `json:"oobSyscalls"`
+}
+
+func (e ErrorStats) Any() bool {
+	return e.CgroupMapFull > 0 || e.RingbufDrops > 0 || e.OobSyscalls > 0
+}
+
+func (e ErrorStats) String() string {
+	return fmt.Sprintf("cgroupMapFull=%d ringbufDrops=%d oobSyscalls=%d", e.CgroupMapFull, e.RingbufDrops, e.OobSyscalls)
+}
+
 type KernelEvent struct {
 	Type         uint32
 	CgroupID     uint64
@@ -28,6 +46,16 @@ type Collector interface {
 	TrackCgroup(cgroupID uint64) error
 	Events() <-chan KernelEvent
 	Flush() (map[uint64]CgroupStats, error)
+	// FlushCgroup reads a single cgroup's stats without deleting them.
+	FlushCgroup(cgroupID uint64) (CgroupStats, bool, error)
+	// DeleteCgroup removes a cgroup's stats and candidate entries from the
+	// kernel maps (called when the container dies to keep the maps bounded).
+	DeleteCgroup(cgroupID uint64) error
+	// ErrorStats reads the kernel error counters.
+	ErrorStats() (ErrorStats, error)
+	// Detach unhooks the BPF programs so no new events/stat updates occur
+	// before Flush. Close still releases everything.
+	Detach() error
 	Close() error
 }
 

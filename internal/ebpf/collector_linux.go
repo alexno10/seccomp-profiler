@@ -16,11 +16,12 @@ import (
 )
 
 type linuxCollector struct {
-	coll      *cebpf.Collection
-	links     []link.Link
-	rbReader  *ringbuf.Reader
-	eventsCh  chan KernelEvent
-	doneCh    chan struct{}
+	coll     *cebpf.Collection
+	links    []link.Link
+	rbReader *ringbuf.Reader
+	eventsCh chan KernelEvent
+	doneCh   chan struct{}
+	detached bool
 }
 
 func NewCollector(bpfObjPath string) (Collector, error) {
@@ -56,24 +57,44 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 	mkdirProg := coll.Programs["handle_cgroup_mkdir"]
 	execProg := coll.Programs["handle_sched_process_exec"]
 	sysEnterProg := coll.Programs["handle_sys_enter"]
-	if mkdirProg == nil || execProg == nil || sysEnterProg == nil {
+	execEnterProg := coll.Programs["handle_sys_enter_execve"]
+	execEnterAtProg := coll.Programs["handle_sys_enter_execveat"]
+	forkProg := coll.Programs["handle_sched_process_fork"]
+	if mkdirProg == nil || execProg == nil || sysEnterProg == nil ||
+		execEnterProg == nil || execEnterAtProg == nil || forkProg == nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("missing required BPF programs in %q", objPath)
 	}
 
-	l1, err := link.Tracepoint("cgroup", "cgroup_mkdir", mkdirProg, nil)
-	if err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("attach tracepoint/cgroup/cgroup_mkdir: %w", err)
+	attach := func(cat, name string, prog *cebpf.Program) error {
+		l, err := link.Tracepoint(cat, name, prog, nil)
+		if err != nil {
+			return fmt.Errorf("attach tracepoint/%s/%s: %w", cat, name, err)
+		}
+		c.links = append(c.links, l)
+		return nil
 	}
-	c.links = append(c.links, l1)
 
-	l2, err := link.Tracepoint("sched", "sched_process_exec", execProg, nil)
-	if err != nil {
+	if err := attach("cgroup", "cgroup_mkdir", mkdirProg); err != nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("attach tracepoint/sched/sched_process_exec: %w", err)
+		return nil, err
 	}
-	c.links = append(c.links, l2)
+	if err := attach("sched", "sched_process_exec", execProg); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := attach("sched", "sched_process_fork", forkProg); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := attach("syscalls", "sys_enter_execve", execEnterProg); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := attach("syscalls", "sys_enter_execveat", execEnterAtProg); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 
 	l3, err := link.AttachRawTracepoint(link.RawTracepointOptions{
 		Name:    "sys_enter",
@@ -158,6 +179,62 @@ func (c *linuxCollector) Flush() (map[uint64]CgroupStats, error) {
 	return out, nil
 }
 
+func (c *linuxCollector) FlushCgroup(cgroupID uint64) (CgroupStats, bool, error) {
+	m := c.coll.Maps["syscalls_per_cgroup"]
+	if m == nil {
+		return CgroupStats{}, false, fmt.Errorf("syscalls_per_cgroup map not found")
+	}
+	var val CgroupStats
+	if err := m.Lookup(&cgroupID, &val); err != nil {
+		if errors.Is(err, cebpf.ErrKeyNotExist) {
+			return CgroupStats{}, false, nil
+		}
+		return CgroupStats{}, false, err
+	}
+	return val, true, nil
+}
+
+func (c *linuxCollector) DeleteCgroup(cgroupID uint64) error {
+	stats := c.coll.Maps["syscalls_per_cgroup"]
+	candidates := c.coll.Maps["candidate_cgroups"]
+	if stats == nil || candidates == nil {
+		return fmt.Errorf("BPF maps not found")
+	}
+	_ = stats.Delete(&cgroupID)
+	_ = candidates.Delete(&cgroupID)
+	return nil
+}
+
+func (c *linuxCollector) ErrorStats() (ErrorStats, error) {
+	m := c.coll.Maps["error_stats"]
+	if m == nil {
+		return ErrorStats{}, fmt.Errorf("error_stats map not found")
+	}
+	var key uint32 = 0
+	var val ErrorStats
+	if err := m.Lookup(&key, &val); err != nil {
+		if errors.Is(err, cebpf.ErrKeyNotExist) {
+			return ErrorStats{}, nil
+		}
+		return ErrorStats{}, err
+	}
+	return val, nil
+}
+
+// Detach unhooks all BPF programs (idempotent). After Detach no new map
+// updates or events are produced, so Flush sees a stable snapshot.
+func (c *linuxCollector) Detach() error {
+	if c.detached {
+		return nil
+	}
+	c.detached = true
+	for _, l := range c.links {
+		_ = l.Close()
+	}
+	c.links = nil
+	return nil
+}
+
 func (c *linuxCollector) Close() error {
 	select {
 	case <-c.doneCh:
@@ -167,9 +244,7 @@ func (c *linuxCollector) Close() error {
 	if c.rbReader != nil {
 		_ = c.rbReader.Close()
 	}
-	for _, l := range c.links {
-		_ = l.Close()
-	}
+	_ = c.Detach()
 	if c.coll != nil {
 		c.coll.Close()
 	}

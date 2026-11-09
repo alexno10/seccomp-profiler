@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -22,24 +21,37 @@ import (
 
 var hex64Regex = regexp.MustCompile(`[0-9a-f]{64}`)
 
+// ephemeralEventAttrs are Docker event Actor attributes that describe the
+// event rather than the container (exitCode, execID, ...). They must not leak
+// into labels, raw artifacts, or target selection.
+var ephemeralEventAttrs = map[string]bool{
+	"exitCode":     true,
+	"execID":       true,
+	"execDuration": true,
+	"signal":       true,
+	"status":       true,
+}
+
 type DockerEvent struct {
-	Action   string
-	ID       string
-	Image    string
-	Name     string
-	Labels   map[string]string
-	TimeNano int64
+	Action      string
+	ID          string
+	Image       string
+	Name        string
+	Labels      map[string]string
+	TimeNano    int64
+	Preexisting bool
 }
 
 type InodeResolver func(containerID string) (uint64, error)
 
 type containerMeta struct {
-	id        string
-	name      string
-	image     string
-	labels    map[string]string
-	startNano int64
-	endNano   int64
+	id          string
+	name        string
+	image       string
+	labels      map[string]string
+	startNano   int64
+	endNano     int64
+	preexisting bool
 }
 
 type Correlator struct {
@@ -47,7 +59,9 @@ type Correlator struct {
 	resolver     InodeResolver
 	containers   map[string]*containerMeta
 	cgroupToCID  map[uint64]string
+	cidToCgroups map[string][]uint64
 	cgroupBins   map[uint64][]string
+	deadStats    map[uint64]ebpf.CgroupStats
 }
 
 func NewCorrelator(resolver InodeResolver) *Correlator {
@@ -55,10 +69,12 @@ func NewCorrelator(resolver InodeResolver) *Correlator {
 		resolver = DefaultResolveContainerCgroupInode
 	}
 	return &Correlator{
-		resolver:    resolver,
-		containers:  make(map[string]*containerMeta),
-		cgroupToCID: make(map[uint64]string),
-		cgroupBins:  make(map[uint64][]string),
+		resolver:     resolver,
+		containers:   make(map[string]*containerMeta),
+		cgroupToCID:  make(map[uint64]string),
+		cidToCgroups: make(map[string][]uint64),
+		cgroupBins:   make(map[uint64][]string),
+		deadStats:    make(map[uint64]ebpf.CgroupStats),
 	}
 }
 
@@ -85,6 +101,9 @@ func (c *Correlator) RecordDockerEvent(ev DockerEvent) {
 		}
 		c.containers[ev.ID] = meta
 	}
+	if ev.Preexisting {
+		meta.preexisting = true
+	}
 	if ev.Image != "" {
 		meta.image = ev.Image
 	}
@@ -92,6 +111,9 @@ func (c *Correlator) RecordDockerEvent(ev DockerEvent) {
 		meta.name = ev.Name
 	}
 	for k, v := range ev.Labels {
+		if ephemeralEventAttrs[k] {
+			continue
+		}
 		if k == "image" && meta.image == "" {
 			meta.image = v
 			continue
@@ -108,8 +130,11 @@ func (c *Correlator) RecordDockerEvent(ev DockerEvent) {
 			meta.startNano = ev.TimeNano
 		}
 	case "start":
+		// Reset endNano on (re)start so a restarted container gets a correct
+		// duration instead of start > end.
 		if ev.TimeNano > 0 {
 			meta.startNano = ev.TimeNano
+			meta.endNano = 0
 		}
 		resolveID = ev.ID
 	case "die", "stop", "destroy":
@@ -121,9 +146,7 @@ func (c *Correlator) RecordDockerEvent(ev DockerEvent) {
 
 	if resolveID != "" && c.resolver != nil {
 		if ino, err := c.resolver(resolveID); err == nil && ino != 0 {
-			c.mu.Lock()
-			c.cgroupToCID[ino] = resolveID
-			c.mu.Unlock()
+			c.BindCgroup(ino, resolveID)
 		}
 	}
 }
@@ -134,7 +157,39 @@ func (c *Correlator) BindCgroup(cgroupID uint64, containerID string) {
 	}
 	c.mu.Lock()
 	c.cgroupToCID[cgroupID] = containerID
+	c.cidToCgroups[containerID] = appendIfMissing(c.cidToCgroups[containerID], cgroupID)
 	c.mu.Unlock()
+}
+
+// CgroupsForContainer returns all cgroup inodes bound to a container so the
+// daemon can drain and delete their BPF map entries when the container dies.
+func (c *Correlator) CgroupsForContainer(containerID string) []uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]uint64, len(c.cidToCgroups[containerID]))
+	copy(out, c.cidToCgroups[containerID])
+	return out
+}
+
+// RecordDeadStats stores a final snapshot of a cgroup's syscall counters. The
+// daemon flushes and deletes the BPF map entry when a container dies; without
+// this the stats would be lost before Stop.
+func (c *Correlator) RecordDeadStats(cgroupID uint64, stats ebpf.CgroupStats) {
+	if cgroupID == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadStats[cgroupID] = stats
+}
+
+// DrainDeadStats returns and clears all accumulated dead-cgroup stats.
+func (c *Correlator) DrainDeadStats() map[uint64]ebpf.CgroupStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.deadStats
+	c.deadStats = make(map[uint64]ebpf.CgroupStats)
+	return out
 }
 
 func (c *Correlator) RecordKernelEvent(ev ebpf.KernelEvent) {
@@ -144,6 +199,7 @@ func (c *Correlator) RecordKernelEvent(ev ebpf.KernelEvent) {
 	if ev.CgroupPath != "" {
 		if cid, ok := ExtractContainerID(ev.CgroupPath); ok {
 			c.cgroupToCID[ev.CgroupID] = cid
+			c.cidToCgroups[cid] = appendIfMissing(c.cidToCgroups[cid], ev.CgroupID)
 		}
 	}
 	if ev.ExecFilename != "" {
@@ -157,10 +213,10 @@ func (c *Correlator) BuildRecords(stats map[uint64]ebpf.CgroupStats) []selector.
 
 	byCID := make(map[string]*selector.ContainerRecord)
 
-	for cgID, st := range stats {
+	merge := func(cgID uint64, st ebpf.CgroupStats) {
 		cid := c.cgroupToCID[cgID]
 		if cid == "" {
-			continue
+			return
 		}
 		rec, ok := byCID[cid]
 		if !ok {
@@ -173,6 +229,7 @@ func (c *Correlator) BuildRecords(stats map[uint64]ebpf.CgroupStats) []selector.
 			if meta != nil {
 				rec.Name = meta.name
 				rec.Image = meta.image
+				rec.Preexisting = meta.preexisting
 				for k, v := range meta.labels {
 					rec.Labels[k] = v
 				}
@@ -181,7 +238,11 @@ func (c *Correlator) BuildRecords(stats map[uint64]ebpf.CgroupStats) []selector.
 				}
 			}
 			if rec.Image == "" {
-				rec.Image = cid[:12]
+				if len(cid) >= 12 {
+					rec.Image = cid[:12]
+				} else {
+					rec.Image = cid
+				}
 			}
 			byCID[cid] = rec
 		}
@@ -194,6 +255,17 @@ func (c *Correlator) BuildRecords(stats map[uint64]ebpf.CgroupStats) []selector.
 		}
 	}
 
+	for cgID, st := range stats {
+		merge(cgID, st)
+	}
+	// Dead containers whose BPF entries were already deleted still count.
+	for cgID, st := range c.deadStats {
+		if _, live := stats[cgID]; live {
+			continue
+		}
+		merge(cgID, st)
+	}
+
 	var out []selector.ContainerRecord
 	for _, r := range byCID {
 		out = append(out, *r)
@@ -202,6 +274,15 @@ func (c *Correlator) BuildRecords(stats map[uint64]ebpf.CgroupStats) []selector.
 		return out[i].ID < out[j].ID
 	})
 	return out
+}
+
+func appendIfMissing(list []uint64, v uint64) []uint64 {
+	for _, x := range list {
+		if x == v {
+			return list
+		}
+	}
+	return append(list, v)
 }
 
 type rawDockerEventJSON struct {
@@ -239,7 +320,7 @@ func ParseDockerEventJSON(line []byte) (DockerEvent, error) {
 	name := raw.Actor.Attributes["name"]
 	labels := make(map[string]string)
 	for k, v := range raw.Actor.Attributes {
-		if k == "image" || k == "name" {
+		if k == "image" || k == "name" || ephemeralEventAttrs[k] {
 			continue
 		}
 		labels[k] = v
@@ -275,40 +356,51 @@ func StreamDockerEvents(ctx context.Context, onEvent func(DockerEvent)) error {
 	return nil
 }
 
+// ScanRunningContainers inspects containers that are already running when the
+// profiler starts. Pre-existing containers are marked so profiles can flag
+// them as partial (their early syscalls were never observed).
 func ScanRunningContainers(ctx context.Context) ([]DockerEvent, map[string]uint64, error) {
 	out, err := exec.CommandContext(ctx, "docker", "ps", "-q", "--no-trunc").Output()
 	if err != nil {
 		return nil, nil, err
 	}
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if cid := strings.TrimSpace(line); cid != "" {
+			ids = append(ids, cid)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, map[string]uint64{}, nil
+	}
+
+	// One batched inspect instead of one docker invocation per container.
+	inspOut, err := exec.CommandContext(ctx, "docker", append([]string{"inspect"}, ids...)...).Output()
+	if err != nil {
+		return nil, nil, err
+	}
+	var inspected []struct {
+		Id     string `json:"Id"`
+		Name   string `json:"Name"`
+		Config struct {
+			Image  string            `json:"Image"`
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+	}
+	if err := json.Unmarshal(inspOut, &inspected); err != nil {
+		return nil, nil, err
+	}
+
 	var events []DockerEvent
 	inodes := make(map[string]uint64)
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		cid := strings.TrimSpace(line)
-		if cid == "" {
-			continue
-		}
-		inspOut, err := exec.CommandContext(ctx, "docker", "inspect", cid).Output()
-		if err != nil {
-			continue
-		}
-		var inspected []struct {
-			Id     string `json:"Id"`
-			Name   string `json:"Name"`
-			Config struct {
-				Image  string            `json:"Image"`
-				Labels map[string]string `json:"Labels"`
-			} `json:"Config"`
-		}
-		if err := json.Unmarshal(inspOut, &inspected); err != nil || len(inspected) == 0 {
-			continue
-		}
-		item := inspected[0]
+	for _, item := range inspected {
 		events = append(events, DockerEvent{
-			Action: "start",
-			ID:     item.Id,
-			Image:  item.Config.Image,
-			Name:   strings.TrimPrefix(item.Name, "/"),
-			Labels: item.Config.Labels,
+			Action:      "start",
+			ID:          item.Id,
+			Image:       item.Config.Image,
+			Name:        strings.TrimPrefix(item.Name, "/"),
+			Labels:      item.Config.Labels,
+			Preexisting: true,
 		})
 		if ino, err := DefaultResolveContainerCgroupInode(item.Id); err == nil && ino != 0 {
 			inodes[item.Id] = ino
@@ -349,27 +441,4 @@ func DefaultResolveContainerCgroupInode(containerID string) (uint64, error) {
 		}
 	}
 	return 0, os.ErrNotExist
-}
-
-func statInode(path string) (uint64, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	sys := fi.Sys()
-	if sys == nil {
-		return 0, fmt.Errorf("no underlying stat info for %s", path)
-	}
-	v := reflect.ValueOf(sys)
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
-	}
-	if v.Kind() != reflect.Struct {
-		return 0, fmt.Errorf("unexpected stat type for %s", path)
-	}
-	f := v.FieldByName("Ino")
-	if !f.IsValid() {
-		return 0, fmt.Errorf("no Ino field on stat for %s", path)
-	}
-	return f.Uint(), nil
 }

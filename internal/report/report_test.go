@@ -87,7 +87,7 @@ func TestRenderMarkdown(t *testing.T) {
 		"baseline-lang:go",
 		"rt_sigreturn",
 		"1/3",
-		"32-bit compatibility (TS_COMPAT) syscalls detected",
+		"32-bit compatibility syscalls detected",
 		"testcontainers/ryuk:0.5.1",
 		"excluded-default",
 		".seccomp-profiler/accepted.yml",

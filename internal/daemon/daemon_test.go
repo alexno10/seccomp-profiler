@@ -18,6 +18,7 @@ type mockCollector struct {
 	eventsCh chan ebpf.KernelEvent
 	stats    map[uint64]ebpf.CgroupStats
 	tracked  []uint64
+	errs     ebpf.ErrorStats
 }
 
 func (m *mockCollector) TrackCgroup(id uint64) error {
@@ -28,7 +29,19 @@ func (m *mockCollector) Events() <-chan ebpf.KernelEvent { return m.eventsCh }
 func (m *mockCollector) Flush() (map[uint64]ebpf.CgroupStats, error) {
 	return m.stats, nil
 }
-func (m *mockCollector) Close() error { return nil }
+func (m *mockCollector) FlushCgroup(id uint64) (ebpf.CgroupStats, bool, error) {
+	st, ok := m.stats[id]
+	return st, ok, nil
+}
+func (m *mockCollector) DeleteCgroup(id uint64) error {
+	delete(m.stats, id)
+	return nil
+}
+func (m *mockCollector) ErrorStats() (ebpf.ErrorStats, error) {
+	return m.errs, nil
+}
+func (m *mockCollector) Detach() error { return nil }
+func (m *mockCollector) Close() error  { return nil }
 
 func TestDaemonEndToEndAndIdempotentStop(t *testing.T) {
 	tmp := t.TempDir()
@@ -54,9 +67,9 @@ func TestDaemonEndToEndAndIdempotentStop(t *testing.T) {
 		Labels: map[string]string{"com.docker.compose.service": "api"},
 	})
 	corr.RecordKernelEvent(ebpf.KernelEvent{
-		Type:         ebpf.EventCgroupMkdir,
-		CgroupID:     9001,
-		CgroupPath:   "/docker/" + cid,
+		Type:       ebpf.EventCgroupMkdir,
+		CgroupID:   9001,
+		CgroupPath: "/docker/" + cid,
 	})
 	corr.RecordKernelEvent(ebpf.KernelEvent{
 		Type:         ebpf.EventExec,
@@ -82,7 +95,10 @@ func TestDaemonEndToEndAndIdempotentStop(t *testing.T) {
 		Kernel:            "6.8.0-test",
 	}
 
-	srv := daemon.NewServer(cfg, mc, corr)
+	srv, err := daemon.NewServer(cfg, mc, corr)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -193,7 +209,10 @@ func TestDaemonPreservesCommittedSyscallsAndArgsAndRejectsCorruptBaseline(t *tes
 		Arch:              syscalls.ArchAMD64,
 	}
 
-	srv := daemon.NewServer(cfg, mc, corr)
+	srv, err := daemon.NewServer(cfg, mc, corr)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := srv.Start(ctx); err != nil {
@@ -230,7 +249,10 @@ func TestDaemonPreservesCommittedSyscallsAndArgsAndRejectsCorruptBaseline(t *tes
 	close(mc2.eventsCh)
 	cfg.ControlAddr = filepath.Join(tmp, "ctl3.sock")
 	cfg.StoppedMarkerPath = stoppedMarkerCorrupt
-	srv2 := daemon.NewServer(cfg, mc2, corr)
+	srv2, err := daemon.NewServer(cfg, mc2, corr)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := srv2.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
