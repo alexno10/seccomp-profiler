@@ -13,6 +13,9 @@ const {
   verifyPinnedSha256,
   verifyCosignSignature,
   buildDaemonEnv,
+  sudoArgv,
+  daemonArgs,
+  prepareBaselineCheckout,
   PINNED_RELEASE_REPO,
   PINNED_RELEASE_VERSION,
   PINNED_BINARY_SHA256,
@@ -131,4 +134,48 @@ test("verifySha256 and verifyPinnedSha256 accept matching digest and reject tamp
   fs.writeFileSync(binPath, "tampered-payload");
   assert.throws(() => verifySha256(binPath, sumsPath, "seccomp-profiler-linux-amd64"), /SHA-256 mismatch/);
   assert.throws(() => verifyPinnedSha256(binPath, digest, "seccomp-profiler-linux-amd64"), /Pinned SHA-256 mismatch/);
+});
+
+test("sudo invocation preserves the daemon env allowlist (env_reset bypass)", () => {
+  const argv = sudoArgv(["setsid", "/bin/tool", "daemon"]);
+  assert.equal(argv[0], "--preserve-env=PATH,HOME,USER,LOGNAME,LANG,LC_ALL,TMPDIR,DOCKER_HOST,DOCKER_CONFIG,DOCKER_API_VERSION,SECCOMP_PROFILER_BPF_OBJ,SECCOMP_PROFILER_SOCKET,SECCOMP_PROFILER_STOPPED_MARKER,SECCOMP_PROFILER_BIN");
+  assert.deepEqual(argv.slice(1), ["setsid", "/bin/tool", "daemon"]);
+});
+
+test("daemonArgs passes baseline-ref checkout paths and drift flags", () => {
+  process.env["INPUT_COMMITTED-PROFILE"] = "seccomp/{name}.json";
+  process.env["INPUT_ALLOW-FILE"] = ".seccomp-profiler/accepted.yml";
+  try {
+    const args = daemonArgs("/bin/seccomp-profiler", "/tmp/baseline-wt");
+    const flag = (name) => {
+      const i = args.indexOf(name);
+      return i === -1 ? undefined : args[i + 1];
+    };
+    assert.equal(flag("--committed-profile"), path.resolve("/tmp/baseline-wt", "seccomp/{name}.json"));
+    assert.equal(flag("--allow-file"), path.resolve("/tmp/baseline-wt", ".seccomp-profiler/accepted.yml"));
+    assert.equal(flag("--working-committed-profile"), path.resolve(process.cwd(), "seccomp/{name}.json"));
+    assert.equal(flag("--working-allow-file"), path.resolve(process.cwd(), ".seccomp-profiler/accepted.yml"));
+    assert.equal(flag("--compose-project"), "");
+
+    // Without a baseline checkout there is no drift comparison.
+    const argsNoBaseline = daemonArgs("/bin/seccomp-profiler", null);
+    assert.equal(argsNoBaseline[argsNoBaseline.indexOf("--committed-profile") + 1], "seccomp/{name}.json");
+    assert.equal(argsNoBaseline[argsNoBaseline.indexOf("--working-committed-profile") + 1], "");
+  } finally {
+    delete process.env["INPUT_COMMITTED-PROFILE"];
+    delete process.env["INPUT_ALLOW-FILE"];
+  }
+});
+
+test("prepareBaselineCheckout is a no-op outside pull_request events", () => {
+  const prevEvent = process.env.GITHUB_EVENT_NAME;
+  const prevBase = process.env.GITHUB_BASE_REF;
+  delete process.env.GITHUB_EVENT_NAME;
+  delete process.env.GITHUB_BASE_REF;
+  try {
+    assert.equal(prepareBaselineCheckout(), null);
+  } finally {
+    if (prevEvent !== undefined) process.env.GITHUB_EVENT_NAME = prevEvent;
+    if (prevBase !== undefined) process.env.GITHUB_BASE_REF = prevBase;
+  }
 });

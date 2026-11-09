@@ -9,6 +9,10 @@ inputs:
     description: "start | stop (post hook stops automatically if mode: stop was not called explicitly)"
     required: false
     default: "start"
+  baseline-ref:
+    description: "Git ref to read the committed profile and accepted.yml from, instead of the PR working tree (prevents a PR from widening its own baseline). Empty = automatically the PR base ref on pull_request events; 'none' disables."
+    required: false
+    default: ""
   targets:
     description: "YAML/multiline list of target selectors (image/labels -> name). Empty = auto-discover all non-system containers"
     required: false
@@ -21,6 +25,14 @@ inputs:
     description: "Additional image globs to exclude (appended to built-in infra exclusions)"
     required: false
     default: ""
+  compose-project:
+    description: "Only profile containers of this com.docker.compose.project (useful on shared self-hosted runners)"
+    required: false
+    default: ""
+  include-preexisting:
+    description: "Also profile containers that were already running when the profiler started (they are flagged partial: preexisting in the raw artifact)"
+    required: false
+    default: "false"
   output-dir:
     description: "Directory where generated seccomp profiles are written"
     required: false
@@ -41,8 +53,12 @@ inputs:
     description: "Newline-separated list of additional syscalls to allow"
     required: false
     default: ""
+  prune:
+    description: "Do not merge syscalls removed from the committed profile back into the generated output (restore least-privilege)"
+    required: false
+    default: "false"
   on-change:
-    description: "report | fail | update-pr"
+    description: "report | fail | update-pr (update-pr writes generated profiles to the committed-profile location for the PR author to commit)"
     required: false
     default: "report"
   fail-on:
