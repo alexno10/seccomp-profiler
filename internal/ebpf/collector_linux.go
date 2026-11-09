@@ -91,12 +91,19 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 	// workloads may be recorded (over-permissive profiles, never
 	// under-recording), which the summary reveals. Losing the daemon over
 	// a kernel quirk would be strictly worse.
+	if l4, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+		Name:    "sched_process_fork",
+		Program: forkProg,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: attach raw_tracepoint/sched_process_fork: %v; runtime-suppression degraded: secondary docker exec setup syscalls may be recorded\n", err)
+	} else {
+		c.links = append(c.links, l4)
+	}
 	for _, h := range []struct {
 		cat  string
 		name string
 		prog *cebpf.Program
 	}{
-		{"sched", "sched_process_fork", forkProg},
 		{"syscalls", "sys_enter_execve", execEnterProg},
 		{"syscalls", "sys_enter_execveat", execEnterAtProg},
 	} {

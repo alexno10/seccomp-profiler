@@ -220,6 +220,32 @@ static __inline int is_runtime_comm(const char *comm) {
 	return 0;
 }
 
+// Runtime family for FORK-TIME marking: runc/crun plus the containerd v2
+// shim. containerd-shim-runc-v2 links runc as a library and forks the
+// container-init and "docker exec" children itself, so those children are
+// only recognizable by their parent's comm ("containerd-shim", truncated to
+// the 15-char limit). Such processes either live in host cgroups (where
+// suppression is a no-op) or are genuine runtime family.
+static __inline int is_runtime_family_comm(const char *comm) {
+	if (is_runtime_comm(comm)) {
+		return 1;
+	}
+	if (comm[0] == 'c' && comm[1] == 'o' && comm[2] == 'n' && comm[3] == 't' &&
+	    comm[4] == 'a' && comm[5] == 'i' && comm[6] == 'n' && comm[7] == 'e' &&
+	    comm[8] == 'r' && comm[9] == 'd' && comm[10] == '-' && comm[11] == 's' &&
+	    comm[12] == 'h' && comm[13] == 'i' && comm[14] == 'm') {
+		return 1;
+	}
+	return 0;
+}
+
+// Minimal CO-RE-annotated task_struct: the pid member is resolved BY NAME
+// against the kernel's BTF, so the real struct offset never has to be
+// hardcoded here.
+struct task_struct {
+	int pid;
+} __attribute__((preserve_access_index));
+
 // Self-referential exec targets used by runc/crun bootstrap re-execs. Only
 // consulted for execs that runc/crun initiated (exec_pending), so application
 // re-execs of /proc/self/exe or fexecve/memfd payloads are never suppressed.
@@ -322,30 +348,35 @@ int handle_cgroup_mkdir(struct trace_event_raw_cgroup_mkdir *ctx) {
 	return 0;
 }
 
-// Children forked by runc/crun are pre-marked so their pre-first-exec setup
-// syscalls (setns, mount, ...) inside an already-active container cgroup are
-// suppressed. The marker is cleared as soon as the child execs the workload.
+// Children forked by the runtime family (runc/crun/containerd-shim) are
+// pre-marked so their pre-first-exec setup syscalls (setns, mount, ...)
+// inside an already-active container cgroup are suppressed. The marker is
+// cleared as soon as the child execs the workload.
 //
-// The child pid is read with bpf_probe_read_kernel instead of a direct ctx
-// access on purpose: sched_process_fork carries no dynamic data, so the
-// kernel's tracepoint-link check
+// Attached as a RAW tracepoint: sched_process_fork carries no dynamic data,
+// so the kernel's tracepoint-link ctx-size check
 //   perf_event_set_bpf_prog(): max_ctx_offset > trace_event_get_offsets()
 // rejects ANY direct ctx read with a misleading EPERM on kernels that ship
-// it (6.8+). A probe read keeps max_ctx_offset at 0. Layout (stable across
-// 5.15..master): common(8) parent_comm[16] parent_pid child_comm[16]
-// child_pid@44.
-SEC("tracepoint/sched/sched_process_fork")
-int handle_sched_process_fork(void *ctx) {
+// it (6.8+). Raw tracepoints bypass that check entirely, and the child pid
+// is resolved via CO-RE by member name.
+SEC("raw_tracepoint/sched_process_fork")
+int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx) {
 	char comm[16] = {};
 	bpf_get_current_comm(comm, sizeof(comm));
-	if (!is_runtime_comm(comm)) {
+	if (!is_runtime_family_comm(comm)) {
 		return 0;
 	}
-	__u32 child_pid = 0;
-	if (bpf_probe_read_kernel(&child_pid, sizeof(child_pid), (const char *)ctx + 44) != 0) {
+	// args[0] = parent task_struct, args[1] = child task_struct (TP_PROTO).
+	__u64 child_ptr = 0;
+	if (bpf_probe_read_kernel(&child_ptr, sizeof(child_ptr), (const char *)ctx + 8) != 0 || child_ptr == 0) {
 		return 0;
 	}
-	__u32 child_tid = (__u32)child_pid;
+	int pid = 0;
+	if (bpf_probe_read_kernel(&pid, sizeof(pid),
+	    __builtin_preserve_access_index(&((struct task_struct *)child_ptr)->pid)) != 0) {
+		return 0;
+	}
+	__u32 child_tid = (__u32)pid;
 	if (child_tid == 0) {
 		return 0;
 	}
@@ -357,7 +388,7 @@ int handle_sched_process_fork(void *ctx) {
 static __inline int handle_exec_enter(void) {
 	char comm[16] = {};
 	bpf_get_current_comm(comm, sizeof(comm));
-	if (!is_runtime_comm(comm)) {
+	if (!is_runtime_family_comm(comm)) {
 		return 0;
 	}
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
