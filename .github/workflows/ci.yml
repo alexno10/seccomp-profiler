@@ -59,6 +59,9 @@ jobs:
         run: |
           DAEMON_PID=$(pgrep -f "seccomp-profiler daemon" | head -n 1)
           test -n "$DAEMON_PID"
+          echo "=== daemon log (attach diagnostics) ==="
+          sudo cat /tmp/seccomp-profiler-daemon.log || true
+          echo "=== end daemon log ==="
           # sudo cat runs the reader as root; a plain "< /proc/..." redirect
           # would silently fail as the non-root step user and void the check.
           if sudo cat "/proc/${DAEMON_PID}/environ" | tr '\0' '\n' | grep -E '^(GITHUB_TOKEN|GH_TOKEN|INPUT_GITHUB|ACTIONS_RUNTIME_TOKEN|RUNNER_TRACKING_ID)='; then
@@ -113,6 +116,15 @@ jobs:
           for leaked in mount pivot_root setns; do
             if grep -q "\"${leaked}\"" .seccomp-profiler/profiles/alpine.json; then
               echo "ERROR: ${leaked} leaked into alpine.json"
+              echo "--- daemon log ---"
+              sudo cat /tmp/seccomp-profiler-daemon.log || true
+              echo "--- leaked syscall provenance ---"
+              node -e '
+                const r = require("./.seccomp-profiler/raw/alpine.profile.v1.json");
+                console.log(JSON.stringify(r.syscalls["setns"] || {}, null, 1));
+                console.log(JSON.stringify(r.syscalls["mount"] || {}, null, 1));
+                console.log("containers:", JSON.stringify(r.target.containers.map(c => ({ id: c.id.slice(0, 8), image: c.image, bins: undefined })), null, 1));
+              '
               exit 1
             fi
           done
