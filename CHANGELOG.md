@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1 (2026-11-10)
+
+Bugfix release for the v1.1.0 daemon on current CI runners.
+
+- **Fixed:** `sched_process_fork` failed to attach on kernels with the tracepoint-link ctx-size check (6.8+): `perf_event_set_bpf_prog` compares `max_ctx_offset` against `trace_event_get_offsets`, which only accounts for *dynamic* data — and this tracepoint has none, so any direct ctx read was refused at link time with a misleading `permission denied` (the program itself loaded fine). The child pid is now read with `bpf_probe_read_kernel` from the fixed ctx offset (`max_ctx_offset` stays 0). Diagnosed against kernel v6.8 source.
+- **Fixed:** the three suppression-refinement hooks (`sched_process_fork`, `sys_enter_execve`, `sys_enter_execveat`) now attach best-effort with a loud warning instead of killing the daemon; losing one can only over-record runtime setup syscalls of secondary `docker exec` workloads (over-permissive, never under-recorded), and a kernel quirk must not take the whole profiler down.
+- **CI:** the positive e2e high-risk probe uses `add_key`/`keyctl` (capability-free) instead of `unshare`, which the current runner fleet (kernel 7.0-azure) refuses inside containers even with `seccomp=unconfined` and `CAP_SYS_ADMIN`. The daemon-environment leak check now actually reads the root daemon's environ (`sudo cat`); the previous `< /proc/...` redirect silently failed as the non-root step user and voided the check.
+
 ## 1.1.0 (2026-11-10)
 
 Security hardening release driven by the v1.0.0 code review.

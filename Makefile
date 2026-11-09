@@ -2,7 +2,7 @@
 
 CLANG ?= clang
 GO ?= go
-VERSION ?= 1.1.0
+VERSION ?= 1.1.1
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),aarch64)
 BPF_ARCH_DEFINE ?= -D__TARGET_ARCH_arm64
