@@ -341,7 +341,7 @@ int handle_sched_process_fork(void *ctx) {
 	if (!is_runtime_comm(comm)) {
 		return 0;
 	}
-	__s32 child_pid = 0;
+	__u32 child_pid = 0;
 	if (bpf_probe_read_kernel(&child_pid, sizeof(child_pid), (const char *)ctx + 44) != 0) {
 		return 0;
 	}
