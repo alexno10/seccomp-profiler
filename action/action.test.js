@@ -71,11 +71,11 @@ test("buildDaemonEnv strips RUNNER_TRACKING_ID and all GitHub/secret tokens from
 
 test("release version, repo, and binary/cosign SHA-256 digests are immutably pinned in code", () => {
   assert.equal(PINNED_RELEASE_REPO, "alexno10/seccomp-profiler");
-  assert.equal(PINNED_RELEASE_VERSION, "v1.1.0");
+  assert.equal(PINNED_RELEASE_VERSION, "v1.1.1");
   assert.equal(COSIGN_SHA256.amd64, "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b");
   assert.equal(COSIGN_SHA256.arm64, "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a");
-  assert.equal(PINNED_BINARY_SHA256.amd64, "a5c3805c6532c322aee084801d0b2f8cc230d3e534a0d3c4946a2bad99e6e7f3");
-  assert.equal(PINNED_BINARY_SHA256.arm64, "be317e3b5a78a7c077ae716a8b801272f3dd54d9e6bbdf937900e08f45c7af86");
+  assert.equal(PINNED_BINARY_SHA256.amd64, "e302fd3c82253384ce9a07f3d02451f54d8effd20c781a2f5ced12a916367629");
+  assert.equal(PINNED_BINARY_SHA256.arm64, "e60901f533def882faa3f75115429191dd95e71ceda3230742027227f8d9132c");
 });
 
 test("COSIGN_CERT_IDENTITY_REGEXP is strictly anchored and rejects other workflows, repos, or refs", () => {

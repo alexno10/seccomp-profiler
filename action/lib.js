@@ -14,7 +14,7 @@ const STOPPED_MARKER = process.env.SECCOMP_PROFILER_STOPPED_MARKER || "/run/secc
 const DAEMON_LOG_PATH = "/tmp/seccomp-profiler-daemon.log";
 
 const PINNED_RELEASE_REPO = "alexno10/seccomp-profiler";
-const PINNED_RELEASE_VERSION = "v1.1.0";
+const PINNED_RELEASE_VERSION = "v1.1.1";
 
 // Versioned cache location: a new pinned release automatically uses a new
 // cache path, and any file found there is verified against the pinned digest
@@ -29,8 +29,8 @@ const COSIGN_SHA256 = Object.freeze({
 });
 
 const PINNED_BINARY_SHA256 = Object.freeze({
-  amd64: "a5c3805c6532c322aee084801d0b2f8cc230d3e534a0d3c4946a2bad99e6e7f3",
-  arm64: "be317e3b5a78a7c077ae716a8b801272f3dd54d9e6bbdf937900e08f45c7af86",
+  amd64: "e302fd3c82253384ce9a07f3d02451f54d8effd20c781a2f5ced12a916367629",
+  arm64: "e60901f533def882faa3f75115429191dd95e71ceda3230742027227f8d9132c",
 });
 
 const COSIGN_CERT_IDENTITY_REGEXP =
