@@ -1,0 +1,70 @@
+name: "eBPF Seccomp Profiler"
+description: "Automatically profile container syscalls via eBPF during CI tests and audit seccomp drift"
+author: "alexno10"
+branding:
+  icon: "shield"
+  color: "blue"
+inputs:
+  mode:
+    description: "start | stop (post hook stops automatically if mode: stop was not called explicitly)"
+    required: false
+    default: "start"
+  targets:
+    description: "YAML/multiline list of target selectors (image/labels -> name). Empty = auto-discover all non-system containers"
+    required: false
+    default: ""
+  group-by:
+    description: "auto | compose-service | image | label:<key>"
+    required: false
+    default: "auto"
+  exclude-images:
+    description: "Additional image globs to exclude (appended to built-in infra exclusions)"
+    required: false
+    default: ""
+  output-dir:
+    description: "Directory where generated seccomp profiles are written"
+    required: false
+    default: ".seccomp-profiler/profiles"
+  committed-profile:
+    description: "Path template (e.g. seccomp/{name}.json), directory, or single file path of committed reference seccomp profile(s)"
+    required: false
+    default: ".seccomp-profiler/profiles/{name}.json"
+  baseline:
+    description: "none | minimal | standard"
+    required: false
+    default: "standard"
+  runtime:
+    description: "auto | go | java | node | python | none"
+    required: false
+    default: "auto"
+  extra-allow:
+    description: "Newline-separated list of additional syscalls to allow"
+    required: false
+    default: ""
+  on-change:
+    description: "report | fail | update-pr"
+    required: false
+    default: "report"
+  fail-on:
+    description: "none | high-risk | any-new"
+    required: false
+    default: "high-risk"
+  allow-file:
+    description: "Path to explicit syscall approvals file"
+    required: false
+    default: ".seccomp-profiler/accepted.yml"
+outputs:
+  profiles-dir:
+    description: "Directory containing generated seccomp.json profiles"
+  raw-dir:
+    description: "Directory containing versioned intermediate raw v1 profile artifacts"
+  new-syscalls-count:
+    description: "Total count of newly observed/added syscalls across targets"
+  high-risk-count:
+    description: "Total count of unapproved high-risk syscalls across targets"
+  gate-passed:
+    description: "true if security gate passed, false otherwise"
+runs:
+  using: "node24"
+  main: "action/main.js"
+  post: "action/post.js"

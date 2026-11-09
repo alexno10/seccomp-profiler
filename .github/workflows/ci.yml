@@ -1,0 +1,224 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-ebpf-integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: "go.mod"
+
+      - name: Verify generated syscall tables and run unit tests
+        run: |
+          go generate ./...
+          git diff --exit-code
+          node --check action/main.js
+          node --check action/post.js
+          node --test action/action.test.js
+          go test ./... -v
+
+      - name: Compile eBPF program and install seccomp-profiler
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang llvm
+          make bpf build
+          sudo install -m 0755 bin/seccomp-profiler /usr/local/bin/seccomp-profiler
+          rm -f bpf/profiler.bpf.o internal/ebpf/profiler.bpf.o
+          docker pull alpine:3.20
+
+      - name: Start Seccomp Profiler Action (mode=start)
+        uses: ./
+        with:
+          mode: start
+
+      - name: Verify sudo daemon environment has zero leaked tokens and run containers
+        run: |
+          DAEMON_PID=$(pgrep -f "seccomp-profiler daemon" | head -n 1)
+          test -n "$DAEMON_PID"
+          if sudo tr '\0' '\n' < "/proc/${DAEMON_PID}/environ" | grep -E '^(GITHUB_TOKEN|GH_TOKEN|INPUT_GITHUB|ACTIONS_RUNTIME_TOKEN|RUNNER_TRACKING_ID)='; then
+            echo "ERROR: sensitive token or tracking ID leaked into sudo daemon environment!"
+            exit 1
+          fi
+
+          # 1. Ultra-short-lived (<100ms) container
+          docker run --rm alpine:3.20 true
+
+          # 2. Container with secondary docker exec
+          CID=$(docker run -d --rm alpine:3.20 sleep 5)
+          docker exec "$CID" uname -a
+          docker stop -t 1 "$CID" || true
+
+          # 3. Infra sidecar container with Ryuk label (should be auto-excluded)
+          docker run --rm --label org.testcontainers.ryuk=true alpine:3.20 echo "ryuk-sidecar"
+
+      - name: Stop Seccomp Profiler Action (mode=stop)
+        id: stop_profiler
+        uses: ./
+        with:
+          mode: stop
+
+      - name: Verify Action outputs, eBPF profile accuracy, enforcement, diff, and merge
+        run: |
+          test "${{ steps.stop_profiler.outputs.gate-passed }}" = "true"
+          test "${{ steps.stop_profiler.outputs.high-risk-count }}" = "0"
+          test "${{ steps.stop_profiler.outputs.profiles-dir }}" = ".seccomp-profiler/profiles"
+          test "${{ steps.stop_profiler.outputs.new-syscalls-count }}" -gt 0
+
+          test -f .seccomp-profiler/profiles/alpine.json
+          test -f .seccomp-profiler/raw/alpine.profile.v1.json
+
+          # Verify runc init / docker exec setup syscalls (mount, pivot_root, setns, unshare) did NOT leak
+          for leaked in mount pivot_root setns unshare; do
+            if grep -q "\"${leaked}\"" .seccomp-profiler/profiles/alpine.json; then
+              echo "ERROR: ${leaked} leaked into alpine.json"
+              exit 1
+            fi
+          done
+
+          # Verify 64-bit container syscalls were NOT misclassified as 32-bit compat,
+          # that Ryuk container was excluded (only 2 alpine containers merged),
+          # and that real observed eBPF syscalls were recorded.
+          node -e '
+            const fs = require("node:fs");
+            const raw = JSON.parse(fs.readFileSync(".seccomp-profiler/raw/alpine.profile.v1.json", "utf8"));
+            if (raw.target.compatSyscallCount !== 0) {
+              throw new Error(`Expected compatSyscallCount=0, got ${raw.target.compatSyscallCount}`);
+            }
+            if (raw.target.containerCount !== 2) {
+              throw new Error(`Expected containerCount=2 (ryuk excluded), got ${raw.target.containerCount}`);
+            }
+            const observed = Object.entries(raw.syscalls || {}).filter(([, v]) => (v.sources || []).includes("observed"));
+            if (observed.length === 0) {
+              throw new Error("Expected >0 observed syscalls from eBPF");
+            }
+          '
+
+          # Re-run container enforced by generated seccomp profile
+          docker run --rm --security-opt seccomp=.seccomp-profiler/profiles/alpine.json alpine:3.20 uname -a
+
+          # Verify CLI diff + security gate (unapproved high-risk fails; accepted.yml passes; on-change=update-pr works)
+          cp .seccomp-profiler/profiles/alpine.json /tmp/committed.json
+          node -e '
+            const fs = require("node:fs");
+            const p = JSON.parse(fs.readFileSync("/tmp/committed.json", "utf8"));
+            p.syscalls[0].names.push("ptrace");
+            fs.writeFileSync("/tmp/drifted.json", JSON.stringify(p, null, 2));
+          '
+          if seccomp-profiler diff --target alpine --committed /tmp/committed.json --current /tmp/drifted.json --fail-on high-risk; then
+            echo "ERROR: expected unapproved high-risk ptrace drift to fail security gate"
+            exit 1
+          fi
+          cat > /tmp/accepted.yml <<'EOF'
+          version: 1
+          accepted:
+            - target: alpine
+              syscall: ptrace
+              reason: "CI gate test approval"
+          EOF
+          seccomp-profiler diff --target alpine --committed /tmp/committed.json --current /tmp/drifted.json --allow-file /tmp/accepted.yml --on-change update-pr --fail-on high-risk
+
+          # Verify CLI merge across multiple .profile.v1.json shards
+          mkdir -p /tmp/shards/s1 /tmp/shards/s2 /tmp/merged-profiles /tmp/merged-raw
+          cp .seccomp-profiler/raw/alpine.profile.v1.json /tmp/shards/s1/alpine.profile.v1.json
+          node -e '
+            const fs = require("node:fs");
+            const raw = JSON.parse(fs.readFileSync(".seccomp-profiler/raw/alpine.profile.v1.json", "utf8"));
+            raw.target.containers = [{ id: "extra_shard_container_id", image: "alpine:3.20", durationMs: 42 }];
+            raw.target.containerCount = 1;
+            raw.syscalls["nanosleep"] = { sources: ["observed"], totalCalls: 7, containersSeen: 1 };
+            fs.writeFileSync("/tmp/shards/s2/alpine.profile.v1.json", JSON.stringify(raw, null, 2));
+          '
+          seccomp-profiler merge --input-dir /tmp/shards --output-dir /tmp/merged-profiles --raw-dir /tmp/merged-raw --lock-file /tmp/merged-lock.json --committed-profile /tmp/committed.json
+          test -f /tmp/merged-profiles/alpine.json
+          test -f /tmp/merged-raw/alpine.profile.v1.json
+
+  test-post-hook-and-release-cosign:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Pre-pull test container image
+        run: |
+          test ! -f /usr/local/bin/seccomp-profiler
+          docker pull alpine:3.20
+
+      - name: Start Seccomp Profiler Action (downloads v1.0.0 release, verifies checksums.txt.sig + pinned SHA-256 + Cosign, auto-stops in post hook)
+        uses: ./
+
+      - name: Run container workload and verify negative Cosign identity rejection
+        run: |
+          test -x /usr/local/bin/seccomp-profiler
+          docker run --rm alpine:3.20 echo "testing v1.0.0 release binary + cosign + automatic post hook teardown"
+
+          # Negative Test: Sign a binary with THIS workflow's OIDC identity (ci.yml@refs/heads/main)
+          # and prove that verifyCosignSignature rejects both wrong workflow/ref and wrong repository!
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            COSIGN_ARCH="arm64"
+            COSIGN_SHA="3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a"
+          else
+            COSIGN_ARCH="amd64"
+            COSIGN_SHA="8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b"
+          fi
+          curl -fsSL "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-${COSIGN_ARCH}" -o /tmp/cosign-neg
+          echo "${COSIGN_SHA}  /tmp/cosign-neg" | sha256sum -c -
+          chmod +x /tmp/cosign-neg
+
+          /tmp/cosign-neg sign-blob --yes \
+            --output-signature /tmp/ci-signed.sig \
+            --output-certificate /tmp/ci-signed.pem \
+            /usr/local/bin/seccomp-profiler
+
+          # 1. Must FAIL when verified against the strict release.yml@refs/tags/v... identity in action/main.js
+          node -e '
+            const { verifyCosignSignature } = require("./action/main.js");
+            try {
+              verifyCosignSignature("/tmp/cosign-neg", "/usr/local/bin/seccomp-profiler", "/tmp/ci-signed.sig", "/tmp/ci-signed.pem");
+              console.error("ERROR: verifyCosignSignature accepted a certificate signed by ci.yml instead of release.yml!");
+              process.exit(1);
+            } catch (err) {
+              console.log("PASS: Rejected binary signed by non-release workflow:", err.message);
+            }
+          '
+
+          # 2. Must FAIL when verified against a different repository identity
+          node -e '
+            const { verifyCosignSignature } = require("./action/main.js");
+            try {
+              verifyCosignSignature(
+                "/tmp/cosign-neg",
+                "/usr/local/bin/seccomp-profiler",
+                "/tmp/ci-signed.sig",
+                "/tmp/ci-signed.pem",
+                "^https://github\\.com/other-owner/seccomp-profiler/\\.github/workflows/ci\\.yml@refs/heads/main$"
+              );
+              console.error("ERROR: verifyCosignSignature accepted a certificate from a different repo!");
+              process.exit(1);
+            } catch (err) {
+              console.log("PASS: Rejected binary when repository owner does not match:", err.message);
+            }
+          '

@@ -1,0 +1,134 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const {
+  getInput,
+  resolveBpfObjPath,
+  verifySha256,
+  verifyPinnedSha256,
+  verifyCosignSignature,
+  buildDaemonEnv,
+  PINNED_RELEASE_REPO,
+  PINNED_RELEASE_VERSION,
+  PINNED_BINARY_SHA256,
+  COSIGN_SHA256,
+  COSIGN_CERT_IDENTITY_REGEXP,
+  COSIGN_OIDC_ISSUER,
+} = require("./main.js");
+
+test("getInput reads hyphenated INPUT_<NAME> env vars set by GitHub Actions runner", () => {
+  process.env["INPUT_FAIL-ON"] = "any-new";
+  process.env["INPUT_OUTPUT-DIR"] = "custom/profiles";
+  try {
+    assert.equal(getInput("fail-on", "high-risk"), "any-new");
+    assert.equal(getInput("output-dir", ".seccomp-profiler/profiles"), "custom/profiles");
+  } finally {
+    delete process.env["INPUT_FAIL-ON"];
+    delete process.env["INPUT_OUTPUT-DIR"];
+  }
+});
+
+test("resolveBpfObjPath defaults to action repository bpf/profiler.bpf.o", () => {
+  delete process.env.SECCOMP_PROFILER_BPF_OBJ;
+  const p = resolveBpfObjPath();
+  assert.equal(p, path.resolve(__dirname, "..", "bpf", "profiler.bpf.o"));
+});
+
+test("buildDaemonEnv strips RUNNER_TRACKING_ID and all GitHub/secret tokens from sudo daemon environment", () => {
+  const env = buildDaemonEnv({
+    PATH: "/usr/bin",
+    HOME: "/home/runner",
+    DOCKER_HOST: "unix:///var/run/docker.sock",
+    RUNNER_TRACKING_ID: "github_abc123",
+    "INPUT_GITHUB-TOKEN": "ghs_secret1",
+    INPUT_GITHUB_TOKEN: "ghs_secret2",
+    GITHUB_TOKEN: "ghs_secret3",
+    GH_TOKEN: "ghs_secret4",
+    ACTIONS_RUNTIME_TOKEN: "eyJ_runtime",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "eyJ_oidc",
+    SUPER_SECRET_KEY: "should_not_leak",
+  });
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(env.HOME, "/home/runner");
+  assert.equal(env.DOCKER_HOST, "unix:///var/run/docker.sock");
+  assert.equal("RUNNER_TRACKING_ID" in env, false);
+  assert.equal("INPUT_GITHUB-TOKEN" in env, false);
+  assert.equal("INPUT_GITHUB_TOKEN" in env, false);
+  assert.equal("GITHUB_TOKEN" in env, false);
+  assert.equal("GH_TOKEN" in env, false);
+  assert.equal("ACTIONS_RUNTIME_TOKEN" in env, false);
+  assert.equal("ACTIONS_ID_TOKEN_REQUEST_TOKEN" in env, false);
+  assert.equal("SUPER_SECRET_KEY" in env, false);
+});
+
+test("release version, repo, and binary/cosign SHA-256 digests are immutably pinned in code", () => {
+  assert.equal(PINNED_RELEASE_REPO, "alexno10/seccomp-profiler");
+  assert.equal(PINNED_RELEASE_VERSION, "v1.0.0");
+  assert.equal(COSIGN_SHA256.amd64, "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b");
+  assert.equal(COSIGN_SHA256.arm64, "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a");
+  assert.equal(PINNED_BINARY_SHA256.amd64, "2a5f9a434e120cc6231aac985d763eaf2e30c2e5ed5920849d0f3f07b380595c");
+  assert.equal(PINNED_BINARY_SHA256.arm64, "f28075b5f88bbe5f9b229a43bec6634d6eafc08607aaf9e0a763d4098c4a5eaf");
+});
+
+test("COSIGN_CERT_IDENTITY_REGEXP is strictly anchored and rejects other workflows, repos, or refs", () => {
+  assert.equal(
+    COSIGN_CERT_IDENTITY_REGEXP,
+    "^https://github\\.com/alexno10/seccomp-profiler/\\.github/workflows/release\\.yml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$"
+  );
+  assert.equal(COSIGN_OIDC_ISSUER, "https://token.actions.githubusercontent.com");
+
+  const re = new RegExp(COSIGN_CERT_IDENTITY_REGEXP);
+  assert.equal(
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v0.2.0"),
+    true
+  );
+  // Negative cases: different repo, prefix/suffix injection, different workflow, branch ref
+  assert.equal(
+    re.test("https://github.com/evil/seccomp-profiler/.github/workflows/release.yml@refs/tags/v0.2.0"),
+    false
+  );
+  assert.equal(
+    re.test("https://evil.com/https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v0.2.0"),
+    false
+  );
+  assert.equal(
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/ci.yml@refs/tags/v0.2.0"),
+    false
+  );
+  assert.equal(
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/heads/main"),
+    false
+  );
+  assert.equal(
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v0.2.0-evil"),
+    false
+  );
+});
+
+test("verifyCosignSignature rejects unanchored identity regex and fails on invalid signature", () => {
+  assert.throws(
+    () => verifyCosignSignature("cosign", "bin", "sig", "cert", "https://github.com/.*/seccomp-profiler/.*"),
+    /must be fully anchored/
+  );
+});
+
+test("verifySha256 and verifyPinnedSha256 accept matching digest and reject tampered binary", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-test-"));
+  const binPath = path.join(tmpDir, "seccomp-profiler-linux-amd64");
+  const sumsPath = path.join(tmpDir, "checksums.txt");
+  fs.writeFileSync(binPath, "fake-elf-payload");
+  const digest = crypto.createHash("sha256").update("fake-elf-payload").digest("hex");
+  fs.writeFileSync(sumsPath, `${digest}  seccomp-profiler-linux-amd64\n`);
+
+  verifySha256(binPath, sumsPath, "seccomp-profiler-linux-amd64");
+  verifyPinnedSha256(binPath, digest, "seccomp-profiler-linux-amd64");
+
+  fs.writeFileSync(binPath, "tampered-payload");
+  assert.throws(() => verifySha256(binPath, sumsPath, "seccomp-profiler-linux-amd64"), /SHA-256 mismatch/);
+  assert.throws(() => verifyPinnedSha256(binPath, digest, "seccomp-profiler-linux-amd64"), /Pinned SHA-256 mismatch/);
+});

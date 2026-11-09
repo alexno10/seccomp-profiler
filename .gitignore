@@ -1,0 +1,11 @@
+.superpowers/
+.worktrees/
+worktrees/
+bin/
+dist/
+/seccomp-profiler
+/seccomp-profiler.exe
+*.o
+*.so
+spec.md
+plan.md

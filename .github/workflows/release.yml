@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update"
+        required: false
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: "go.mod"
+
+      - name: Install Clang, LLVM, and SHA-256 verified Cosign
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang llvm
+          curl -fsSL https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64 -o /tmp/cosign
+          echo "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  /tmp/cosign" | sha256sum -c -
+          chmod +x /tmp/cosign
+          sudo mv /tmp/cosign /usr/local/bin/cosign
+          cosign version
+
+      - name: Build deterministic multi-arch release binaries with embedded eBPF bytecode
+        run: |
+          mkdir -p dist
+
+          make bpf-amd64
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o dist/seccomp-profiler-linux-amd64 ./cmd/seccomp-profiler
+
+          make bpf-arm64
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o dist/seccomp-profiler-linux-arm64 ./cmd/seccomp-profiler
+
+          cd dist
+          sha256sum seccomp-profiler-linux-amd64 seccomp-profiler-linux-arm64 > checksums.txt
+          cat checksums.txt
+
+      - name: Sign binaries and checksums.txt with Sigstore Cosign (keyless OIDC)
+        run: |
+          cd dist
+          CERT_REGEX='^https://github\.com/alexno10/seccomp-profiler/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+          OIDC_ISSUER='https://token.actions.githubusercontent.com'
+
+          for artifact in seccomp-profiler-linux-amd64 seccomp-profiler-linux-arm64 checksums.txt; do
+            cosign sign-blob --yes \
+              --output-signature "${artifact}.sig" \
+              --output-certificate "${artifact}.pem" \
+              "${artifact}"
+            cosign verify-blob \
+              --certificate "${artifact}.pem" \
+              --signature "${artifact}.sig" \
+              --certificate-identity-regexp "${CERT_REGEX}" \
+              --certificate-oidc-issuer "${OIDC_ISSUER}" \
+              "${artifact}"
+          done
+
+      - name: Publish GitHub Pre-Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" != v* ]]; then
+            TAG="${{ inputs.tag || 'v1.0.0' }}"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --prerelease
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --prerelease
+          fi
