@@ -25,10 +25,13 @@ jobs:
         with:
           go-version-file: "go.mod"
 
-      - name: Verify generated syscall tables and run unit tests
+      - name: Lint (gofmt, go vet) and verify generated syscall tables
         run: |
+          test -z "$(gofmt -l . )" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
+          go vet ./...
           go generate ./...
           git diff --exit-code
+          node --check action/lib.js
           node --check action/main.js
           node --check action/post.js
           node --test action/action.test.js
@@ -46,6 +49,11 @@ jobs:
         uses: ./
         with:
           mode: start
+          fail-on: none # the positive e2e tests below intentionally add high-risk syscalls; the gate is asserted manually
+        env:
+          # Exercise the freshly built binary instead of downloading the
+          # pinned release artifact.
+          SECCOMP_PROFILER_BIN: /usr/local/bin/seccomp-profiler
 
       - name: Verify sudo daemon environment has zero leaked tokens and run containers
         run: |
@@ -59,7 +67,7 @@ jobs:
           # 1. Ultra-short-lived (<100ms) container
           docker run --rm alpine:3.20 true
 
-          # 2. Container with secondary docker exec
+          # 2. Container with secondary docker exec (also exercises die-cleanup)
           CID=$(docker run -d --rm alpine:3.20 sleep 5)
           docker exec "$CID" uname -a
           docker stop -t 1 "$CID" || true
@@ -67,24 +75,35 @@ jobs:
           # 3. Infra sidecar container with Ryuk label (should be auto-excluded)
           docker run --rm --label org.testcontainers.ryuk=true alpine:3.20 echo "ryuk-sidecar"
 
+          # 4. Positive e2e: the profiler MUST observe a high-risk syscall
+          #    (unshare) instead of letting it pass silently.
+          docker run --rm --security-opt seccomp=unconfined --cap-add SYS_ADMIN alpine:3.20 unshare -m true
+
+          # 5. Application re-exec via /proc/self/exe must be recorded, not
+          #    suppressed as runtime self-exec.
+          docker run --rm alpine:3.20 sh -c 'exec /proc/self/exe echo re-exec-ok'
+
       - name: Stop Seccomp Profiler Action (mode=stop)
         id: stop_profiler
         uses: ./
         with:
           mode: stop
+        env:
+          SECCOMP_PROFILER_BIN: /usr/local/bin/seccomp-profiler
 
       - name: Verify Action outputs, eBPF profile accuracy, enforcement, diff, and merge
         run: |
           test "${{ steps.stop_profiler.outputs.gate-passed }}" = "true"
-          test "${{ steps.stop_profiler.outputs.high-risk-count }}" = "0"
+          # Positive e2e gate: the unshare run must be counted as unapproved high-risk.
+          test "${{ steps.stop_profiler.outputs.high-risk-count }}" -ge 1
           test "${{ steps.stop_profiler.outputs.profiles-dir }}" = ".seccomp-profiler/profiles"
           test "${{ steps.stop_profiler.outputs.new-syscalls-count }}" -gt 0
 
           test -f .seccomp-profiler/profiles/alpine.json
           test -f .seccomp-profiler/raw/alpine.profile.v1.json
 
-          # Verify runc init / docker exec setup syscalls (mount, pivot_root, setns, unshare) did NOT leak
-          for leaked in mount pivot_root setns unshare; do
+          # Verify runc init / docker exec setup syscalls (mount, pivot_root, setns) did NOT leak.
+          for leaked in mount pivot_root setns; do
             if grep -q "\"${leaked}\"" .seccomp-profiler/profiles/alpine.json; then
               echo "ERROR: ${leaked} leaked into alpine.json"
               exit 1
@@ -92,20 +111,32 @@ jobs:
           done
 
           # Verify 64-bit container syscalls were NOT misclassified as 32-bit compat,
-          # that Ryuk container was excluded (only 2 alpine containers merged),
-          # and that real observed eBPF syscalls were recorded.
+          # that Ryuk was excluded (4 profiled containers), and that the positive e2e
+          # syscalls (unshare, execve of the /proc/self/exe re-exec) were really
+          # captured by the eBPF hooks.
           node -e '
             const fs = require("node:fs");
             const raw = JSON.parse(fs.readFileSync(".seccomp-profiler/raw/alpine.profile.v1.json", "utf8"));
             if (raw.target.compatSyscallCount !== 0) {
               throw new Error(`Expected compatSyscallCount=0, got ${raw.target.compatSyscallCount}`);
             }
-            if (raw.target.containerCount !== 2) {
-              throw new Error(`Expected containerCount=2 (ryuk excluded), got ${raw.target.containerCount}`);
+            if (raw.target.containerCount !== 4) {
+              throw new Error(`Expected containerCount=4 (ryuk excluded), got ${raw.target.containerCount}`);
             }
             const observed = Object.entries(raw.syscalls || {}).filter(([, v]) => (v.sources || []).includes("observed"));
             if (observed.length === 0) {
               throw new Error("Expected >0 observed syscalls from eBPF");
+            }
+            if (!raw.syscalls["unshare"] || !raw.syscalls["unshare"].sources.includes("observed")) {
+              throw new Error("POSITIVE e2e FAILED: eBPF did not observe unshare!");
+            }
+            if (!raw.syscalls["execve"] || !raw.syscalls["execve"].sources.includes("observed")) {
+              throw new Error("POSITIVE e2e FAILED: /proc/self/exe re-exec was suppressed instead of recorded!");
+            }
+            // Generated profiles must constrain clone namespace creation.
+            const profile = JSON.parse(fs.readFileSync(".seccomp-profiler/profiles/alpine.json", "utf8"));
+            if (profile.defaultErrnoRet !== 38) {
+              throw new Error(`Expected defaultErrnoRet=38 (ENOSYS), got ${profile.defaultErrnoRet}`);
             }
           '
 
@@ -120,8 +151,25 @@ jobs:
             p.syscalls[0].names.push("ptrace");
             fs.writeFileSync("/tmp/drifted.json", JSON.stringify(p, null, 2));
           '
-          if seccomp-profiler diff --target alpine --committed /tmp/committed.json --current /tmp/drifted.json --fail-on high-risk; then
-            echo "ERROR: expected unapproved high-risk ptrace drift to fail security gate"
+          # A clone allow that lost its arg constraint must fail the gate
+          # (conditional -> unconditional escalation, review item 2/12).
+          node -e '
+            const fs = require("node:fs");
+            const p = JSON.parse(fs.readFileSync("/tmp/committed.json", "utf8"));
+            p.syscalls = p.syscalls.filter(r => !((r.names || []).includes("clone")));
+            p.syscalls.push({ names: ["clone"], action: "SCMP_ACT_ALLOW", args: [{ index: 0, value: 2114060288, valueTwo: 0, op: "SCMP_CMP_MASKED_EQ" }] });
+            fs.writeFileSync("/tmp/committed-clone.json", JSON.stringify(p, null, 2));
+            const c = JSON.parse(fs.readFileSync("/tmp/committed-clone.json", "utf8"));
+            c.syscalls = c.syscalls.filter(r => !((r.names || []).includes("clone")));
+            c.syscalls.push({ names: ["clone"], action: "SCMP_ACT_ALLOW" });
+            fs.writeFileSync("/tmp/escalated.json", JSON.stringify(c, null, 2));
+          '
+          if seccomp-profiler diff --target alpine --committed /tmp/committed-clone.json --current /tmp/escalated.json --fail-on high-risk; then
+            echo "ERROR: expected conditional->unconditional clone escalation to fail security gate"
+            exit 1
+          fi
+          if seccomp-profiler diff --target alpine --committed /tmp/committed.json --current /tmp/escalated.json --fail-on high-risk; then
+            echo "ERROR: expected conditional->unconditional clone escalation to fail security gate"
             exit 1
           fi
           cat > /tmp/accepted.yml <<'EOF'
@@ -149,6 +197,8 @@ jobs:
           test -f /tmp/merged-raw/alpine.profile.v1.json
 
   test-post-hook-and-release-cosign:
+    # Fork PRs cannot get id-token: write — skip instead of failing.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     strategy:
       fail-fast: false
       matrix:
@@ -163,7 +213,7 @@ jobs:
 
       - name: Pre-pull test container image
         run: |
-          test ! -f /usr/local/bin/seccomp-profiler
+          test ! -f /opt/seccomp-profiler/v1.0.0/seccomp-profiler
           docker pull alpine:3.20
 
       - name: Start Seccomp Profiler Action (downloads v1.0.0 release, verifies checksums.txt.sig + pinned SHA-256 + Cosign, auto-stops in post hook)
@@ -171,7 +221,7 @@ jobs:
 
       - name: Run container workload and verify negative Cosign identity rejection
         run: |
-          test -x /usr/local/bin/seccomp-profiler
+          test -x /opt/seccomp-profiler/v1.0.0/seccomp-profiler
           docker run --rm alpine:3.20 echo "testing v1.0.0 release binary + cosign + automatic post hook teardown"
 
           # Negative Test: Sign a binary with THIS workflow's OIDC identity (ci.yml@refs/heads/main)
@@ -191,13 +241,13 @@ jobs:
           /tmp/cosign-neg sign-blob --yes \
             --output-signature /tmp/ci-signed.sig \
             --output-certificate /tmp/ci-signed.pem \
-            /usr/local/bin/seccomp-profiler
+            /opt/seccomp-profiler/v1.0.0/seccomp-profiler
 
-          # 1. Must FAIL when verified against the strict release.yml@refs/tags/v... identity in action/main.js
+          # 1. Must FAIL when verified against the strict release.yml@refs/tags/v... identity in action/lib.js
           node -e '
-            const { verifyCosignSignature } = require("./action/main.js");
+            const { verifyCosignSignature } = require("./action/lib.js");
             try {
-              verifyCosignSignature("/tmp/cosign-neg", "/usr/local/bin/seccomp-profiler", "/tmp/ci-signed.sig", "/tmp/ci-signed.pem");
+              verifyCosignSignature("/tmp/cosign-neg", "/opt/seccomp-profiler/v1.0.0/seccomp-profiler", "/tmp/ci-signed.sig", "/tmp/ci-signed.pem");
               console.error("ERROR: verifyCosignSignature accepted a certificate signed by ci.yml instead of release.yml!");
               process.exit(1);
             } catch (err) {
@@ -207,11 +257,11 @@ jobs:
 
           # 2. Must FAIL when verified against a different repository identity
           node -e '
-            const { verifyCosignSignature } = require("./action/main.js");
+            const { verifyCosignSignature } = require("./action/lib.js");
             try {
               verifyCosignSignature(
                 "/tmp/cosign-neg",
-                "/usr/local/bin/seccomp-profiler",
+                "/opt/seccomp-profiler/v1.0.0/seccomp-profiler",
                 "/tmp/ci-signed.sig",
                 "/tmp/ci-signed.pem",
                 "^https://github\\.com/other-owner/seccomp-profiler/\\.github/workflows/ci\\.yml@refs/heads/main$"

@@ -4,19 +4,37 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag to create or update"
-        required: false
-        default: "v1.0.0"
 
 permissions:
   contents: write
   id-token: write
 
 jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run unit tests (a release is never cut from untested code)
+        run: |
+          test -z "$(gofmt -l . )" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+          node --check action/lib.js
+          node --check action/main.js
+          node --check action/post.js
+          node --test action/action.test.js
+
   release:
+    needs: unit-tests
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -27,9 +45,9 @@ jobs:
         with:
           go-version-file: "go.mod"
 
-      - name: Install Clang, LLVM, and SHA-256 verified Cosign
+      - name: Install pinned Clang/LLVM and SHA-256 verified Cosign
         run: |
-          sudo apt-get update && sudo apt-get install -y clang llvm
+          sudo apt-get update && sudo apt-get install -y clang-18 llvm-18
           curl -fsSL https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64 -o /tmp/cosign
           echo "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  /tmp/cosign" | sha256sum -c -
           chmod +x /tmp/cosign
@@ -37,14 +55,16 @@ jobs:
           cosign version
 
       - name: Build deterministic multi-arch release binaries with embedded eBPF bytecode
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           mkdir -p dist
 
-          make bpf-amd64
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o dist/seccomp-profiler-linux-amd64 ./cmd/seccomp-profiler
+          make bpf-amd64 CLANG=clang-18
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${TAG_NAME}" -o dist/seccomp-profiler-linux-amd64 ./cmd/seccomp-profiler
 
-          make bpf-arm64
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o dist/seccomp-profiler-linux-arm64 ./cmd/seccomp-profiler
+          make bpf-arm64 CLANG=clang-18
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${TAG_NAME}" -o dist/seccomp-profiler-linux-arm64 ./cmd/seccomp-profiler
 
           cd dist
           sha256sum seccomp-profiler-linux-amd64 seccomp-profiler-linux-arm64 > checksums.txt
@@ -69,17 +89,13 @@ jobs:
               "${artifact}"
           done
 
-      - name: Publish GitHub Pre-Release
+      - name: Publish GitHub Release (tag pushes only — never overwrite published assets)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [[ "$TAG" != v* ]]; then
-            TAG="${{ inputs.tag || 'v1.0.0' }}"
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists; refusing to overwrite published assets (re-tag as a new version instead)."
+            exit 1
           fi
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --prerelease
-            gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --prerelease
-          fi
+          gh release create "$TAG_NAME" dist/* --title "$TAG_NAME" --generate-notes

@@ -2,6 +2,7 @@
 
 CLANG ?= clang
 GO ?= go
+VERSION ?= 1.1.0
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),aarch64)
 BPF_ARCH_DEFINE ?= -D__TARGET_ARCH_arm64
@@ -11,7 +12,7 @@ else
 BPF_ARCH_DEFINE ?= -D__TARGET_ARCH_x86
 endif
 BPF_CFLAGS ?= -O2 -g -ffile-prefix-map=$(CURDIR)=. -Wall -Werror -target bpf $(BPF_ARCH_DEFINE)
-GO_LDFLAGS ?= -s -w -buildid=
+GO_LDFLAGS ?= -s -w -buildid= -X main.version=$(VERSION)
 
 all: bpf build
 
