@@ -86,8 +86,9 @@ jobs:
           docker run --rm --security-opt seccomp=unconfined alpine:3.20 sh -c 'apk add --no-cache keyutils >/dev/null && keyctl add user seccomp-probe probe-value @u'
 
           # 5. Application re-exec via /proc/self/exe must be recorded, not
-          #    suppressed as runtime self-exec.
-          docker run --rm alpine:3.20 sh -c 'exec /proc/self/exe echo re-exec-ok'
+          #    suppressed as runtime self-exec. exec -a keeps busybox
+          #    dispatching to the echo applet despite argv[0] rewriting.
+          docker run --rm alpine:3.20 sh -c 'exec -a echo /proc/self/exe re-exec-ok'
 
       - name: Stop Seccomp Profiler Action (mode=stop)
         id: stop_profiler
