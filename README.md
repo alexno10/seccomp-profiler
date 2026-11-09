@@ -2,15 +2,7 @@
 
 Automatically generate and audit Docker [Seccomp](https://docs.docker.com/engine/security/seccomp/) profiles during your GitHub Actions tests — **without changing a single line of your application or test commands**.
 
-<p align="center">
-  <a href="https://github.com/alexno10/seccomp-profiler/raw/main/docs/demo.mp4">
-    <img src="https://raw.githubusercontent.com/alexno10/seccomp-profiler/main/docs/demo.gif" alt="eBPF Seccomp Profiler Launch Video" width="100%" />
-  </a>
-  <br />
-  <sub>
-    🎬 <a href="https://github.com/alexno10/seccomp-profiler/raw/main/docs/demo.mp4"><strong>Watch / Download Full HD Launch Video with Audio (<code>docs/demo.mp4</code>)</strong></a>
-  </sub>
-</p>
+🎬 **[Watch / download the launch video and demo (attached to GitHub Releases)](https://github.com/alexno10/seccomp-profiler/releases)** — large media files are no longer stored in the repository so action runners only download the source tarball.
 
 ---
 
@@ -22,6 +14,20 @@ Writing Seccomp profiles by hand is notoriously hard: allow too little and your 
 1. **Watches your containers in the background** using Linux eBPF while your normal `docker run`, `docker compose`, or **Testcontainers** tests run (even containers that finish in under 10 milliseconds).
 2. **Builds ready-to-use `seccomp.json` profiles** for each service/image by combining the syscalls your container actually used with safe container-startup and shutdown baselines.
 3. **Protects your Pull Requests** by comparing new syscall behavior against your committed profiles, highlighting high-risk syscalls in the **GitHub Job Summary**, and failing the build if an unapproved high-risk syscall appears.
+
+---
+
+## Requirements
+
+| Requirement | Why |
+|---|---|
+| Linux runner with **kernel ≥ 5.19** | The `cgroup_mkdir` tracepoint exposes a full 64-bit cgroup id only from v5.19 (on 5.15–5.18 it is a truncated `int` that cannot be correlated). The daemon fails fast with a clear error on older kernels. |
+| cgroup v2 | Cgroup-id based container correlation. |
+| `sudo` (root) for the daemon | eBPF tracepoints + raw tracepoint attachment. |
+| Docker CLI available | `docker events` / `docker inspect` metadata. |
+| GitHub-hosted `ubuntu-24.04` / `ubuntu-24.04-arm` runners, or self-hosted equivalents | Verified in this repo's CI on both architectures. |
+
+32-bit (compat) binaries are detected but **not supported**: compat hits fail the security gate with an explanatory message, and generated profiles stay native 64-bit only.
 
 ---
 
@@ -79,11 +85,23 @@ steps:
 
 ---
 
-## Approving New High-Risk Syscalls in PRs
+## The Security Gate Cannot Be Widened From Inside a PR
 
-By default (`fail-on: high-risk`), if a Pull Request introduces a high-risk syscall (such as `ptrace`, `mount`, or `bpf`) compared to your committed profile, the action fails the check and explains why in the Job Summary.
+Both the committed reference profile **and** `.seccomp-profiler/accepted.yml` are read from the **PR base ref** (`baseline-ref`, automatic on `pull_request` events), not from the working tree. A PR that adds `ptrace` to its own profile, or that self-approves `ptrace` in `accepted.yml`, gains nothing: the pristine base versions are used for comparison and approval. Changes to those files inside a PR are reported as drift warnings in the Job Summary and still require review.
 
-If the new syscall is intentional, add an approval entry with a reason (and optional expiration date) in `.seccomp-profiler/accepted.yml`:
+Set `baseline-ref: none` to disable (e.g. for scheduled runs on `main`), or pass an explicit ref.
+
+> [!IMPORTANT]
+> Protect `.seccomp-profiler/` and your committed profile directory in `.github/CODEOWNERS` so approval entries require security team review, and enable **Require review from Code Owners** in branch protection:
+>
+> ```gitignore
+> .seccomp-profiler/ @myorg/security-team
+> seccomp/           @myorg/security-team
+> ```
+
+## Approving New High-Risk Syscalls
+
+Because approvals are read from the base ref, merge intentional approval entries to your base branch first (through a CODEOWNERS-protected PR), then rebase:
 
 ```yaml
 version: 1
@@ -94,13 +112,13 @@ accepted:
     expires: 2027-01-01
 ```
 
-> [!IMPORTANT]
-> Protect `.seccomp-profiler/` and your committed profile directory in `.github/CODEOWNERS` so high-risk syscall approvals require security team review:
->
-> ```gitignore
-> .seccomp-profiler/ @myorg/security-team
-> seccomp/           @myorg/security-team
-> ```
+---
+
+## Hardening Built Into Generated Profiles
+
+- `defaultErrnoRet: 38` (ENOSYS) so glibc/musl fall back to older syscall paths instead of crashing (`clone3` → `clone`, `faccessat2`, `statx`, `rseq`).
+- `clone` is never allowed unconditionally: the generated profile masks the `CLONE_NEW*` namespace flags (like Docker's default profile), and `clone3` is answered with ENOSYS so libcs fall back. Use `extra-allow: clone` to consciously opt out.
+- A syscall that was only allowed under argument constraints can never silently become an unconditional allow — such escalations are reported as high-risk drift and fail the gate.
 
 ---
 
@@ -111,15 +129,19 @@ accepted:
 | Input | Default | Description |
 |---|---|---|
 | `mode` | `start` | `start` or `stop`. If `mode: stop` is not called explicitly, the `post:` hook stops the profiler automatically at the end of the job. |
+| `baseline-ref` | `""` (auto) | Git ref to read the committed profile and approvals from. Empty = the PR base ref on `pull_request` events, otherwise the working tree. `none` disables. |
 | `targets` | `""` (auto) | Optional selector rules (`image` / `labels` -> target name). When empty, all non-infra containers are profiled automatically. |
 | `group-by` | `auto` | How multiple containers are grouped into a single profile: `auto` (`com.docker.compose.service` label, falling back to image name), `compose-service`, `image`, or `label:<key>`. |
 | `exclude-images` | `""` | Additional image globs to ignore (appended to built-in exclusions like `testcontainers/ryuk:*` and `moby/buildkit:*`). |
+| `compose-project` | `""` | Only profile containers of this `com.docker.compose.project` (useful on shared self-hosted runners). |
+| `include-preexisting` | `false` | Also profile containers that were already running at start. They are flagged `"preexisting": true` in the raw artifact because their early syscalls were never observed. |
 | `output-dir` | `.seccomp-profiler/profiles` | Directory where generated `<target>.json` OCI seccomp profiles are written. |
 | `committed-profile` | `.seccomp-profiler/profiles/{name}.json` | Path template, directory, or file path of committed reference profile(s) for PR diffing. |
-| `baseline` | `standard` | Baseline layer mode: `standard` (runtime + safe lifecycle syscalls), `minimal` (runtime handover only), or `none` (strictly observed syscalls only). |
+| `baseline` | `standard` | Baseline layer mode: `standard` (runtime + safe lifecycle syscalls), `minimal` (runtime handover only), or `none` (strictly observed syscalls only). Invalid values fail fast at start. |
 | `runtime` | `auto` | Language runtime baseline: `auto`, `go`, `node`, `python`, `java`, or `none`. |
-| `extra-allow` | `""` | Comma- or newline-separated list of additional syscalls to allow. |
-| `on-change` | `report` | Policy when non-high-risk syscalls are added: `report`, `fail`, or `update-pr`. |
+| `extra-allow` | `""` | Comma- or newline-separated list of additional syscalls to allow. Unknown syscall names fail fast. |
+| `prune` | `false` | Do not merge syscalls removed from the committed profile back into the generated output (restores least-privilege; removed syscalls are listed in the summary). |
+| `on-change` | `report` | Policy when non-high-risk syscalls are added: `report`, `fail`, or `update-pr` (writes generated profiles to the committed-profile location for the PR author to commit). |
 | `fail-on` | `high-risk` | Security gate threshold: `high-risk`, `any-new`, or `none`. |
 | `allow-file` | `.seccomp-profiler/accepted.yml` | Path to the YAML file containing explicit syscall approvals. |
 
@@ -132,6 +154,8 @@ accepted:
 | `new-syscalls-count` | Total number of newly added syscalls across all targets. |
 | `high-risk-count` | Number of unapproved high-risk syscalls detected. |
 | `gate-passed` | `true` if the security gate passed, `false` otherwise. |
+
+The gate additionally fails when kernel-side error counters are non-zero (a BPF map filled up, a ring buffer event was dropped, or an out-of-range syscall id was seen) — an incomplete observation must never pass silently.
 
 ---
 
@@ -152,7 +176,7 @@ seccomp-profiler merge \
 
 ## Architecture & Security Documentation
 
-For a deep technical overview of the 3-hook eBPF kernel tracer, Anchor-64 verifier optimization, `runc` initialization suppression, 4-layer provenance model, hand-edit lock protection, and Sigstore Cosign OIDC verification, see [**`docs/ARCHITECTURE.md`**](docs/ARCHITECTURE.md).
+For a deep technical overview of the 3-hook eBPF kernel tracer, Anchor-64 verifier optimization, runc/crun suppression model (and why `prctl(PR_SET_NAME, "runc")` no longer hides syscalls), 4-layer provenance model, hand-edit lock protection, and Sigstore Cosign OIDC verification, see [**`docs/ARCHITECTURE.md`**](docs/ARCHITECTURE.md). For the security policy see [**`SECURITY.md`**](SECURITY.md).
 
 ---
 
