@@ -2,6 +2,16 @@
 
 Automatically generate and audit Docker [Seccomp](https://docs.docker.com/engine/security/seccomp/) profiles during your GitHub Actions tests — **without changing a single line of your application or test commands**.
 
+<p align="center">
+  <a href="https://github.com/alexno10/seccomp-profiler/raw/main/docs/demo.mp4">
+    <img src="https://raw.githubusercontent.com/alexno10/seccomp-profiler/main/docs/demo.gif" alt="eBPF Seccomp Profiler Launch Video" width="100%" />
+  </a>
+  <br />
+  <sub>
+    🎬 <a href="https://github.com/alexno10/seccomp-profiler/raw/main/docs/demo.mp4"><strong>Watch / Download Full HD Launch Video with Audio (<code>docs/demo.mp4</code>)</strong></a>
+  </sub>
+</p>
+
 ---
 
 ## Why Use This Action?

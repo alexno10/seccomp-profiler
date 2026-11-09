@@ -2,6 +2,8 @@
 
 This document describes the internal architecture, kernel eBPF tracing pipeline, layered profile composition, semantic diff engine, and supply-chain verification model of `seccomp-profiler`.
 
+![3-Hook Kernel eBPF Tracer Overview](demo-poster.jpg)
+
 ---
 
 ## 1. System Overview
