@@ -1,6 +1,9 @@
 package diff
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,15 +28,35 @@ type AddedSyscall struct {
 	ApprovalExpired bool
 }
 
+// EscalatedSyscall reports a syscall that was previously only allowed under
+// argument constraints in the committed profile but now appears as an
+// unconditional allow. This is treated as high-risk drift: dropping the
+// constraint silently widens the rule (e.g. clone without the CLONE_NEW* mask
+// is equivalent to unshare).
+type EscalatedSyscall struct {
+	Name            string
+	Risk            RiskLevel
+	RiskReason      string
+	CommittedArgs   string
+	Approved        bool
+	ApprovalReason  string
+	ApprovalExpires string
+	ApprovalExpired bool
+}
+
 type TargetDiff struct {
 	TargetName           string
 	HasCommittedBaseline bool
 	Added                []AddedSyscall
+	Escalated            []EscalatedSyscall
+	ArgsChanged          []string
 	Removed              []string
 	DefaultActionChanged bool
 	OldDefaultAction     string
 	NewDefaultAction     string
 	PreservedArgRules    int
+	CompatObserved       bool
+	CompatHits           uint32
 }
 
 func ResolveCommittedProfilePath(pattern string, targetName string, totalTargets int) string {
@@ -56,6 +79,47 @@ func ResolveCommittedProfilePath(pattern string, targetName string, totalTargets
 	return p
 }
 
+// argsKey returns a canonical JSON encoding of a rule's argument constraints so
+// that conditional rules can be compared structurally (ignoring ordering).
+func argsKey(rule profile.OCISyscallRule) string {
+	if len(rule.Args) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(rule.Args)
+	if err != nil {
+		return fmt.Sprintf("len:%d", len(rule.Args))
+	}
+	return string(b)
+}
+
+func allowRuleSets(profiles []*profile.OCISeccompProfile) (uncond map[string]bool, cond map[string]string) {
+	uncond = make(map[string]bool)
+	cond = make(map[string]string)
+	for _, p := range profiles {
+		if p == nil {
+			continue
+		}
+		for _, r := range p.Syscalls {
+			if r.Action != "SCMP_ACT_ALLOW" && r.Action != "" {
+				continue
+			}
+			if len(r.Args) > 0 {
+				key := argsKey(r)
+				for _, name := range r.Names {
+					if _, ok := cond[name]; !ok || key != "" {
+						cond[name] = key
+					}
+				}
+				continue
+			}
+			for _, name := range r.Names {
+				uncond[name] = true
+			}
+		}
+	}
+	return uncond, cond
+}
+
 func Compare(
 	targetName string,
 	committed *profile.OCISeccompProfile,
@@ -72,60 +136,77 @@ func Compare(
 		HasCommittedBaseline: committed != nil,
 	}
 
-	committedSet := make(map[string]bool)
+	if committed != nil && current != nil && committed.DefaultAction != current.DefaultAction {
+		td.DefaultActionChanged = true
+		td.OldDefaultAction = committed.DefaultAction
+		td.NewDefaultAction = current.DefaultAction
+	}
+
+	committedUncond, committedCond := allowRuleSets([]*profile.OCISeccompProfile{committed})
 	if committed != nil {
-		if committed.DefaultAction != current.DefaultAction {
-			td.DefaultActionChanged = true
-			td.OldDefaultAction = committed.DefaultAction
-			td.NewDefaultAction = current.DefaultAction
-		}
 		for _, r := range committed.Syscalls {
 			if len(r.Args) > 0 {
 				td.PreservedArgRules++
 			}
-			if r.Action == "SCMP_ACT_ALLOW" || r.Action == "" {
-				for _, name := range r.Names {
-					committedSet[name] = true
-				}
-			}
 		}
 	}
-
-	currentSet := make(map[string]bool)
-	if current != nil {
-		for _, r := range current.Syscalls {
-			if r.Action == "SCMP_ACT_ALLOW" || r.Action == "" {
-				for _, name := range r.Names {
-					currentSet[name] = true
-				}
-			}
-		}
-	}
+	currentUncond, currentCond := allowRuleSets([]*profile.OCISeccompProfile{current})
 
 	var addedNames []string
-	for name := range currentSet {
-		if !committedSet[name] {
-			addedNames = append(addedNames, name)
+	for name := range currentUncond {
+		if committedUncond[name] {
+			continue
 		}
+		if _, wasCond := committedCond[name]; wasCond {
+			continue
+		}
+		addedNames = append(addedNames, name)
 	}
 	sort.Strings(addedNames)
 
+	// Conditional -> unconditional escalation: the name existed only under arg
+	// constraints before, and is now allowed without any constraint.
+	var escalatedNames []string
+	for name := range currentUncond {
+		if _, wasCond := committedCond[name]; wasCond && !committedUncond[name] {
+			escalatedNames = append(escalatedNames, name)
+		}
+	}
+	sort.Strings(escalatedNames)
+
+	// Constraint loosening within conditional rules (informational).
+	for name, currKey := range currentCond {
+		if prevKey, ok := committedCond[name]; ok && prevKey != currKey && prevKey != "" {
+			td.ArgsChanged = append(td.ArgsChanged, name)
+		}
+	}
+	sort.Strings(td.ArgsChanged)
+
 	var removedNames []string
-	for name := range committedSet {
-		if !currentSet[name] {
+	for name := range committedUncond {
+		if !currentUncond[name] && !hasCond(currentCond, name) {
+			removedNames = append(removedNames, name)
+		}
+	}
+	for name := range committedCond {
+		if !currentUncond[name] && !hasCond(currentCond, name) {
 			removedNames = append(removedNames, name)
 		}
 	}
 	sort.Strings(removedNames)
-	td.Removed = removedNames
+	td.Removed = dedup(removedNames)
 
 	containerTotal := 0
 	if raw != nil {
 		containerTotal = raw.Target.ContainerCount
+		if raw.Target.CompatSyscallCount > 0 {
+			td.CompatObserved = true
+			td.CompatHits = raw.Target.CompatSyscallCount
+		}
 	}
 
 	for _, name := range addedNames {
-		risk, reason := ClassifySyscall(name)
+		risk, reason := ClassifySyscallRule(name, false)
 		item := AddedSyscall{
 			Name:           name,
 			Risk:           risk,
@@ -139,22 +220,68 @@ func Compare(
 				item.ContainersSeen = meta.ContainersSeen
 			}
 		}
-		if app, ok := findApproval(approvals, targetName, name); ok {
-			item.ApprovalReason = app.Reason
-			item.ApprovalExpires = app.Expires
-			if isExpired(app.Expires, now) {
-				item.ApprovalExpired = true
-				item.Approved = false
-			} else {
-				item.Approved = true
-			}
-		}
+		applyApproval(&item.Approved, &item.ApprovalReason, &item.ApprovalExpires,
+			&item.ApprovalExpired, approvals, targetName, name, now)
 		td.Added = append(td.Added, item)
+	}
+
+	for _, name := range escalatedNames {
+		risk, reason := ClassifySyscallRule(name, false)
+		item := EscalatedSyscall{
+			Name:          name,
+			Risk:          risk,
+			RiskReason:    reason,
+			CommittedArgs: committedCond[name],
+		}
+		approved := false
+		var aReason, aExpires string
+		var aExpired bool
+		applyApproval(&approved, &aReason, &aExpires, &aExpired, approvals, targetName, name, now)
+		item.Approved = approved
+		item.ApprovalReason = aReason
+		item.ApprovalExpires = aExpires
+		item.ApprovalExpired = aExpired
+		td.Escalated = append(td.Escalated, item)
 	}
 
 	return td, nil
 }
 
+func hasCond(cond map[string]string, name string) bool {
+	_, ok := cond[name]
+	return ok
+}
+
+func dedup(in []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, s := range in {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func applyApproval(approved *bool, reason, expires *string, expired *bool,
+	approvals []ApprovalEntry, target, syscall string, now time.Time) {
+	if app, ok := findApproval(approvals, target, syscall); ok {
+		*reason = app.Reason
+		*expires = app.Expires
+		if isExpired(app.Expires, now) {
+			*expired = true
+			*approved = false
+		} else {
+			*approved = true
+		}
+	}
+}
+
+// EvaluateGate validates the policy inputs and decides whether the run passes.
+// on-change: update-pr is treated like report at the gate level (the profiles
+// are written to the committed location for the PR author to commit).
 func EvaluateGate(diffs []*TargetDiff, onChange string, failOn string) (bool, string, error) {
 	oc := strings.ToLower(strings.TrimSpace(onChange))
 	if oc == "" {
@@ -189,6 +316,16 @@ func EvaluateGate(diffs []*TargetDiff, onChange string, failOn string) (bool, st
 				unapprovedHigh = append(unapprovedHigh, fmt.Sprintf("%s:%s", d.TargetName, a.Name))
 			}
 		}
+		for _, e := range d.Escalated {
+			if e.ApprovalExpired {
+				expiredApprovals = append(expiredApprovals, fmt.Sprintf("%s:%s (expired %s)", d.TargetName, e.Name, e.ApprovalExpires))
+			}
+			if e.Approved {
+				continue
+			}
+			unapprovedAny = append(unapprovedAny, fmt.Sprintf("%s:%s (constraint dropped)", d.TargetName, e.Name))
+			unapprovedHigh = append(unapprovedHigh, fmt.Sprintf("%s:%s (constraint dropped)", d.TargetName, e.Name))
+		}
 	}
 
 	if fo == "high-risk" && len(unapprovedHigh) > 0 {
@@ -199,6 +336,13 @@ func EvaluateGate(diffs []*TargetDiff, onChange string, failOn string) (bool, st
 	}
 	if len(expiredApprovals) > 0 && fo != "none" {
 		return false, fmt.Sprintf("expired syscall approvals in accepted.yml: %s", strings.Join(expiredApprovals, ", ")), nil
+	}
+	if fo != "none" {
+		for _, d := range diffs {
+			if d.CompatObserved {
+				return false, fmt.Sprintf("target %q observed 32-bit compatibility syscalls (%d calls): 32-bit compat is unsupported by seccomp-profiler; the generated profile only covers native 64-bit syscalls. Rebuild the workload as 64-bit or exclude the target", d.TargetName, d.CompatHits), nil
+			}
+		}
 	}
 	return true, "all security gate checks passed", nil
 }
@@ -226,4 +370,18 @@ func isExpired(expires string, now time.Time) bool {
 	}
 	nowDate := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
 	return expTime.UTC().Before(nowDate)
+}
+
+// FileChanged reports whether the two files' SHA-256 digests differ. Missing
+// files are compared by existence so that "baseline has file, working tree
+// does not" is also detected as a change.
+func FileChanged(aPath, bPath string) bool {
+	ab, aErr := os.ReadFile(aPath)
+	bb, bErr := os.ReadFile(bPath)
+	if aErr != nil || bErr != nil {
+		return aErr != bErr
+	}
+	ha := sha256.Sum256(ab)
+	hb := sha256.Sum256(bb)
+	return hex.EncodeToString(ha[:]) != hex.EncodeToString(hb[:])
 }

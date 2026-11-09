@@ -3,6 +3,7 @@ package diff
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -19,7 +20,17 @@ type approvalsFile struct {
 	Accepted []ApprovalEntry `json:"accepted" yaml:"accepted"`
 }
 
-// shortcut: parses flat accepted.yml list without external yaml dependency, upgrade to gopkg.in/yaml.v3 if nested anchors are needed
+var knownApprovalKeys = map[string]bool{
+	"target":  true,
+	"syscall": true,
+	"reason":  true,
+	"expires": true,
+}
+
+// shortcut: parses the flat accepted.yml list without external yaml
+// dependencies. It is deliberately fail-closed: unknown keys and list items
+// outside `accepted:` are errors, not silently ignored input. Upgrade to
+// gopkg.in/yaml.v3 with KnownFields(true) if nested anchors are ever needed.
 func LoadApprovals(path string) ([]ApprovalEntry, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
@@ -45,14 +56,17 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 
 	var entries []ApprovalEntry
 	var cur *ApprovalEntry
+	seenKeys := make(map[string]bool)
 	inAccepted := false
 
 	sc := bufio.NewScanner(strings.NewReader(string(data)))
+	lineNo := 0
 	for sc.Scan() {
+		lineNo++
 		line := sc.Text()
 		if idx := strings.Index(line, "#"); idx != -1 {
 			// strip unquoted comments
-			if !strings.Contains(line[:idx], "\"") && !strings.Contains(line[:idx], "'") {
+			if !strings.ContainsAny(line[:idx], "\"'") {
 				line = line[:idx]
 			}
 		}
@@ -65,6 +79,10 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 			continue
 		}
 		if !inAccepted {
+			if strings.HasPrefix(line, "-") {
+				return nil, fmt.Errorf("accepted.yml line %d: list item outside of \"accepted:\" (typo in the header?)", lineNo)
+			}
+			// Top-level keys (e.g. version) are ignored.
 			continue
 		}
 		if strings.HasPrefix(line, "-") {
@@ -72,6 +90,7 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 				entries = append(entries, *cur)
 			}
 			cur = &ApprovalEntry{}
+			seenKeys = make(map[string]bool)
 			line = strings.TrimSpace(strings.TrimPrefix(line, "-"))
 			if line == "" {
 				continue
@@ -84,6 +103,13 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 		if !ok {
 			continue
 		}
+		if !knownApprovalKeys[k] {
+			return nil, fmt.Errorf("accepted.yml line %d: unknown key %q (allowed: target, syscall, reason, expires)", lineNo, k)
+		}
+		if seenKeys[k] {
+			return nil, fmt.Errorf("accepted.yml line %d: duplicate key %q in one entry", lineNo, k)
+		}
+		seenKeys[k] = true
 		switch k {
 		case "target":
 			cur.Target = v
@@ -95,12 +121,17 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 			cur.Expires = v
 		}
 	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
 	if cur != nil && (cur.Syscall != "" || cur.Target != "") {
 		entries = append(entries, *cur)
 	}
-	return entries, sc.Err()
+	return entries, nil
 }
 
+// splitYAMLKV splits "key: value". A quoted value is unquoted and anything
+// after the closing quote (e.g. a trailing comment) is dropped.
 func splitYAMLKV(line string) (string, string, bool) {
 	idx := strings.IndexByte(line, ':')
 	if idx == -1 {
@@ -108,6 +139,10 @@ func splitYAMLKV(line string) (string, string, bool) {
 	}
 	k := strings.TrimSpace(line[:idx])
 	v := strings.TrimSpace(line[idx+1:])
-	v = strings.Trim(v, "\"'")
-	return k, v, true
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') {
+		if end := strings.IndexByte(v[1:], v[0]); end != -1 {
+			return k, v[1 : 1+end], true
+		}
+	}
+	return k, strings.Trim(v, "\"'"), true
 }
