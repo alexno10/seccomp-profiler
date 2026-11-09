@@ -11,6 +11,7 @@ type ContainerRecord struct {
 	Image        string
 	Labels       map[string]string
 	DurationMs   int64
+	Preexisting  bool
 	ExecutedBins []string
 	SyscallHits  map[int]uint32
 	CompatHits   uint32
@@ -23,9 +24,10 @@ type TargetRule struct {
 }
 
 type Config struct {
-	Rules         []TargetRule
-	GroupBy       string
-	ExtraExcludes []string
+	Rules          []TargetRule
+	GroupBy        string
+	ExtraExcludes  []string
+	ComposeProject string
 }
 
 type MatchedTarget struct {
@@ -59,6 +61,10 @@ var defaultExcludeGlobs = []string{
 	"ghcr.io/actions/*",
 }
 
+// NormalizeImageName strips registry, tag, and digest from an image reference.
+// For image-ID-only references ("sha256:...") it returns "sha256"; callers
+// that need a unique fallback should prefer the container ID (see
+// resolveGroupKey).
 func NormalizeImageName(image string) string {
 	s := strings.TrimSpace(image)
 	if idx := strings.IndexByte(s, '@'); idx != -1 {
@@ -76,11 +82,39 @@ func NormalizeImageName(image string) string {
 	return s
 }
 
+// isValidTargetName mirrors profile.ValidateTargetName. Target names are used
+// as output file names by a root daemon, so labels and image names must never
+// be able to traverse paths.
+func isValidTargetName(name string) bool {
+	if name == "" || len(name) > 100 {
+		return false
+	}
+	if name == "." || strings.HasPrefix(name, "..") {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '_' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func Evaluate(cfg Config, containers []ContainerRecord) ([]MatchedTarget, []SkippedContainer) {
 	byName := make(map[string]*MatchedTarget)
 	var skipped []SkippedContainer
 
 	for _, c := range containers {
+		if cfg.ComposeProject != "" && c.Labels["com.docker.compose.project"] != cfg.ComposeProject {
+			skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "compose-project-mismatch"})
+			continue
+		}
+
 		if len(cfg.Rules) > 0 {
 			rule, ok := matchRules(cfg.Rules, c)
 			if !ok {
@@ -97,6 +131,10 @@ func Evaluate(cfg Config, containers []ContainerRecord) ([]MatchedTarget, []Skip
 			if name == "" {
 				name, _ = resolveGroupKey(cfg.GroupBy, c)
 			}
+			if !isValidTargetName(name) {
+				skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "invalid-target-name"})
+				continue
+			}
 			mergeIntoTarget(byName, name, "selector", c)
 			continue
 		}
@@ -111,6 +149,10 @@ func Evaluate(cfg Config, containers []ContainerRecord) ([]MatchedTarget, []Skip
 		}
 
 		targetName, groupByUsed := resolveGroupKey(cfg.GroupBy, c)
+		if !isValidTargetName(targetName) {
+			skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "invalid-target-name"})
+			continue
+		}
 		mergeIntoTarget(byName, targetName, groupByUsed, c)
 	}
 
@@ -152,25 +194,40 @@ func resolveGroupKey(groupBy string, c ContainerRecord) (string, string) {
 	if gb == "" {
 		gb = "auto"
 	}
+	fallback := func() string {
+		if len(c.ID) >= 12 {
+			return c.ID[:12]
+		}
+		return c.ID
+	}
+	imageName := func() string {
+		name := NormalizeImageName(c.Image)
+		// Image-ID-only references all collapse to "sha256"; fall back to the
+		// container ID so unrelated containers never merge into one profile.
+		if name == "sha256" || name == "container" {
+			return fallback()
+		}
+		return name
+	}
 	switch {
 	case gb == "compose-service":
 		if svc := strings.TrimSpace(c.Labels["com.docker.compose.service"]); svc != "" {
 			return svc, "compose-service"
 		}
-		return NormalizeImageName(c.Image), "image"
+		return imageName(), "image"
 	case gb == "image":
-		return NormalizeImageName(c.Image), "image"
+		return imageName(), "image"
 	case strings.HasPrefix(gb, "label:"):
 		key := strings.TrimPrefix(gb, "label:")
 		if val := strings.TrimSpace(c.Labels[key]); val != "" {
 			return val, gb
 		}
-		return NormalizeImageName(c.Image), "image"
+		return imageName(), "image"
 	default: // "auto"
 		if svc := strings.TrimSpace(c.Labels["com.docker.compose.service"]); svc != "" {
 			return svc, "compose-service"
 		}
-		return NormalizeImageName(c.Image), "image"
+		return imageName(), "image"
 	}
 }
 
@@ -217,6 +274,9 @@ func matchesAnyGlob(globs []string, value string) bool {
 func matchGlob(pattern, str string) bool {
 	if pattern == "*" {
 		return true
+	}
+	if pattern == "" {
+		return false
 	}
 	parts := strings.Split(pattern, "*")
 	if len(parts) == 1 {
