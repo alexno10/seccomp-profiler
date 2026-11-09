@@ -80,9 +80,10 @@ jobs:
           # 4. Positive e2e: the profiler MUST observe a high-risk syscall
           #    instead of letting it pass silently. add_key/keyctl are
           #    high-risk yet need no capabilities, unlike unshare which the
-          #    current runner fleet refuses even with seccomp=unconfined and
-          #    CAP_SYS_ADMIN.
-          docker run --rm alpine:3.20 sh -c 'apk add --no-cache keyutils >/dev/null && keyctl add user seccomp-probe probe-value @u'
+          #    current runner fleet refuses even with CAP_SYS_ADMIN.
+          #    seccomp=unconfined only lifts Docker's own default profile,
+          #    which blocks add_key exactly like our gate would.
+          docker run --rm --security-opt seccomp=unconfined alpine:3.20 sh -c 'apk add --no-cache keyutils >/dev/null && keyctl add user seccomp-probe probe-value @u'
 
           # 5. Application re-exec via /proc/self/exe must be recorded, not
           #    suppressed as runtime self-exec.
