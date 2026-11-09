@@ -24,7 +24,7 @@ steps:
   - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
   - name: Start Seccomp Profiler
-    uses: alexno10/seccomp-profiler@c1feb973f021cafdce692b6e2c385023d604d54d # v1.0.0
+    uses: alexno10/seccomp-profiler@b339d64dd75f050c42ed42b006c501af9c4e34d2 # v1.0.0
 
   - name: Run your existing tests (Docker, Compose, or Testcontainers)
     run: docker compose run --rm api go test ./...
@@ -41,7 +41,7 @@ steps:
   - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
   - name: Start Seccomp Profiler
-    uses: alexno10/seccomp-profiler@c1feb973f021cafdce692b6e2c385023d604d54d # v1.0.0
+    uses: alexno10/seccomp-profiler@b339d64dd75f050c42ed42b006c501af9c4e34d2 # v1.0.0
     with:
       mode: start
 
@@ -50,7 +50,7 @@ steps:
 
   - name: Stop Profiler & Generate Profiles
     id: seccomp
-    uses: alexno10/seccomp-profiler@c1feb973f021cafdce692b6e2c385023d604d54d # v1.0.0
+    uses: alexno10/seccomp-profiler@b339d64dd75f050c42ed42b006c501af9c4e34d2 # v1.0.0
     with:
       mode: stop
 
