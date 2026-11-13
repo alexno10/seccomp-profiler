@@ -255,3 +255,38 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectBPFCollectionSourcePrecedence(t *testing.T) {
+	// 1. When embeddedBPFObj is present and no explicit CLI --bpf-obj was passed,
+	// embedded bytecode MUST take precedence over ambient CWD/env files.
+	useEmbed, diskPath := ebpf.SelectBPFCollectionSource("", 1024, func(string) string {
+		return "bpf/profiler.bpf.o"
+	})
+	if !useEmbed || diskPath != "" {
+		t.Fatalf("expected embeddedBPFObj precedence when explicit=\"\" and embeddedLen>0, got useEmbed=%v diskPath=%q", useEmbed, diskPath)
+	}
+
+	// 2. Explicit --bpf-obj CLI flag takes precedence even when embeddedBPFObj exists.
+	useEmbed, diskPath = ebpf.SelectBPFCollectionSource("/opt/custom/profiler.bpf.o", 1024, func(string) string {
+		return "bpf/profiler.bpf.o"
+	})
+	if useEmbed || diskPath != "/opt/custom/profiler.bpf.o" {
+		t.Fatalf("expected explicit path override, got useEmbed=%v diskPath=%q", useEmbed, diskPath)
+	}
+
+	// 3. When embeddedBPFObj is absent (no_embed_bpf), fall back to disk resolver.
+	useEmbed, diskPath = ebpf.SelectBPFCollectionSource("", 0, func(string) string {
+		return "/usr/local/share/seccomp-profiler/profiler.bpf.o"
+	})
+	if useEmbed || diskPath != "/usr/local/share/seccomp-profiler/profiler.bpf.o" {
+		t.Fatalf("expected fallback disk path when embeddedLen==0, got useEmbed=%v diskPath=%q", useEmbed, diskPath)
+	}
+
+	collectorLinuxSrc, err := os.ReadFile(filepath.Join(".", "collector_linux.go"))
+	if err != nil {
+		t.Fatalf("read collector_linux.go: %v", err)
+	}
+	if !strings.Contains(string(collectorLinuxSrc), "SelectBPFCollectionSource(") {
+		t.Fatal("collector_linux.go must use SelectBPFCollectionSource to ensure embeddedBPFObj precedence")
+	}
+}

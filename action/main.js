@@ -6,48 +6,68 @@ const { spawn, execFileSync } = require("node:child_process");
 
 const lib = require("./lib.js");
 
-const DAEMON_LOG_PATH = "/tmp/seccomp-profiler-daemon.log";
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function startDaemon(binPath, baselineDir) {
   const args = lib.sudoArgv(lib.daemonArgs(binPath, baselineDir));
+  const socketPath = lib.getSocketPath();
+  const { dir: logDir, logPath, fd: logFd } = lib.createDaemonLogPath();
+  lib.saveState("STARTED_LOG_DIR", logDir);
 
-  const logFd = fs.openSync(DAEMON_LOG_PATH, "w");
-  const child = spawn("sudo", args, {
+  const sudo = lib.sudoBin();
+  const daemonEnv = lib.buildDaemonEnv();
+  const child = spawn(sudo, args, {
     detached: true,
     stdio: ["ignore", logFd, logFd],
-    env: lib.buildDaemonEnv(),
+    env: daemonEnv,
   });
   child.unref();
   fs.closeSync(logFd);
 
   for (let i = 0; i < 100; i++) {
     try {
-      execFileSync("sudo", lib.sudoArgv([binPath, "ping", "--socket", lib.SOCKET_PATH]), { stdio: "ignore" });
+      execFileSync(sudo, lib.sudoArgv([binPath, "ping", "--socket", socketPath]), {
+        stdio: "ignore",
+        env: daemonEnv,
+      });
       console.log("seccomp-profiler daemon is ready and tracing containers.");
-      return;
+      return logDir;
     } catch (_) {
       await sleep(100);
     }
   }
   let daemonLogs = "";
   try {
-    daemonLogs = fs.readFileSync(DAEMON_LOG_PATH, "utf8");
+    daemonLogs = fs.readFileSync(logPath, "utf8");
+  } catch (_) {}
+  try {
+    fs.rmSync(logDir, { recursive: true, force: true });
   } catch (_) {}
   throw new Error(
-    `Timed out waiting for seccomp-profiler daemon readiness on ${lib.SOCKET_PATH}.\nDaemon log:\n${daemonLogs}`
+    `Timed out waiting for seccomp-profiler daemon readiness on ${socketPath}.\nDaemon log:\n${daemonLogs}`
   );
 }
 
 async function run() {
   const mode = lib.getInput("mode", "start").toLowerCase();
-  const binPath = await lib.ensureBinary();
+  const { binPath, fromCache } = await lib.ensureBinary();
   if (mode === "start") {
     const baselineDir = lib.prepareBaselineCheckout();
-    await startDaemon(binPath, baselineDir);
+    lib.saveState("STARTED_BIN", binPath);
+    lib.saveState("STARTED_BIN_FROM_CACHE", fromCache ? "true" : "false");
+    lib.saveState("STARTED_SOCKET", lib.getSocketPath());
+    lib.saveState("STARTED_STOPPED_MARKER", lib.getStoppedMarker());
+    if (baselineDir) {
+      lib.saveState("STARTED_BASELINE_DIR", baselineDir);
+    }
+    try {
+      await startDaemon(binPath, baselineDir);
+    } catch (err) {
+      lib.cleanupBaselineCheckout(baselineDir);
+      throw err;
+    }
   } else if (mode === "stop") {
     lib.stopDaemon(binPath);
   } else {

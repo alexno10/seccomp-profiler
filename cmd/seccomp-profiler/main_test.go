@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/alexno10/seccomp-profiler/internal/docker"
+	"github.com/alexno10/seccomp-profiler/internal/ebpf"
 	"github.com/alexno10/seccomp-profiler/internal/profile"
 )
 
@@ -113,5 +114,94 @@ func TestStartDockerEventWatcherWaitsForInFlightHandlerOnCancel(t *testing.T) {
 
 	if !handlerDone.Load() {
 		t.Fatal("wg.Wait() returned before in-flight docker event handler completed")
+	}
+}
+
+type fakeCollector struct {
+	mu      sync.Mutex
+	stats   map[uint64]ebpf.CgroupStats
+	deleted []uint64
+}
+
+func (f *fakeCollector) TrackCgroup(uint64) error        { return nil }
+func (f *fakeCollector) Events() <-chan ebpf.KernelEvent { return nil }
+func (f *fakeCollector) ErrorStats() (ebpf.ErrorStats, error) {
+	return ebpf.ErrorStats{}, nil
+}
+func (f *fakeCollector) Detach() error { return nil }
+func (f *fakeCollector) Close() error  { return nil }
+
+func (f *fakeCollector) Flush() (map[uint64]ebpf.CgroupStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[uint64]ebpf.CgroupStats, len(f.stats))
+	for k, v := range f.stats {
+		out[k] = v
+	}
+	return out, nil
+}
+
+func (f *fakeCollector) FlushCgroup(cgID uint64) (ebpf.CgroupStats, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.stats[cgID]
+	return st, ok, nil
+}
+
+func (f *fakeCollector) DeleteCgroup(cgID uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.stats, cgID)
+	f.deleted = append(f.deleted, cgID)
+	return nil
+}
+
+func (f *fakeCollector) wasDeleted(cgID uint64) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range f.deleted {
+		if id == cgID {
+			return true
+		}
+	}
+	return false
+}
+
+func TestDieBeforeKernelCgroupMkdirReclaimsBPFMap(t *testing.T) {
+	cid := strings.Repeat("f", 64)
+	corr := docker.NewCorrelator(func(string) (uint64, error) { return 0, os.ErrNotExist })
+
+	var st ebpf.CgroupStats
+	st.Counts[0] = 5
+	fc := &fakeCollector{stats: map[uint64]ebpf.CgroupStats{42: st}}
+
+	// Container exits (<100ms) and docker "die" arrives before ringbuf delivers EVENT_CGROUP_MKDIR.
+	handleDockerContainerEvent(docker.DockerEvent{
+		Action:   "start",
+		ID:       cid,
+		Image:    "alpine:3.20",
+		Name:     "short",
+		TimeNano: 100,
+	}, corr, fc)
+	handleDockerContainerEvent(docker.DockerEvent{
+		Action:   "die",
+		ID:       cid,
+		TimeNano: 200,
+	}, corr, fc)
+
+	// Delayed ringbuf event arrives afterwards.
+	handleKernelCollectorEvent(ebpf.KernelEvent{
+		Type:       ebpf.EventCgroupMkdir,
+		CgroupID:   42,
+		CgroupPath: "/docker/" + cid,
+	}, corr, fc)
+
+	if !fc.wasDeleted(42) {
+		t.Fatal("expected cgroup 42 to be flushed and deleted from BPF maps when delayed EventCgroupMkdir arrives after die")
+	}
+	liveStats, _ := fc.Flush()
+	records := corr.BuildRecords(liveStats)
+	if len(records) != 1 || records[0].SyscallHits[0] != 5 {
+		t.Fatalf("expected flushed stats preserved in BuildRecords after reclaim, got %+v", records)
 	}
 }

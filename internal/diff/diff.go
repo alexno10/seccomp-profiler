@@ -551,8 +551,15 @@ func EvaluateGate(diffs []*TargetDiff, onChange string, failOn string) (bool, st
 }
 
 func findApproval(approvals []ApprovalEntry, target, syscall string) (ApprovalEntry, bool) {
+	// Exact target entries always take precedence over wildcard ("*") entries,
+	// regardless of ordering inside accepted.yml.
 	for _, a := range approvals {
-		if (a.Target == target || a.Target == "*") && a.Syscall == syscall {
+		if a.Target == target && a.Syscall == syscall {
+			return a, true
+		}
+	}
+	for _, a := range approvals {
+		if a.Target == "*" && a.Syscall == syscall {
 			return a, true
 		}
 	}
@@ -564,25 +571,28 @@ func isExpired(expires string, now time.Time) bool {
 	if s == "" {
 		return false
 	}
-	expTime, err := time.Parse("2006-01-02", s)
-	if err != nil {
-		expTime, err = time.Parse(time.RFC3339, s)
-		if err != nil {
-			return true
-		}
+	nowUTC := now.UTC()
+	if expDate, err := time.Parse("2006-01-02", s); err == nil {
+		// Date-only expiration stays valid through the end of that UTC day.
+		nowDate := time.Date(nowUTC.Year(), nowUTC.Month(), nowUTC.Day(), 0, 0, 0, 0, time.UTC)
+		return expDate.Before(nowDate)
 	}
-	nowDate := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
-	return expTime.UTC().Before(nowDate)
+	if expTime, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return expTime.UTC().Before(nowUTC)
+	}
+	return true
 }
 
-// FileChanged reports whether the two files' SHA-256 digests differ. Missing
-// files are compared by existence so that "baseline has file, working tree
-// does not" is also detected as a change.
+// FileChanged reports whether two files differ. If both are missing it returns
+// false; if only one exists or reading fails otherwise, it returns true.
 func FileChanged(aPath, bPath string) bool {
 	ab, aErr := os.ReadFile(aPath)
 	bb, bErr := os.ReadFile(bPath)
 	if aErr != nil || bErr != nil {
-		return aErr != bErr
+		if os.IsNotExist(aErr) && os.IsNotExist(bErr) {
+			return false
+		}
+		return true
 	}
 	ha := sha256.Sum256(ab)
 	hb := sha256.Sum256(bb)

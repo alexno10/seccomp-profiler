@@ -6,10 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ import (
 	"github.com/alexno10/seccomp-profiler/internal/selector"
 )
 
-var hex64Regex = regexp.MustCompile(`[0-9a-f]{64}`)
+const dockerInspectTimeout = 2 * time.Second
 
 // ephemeralEventAttrs are Docker event Actor attributes that describe the
 // event rather than the container (exitCode, execID, ...). They must not leak
@@ -52,6 +53,7 @@ type containerMeta struct {
 	startNano   int64
 	endNano     int64
 	preexisting bool
+	dead        bool
 }
 
 type Correlator struct {
@@ -78,12 +80,32 @@ func NewCorrelator(resolver InodeResolver) *Correlator {
 	}
 }
 
+// ExtractContainerID returns the innermost (last) exact 64-hex container ID
+// in cgroupPath so nested DinD paths match the child container rather than the
+// outer DinD host container.
 func ExtractContainerID(cgroupPath string) (string, bool) {
-	m := hex64Regex.FindString(strings.ToLower(cgroupPath))
-	if m == "" {
+	s := strings.ToLower(cgroupPath)
+	var last string
+	start := -1
+	for i := 0; i <= len(s); i++ {
+		isHex := i < len(s) && ((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))
+		if isHex {
+			if start == -1 {
+				start = i
+			}
+			continue
+		}
+		if start != -1 {
+			if i-start == 64 {
+				last = s[start:i]
+			}
+			start = -1
+		}
+	}
+	if last == "" {
 		return "", false
 	}
-	return m, true
+	return last, true
 }
 
 func (c *Correlator) RecordDockerEvent(ev DockerEvent) {
@@ -130,14 +152,20 @@ func (c *Correlator) RecordDockerEvent(ev DockerEvent) {
 			meta.startNano = ev.TimeNano
 		}
 	case "start":
-		// Reset endNano on (re)start so a restarted container gets a correct
-		// duration instead of start > end.
-		if ev.TimeNano > 0 {
+		// Reset endNano/dead only on a genuine (re)start newer than any recorded end,
+		// so out-of-order or pre-existing start events do not resurrect dead containers.
+		if ev.TimeNano > 0 && (meta.endNano == 0 || ev.TimeNano > meta.endNano) {
 			meta.startNano = ev.TimeNano
 			meta.endNano = 0
+			meta.dead = false
 		}
-		resolveID = ev.ID
+		if len(c.cidToCgroups[ev.ID]) == 0 {
+			resolveID = ev.ID
+		}
 	case "die", "stop", "destroy":
+		if ev.Action == "die" || ev.Action == "destroy" {
+			meta.dead = true
+		}
 		if ev.TimeNano > 0 && meta.endNano == 0 {
 			meta.endNano = ev.TimeNano
 		}
@@ -149,6 +177,31 @@ func (c *Correlator) RecordDockerEvent(ev DockerEvent) {
 			c.BindCgroup(ino, resolveID)
 		}
 	}
+}
+
+// IsCgroupContainerDead reports whether cgID is bound to a container that has
+// already emitted a die or destroy event.
+func (c *Correlator) IsCgroupContainerDead(cgID uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cid := c.cgroupToCID[cgID]
+	if cid == "" {
+		return false
+	}
+	meta := c.containers[cid]
+	return meta != nil && meta.dead
+}
+
+// ReclaimCgroup flushes any recorded stats for cgID into corr and removes the
+// cgroup entry from the kernel eBPF maps.
+func ReclaimCgroup(corr *Correlator, collector ebpf.Collector, cgID uint64) {
+	if corr == nil || collector == nil || cgID == 0 {
+		return
+	}
+	if st, ok, err := collector.FlushCgroup(cgID); err == nil && ok {
+		corr.RecordDeadStats(cgID, st)
+	}
+	_ = collector.DeleteCgroup(cgID)
 }
 
 func (c *Correlator) BindCgroup(cgroupID uint64, containerID string) {
@@ -335,38 +388,146 @@ func ParseDockerEventJSON(line []byte) (DockerEvent, error) {
 	}, nil
 }
 
+type limitedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.max <= 0 {
+		return len(p), nil
+	}
+	rem := b.max - b.buf.Len()
+	if rem > 0 {
+		if len(p) > rem {
+			_, _ = b.buf.Write(p[:rem])
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string {
+	return strings.TrimSpace(b.buf.String())
+}
+
+// NewDockerEventStreamer returns a StreamDockerEvents-compatible function that
+// remembers the timestamp of the last observed event across reconnects.
+func NewDockerEventStreamer() func(context.Context, func(DockerEvent)) error {
+	var mu sync.Mutex
+	since := time.Now().Add(-5 * time.Second)
+	return func(ctx context.Context, onEvent func(DockerEvent)) error {
+		mu.Lock()
+		curSince := since
+		mu.Unlock()
+		return streamDockerEventsSince(ctx, curSince, func(ev DockerEvent) {
+			if ev.TimeNano > 0 {
+				t := time.Unix(0, ev.TimeNano)
+				mu.Lock()
+				if t.After(since) {
+					since = t
+				}
+				mu.Unlock()
+			}
+			if onEvent != nil {
+				onEvent(ev)
+			}
+		})
+	}
+}
+
 func StreamDockerEvents(ctx context.Context, onEvent func(DockerEvent)) error {
-	since := fmt.Sprintf("%d", time.Now().Add(-5*time.Second).Unix())
+	return streamDockerEventsSince(ctx, time.Now().Add(-5*time.Second), onEvent)
+}
+
+func streamDockerEventsSince(ctx context.Context, sinceTime time.Time, onEvent func(DockerEvent)) error {
+	since := fmt.Sprintf("%d", sinceTime.Unix())
 	cmd := exec.CommandContext(ctx, "docker", "events", "--since", since, "--filter", "type=container", "--format", "{{json .}}")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
+	stderr := &limitedBuffer{max: 4096}
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	sc := bufio.NewScanner(stdout)
+	return readDockerEventStream(ctx, stdout, onEvent, func() error {
+		err := cmd.Wait()
+		if err != nil && stderr.String() != "" {
+			return fmt.Errorf("%w: %s", err, stderr.String())
+		}
+		return err
+	})
+}
+
+func readDockerEventStream(ctx context.Context, r io.Reader, onEvent func(DockerEvent), waitFn func() error) error {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
 		ev, err := ParseDockerEventJSON(sc.Bytes())
-		if err == nil && ev.ID != "" {
+		if err == nil && ev.ID != "" && onEvent != nil {
 			onEvent(ev)
 		}
 	}
-	_ = cmd.Wait()
+	scanErr := sc.Err()
+	var waitErr error
+	if waitFn != nil {
+		waitErr = waitFn()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if scanErr != nil {
+		return fmt.Errorf("read docker events stream: %w", scanErr)
+	}
+	if waitErr != nil {
+		return fmt.Errorf("docker events exited: %w", waitErr)
+	}
 	return nil
+}
+
+type dockerInspectContainer struct {
+	Id     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Image  string            `json:"Image"`
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+}
+
+func defaultDockerCmdRunner(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "docker", args...).Output()
+}
+
+func isContainerNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "no such object") || strings.Contains(s, "no such container") || strings.Contains(s, "not found")
 }
 
 // ScanRunningContainers inspects containers that are already running when the
 // profiler starts. Pre-existing containers are marked so profiles can flag
 // them as partial (their early syscalls were never observed).
 func ScanRunningContainers(ctx context.Context) ([]DockerEvent, map[string]uint64, error) {
-	out, err := exec.CommandContext(ctx, "docker", "ps", "-q", "--no-trunc").Output()
+	return scanRunningContainersWithRunner(ctx, defaultDockerCmdRunner, DefaultResolveContainerCgroupInode)
+}
+
+func scanRunningContainersWithRunner(
+	ctx context.Context,
+	runCmd func(context.Context, ...string) ([]byte, error),
+	resolveFn InodeResolver,
+) ([]DockerEvent, map[string]uint64, error) {
+	out, err := runCmd(ctx, "ps", "-q", "--no-trunc")
 	if err != nil {
 		return nil, nil, err
 	}
 	var ids []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if cid := strings.TrimSpace(line); cid != "" {
+		if cid := strings.TrimSpace(line); cid != "" && !strings.HasPrefix(cid, "-") {
 			ids = append(ids, cid)
 		}
 	}
@@ -374,21 +535,35 @@ func ScanRunningContainers(ctx context.Context) ([]DockerEvent, map[string]uint6
 		return nil, map[string]uint64{}, nil
 	}
 
-	// One batched inspect instead of one docker invocation per container.
-	inspOut, err := exec.CommandContext(ctx, "docker", append([]string{"inspect"}, ids...)...).Output()
-	if err != nil {
-		return nil, nil, err
-	}
-	var inspected []struct {
-		Id     string `json:"Id"`
-		Name   string `json:"Name"`
-		Config struct {
-			Image  string            `json:"Image"`
-			Labels map[string]string `json:"Labels"`
-		} `json:"Config"`
-	}
-	if err := json.Unmarshal(inspOut, &inspected); err != nil {
-		return nil, nil, err
+	var inspected []dockerInspectContainer
+	// Try one batched inspect first; if a short-lived container vanished mid-batch,
+	// fall back to inspecting each ID individually so surviving containers remain tracked.
+	inspOut, batchErr := runCmd(ctx, append([]string{"inspect", "--"}, ids...)...)
+	if batchErr == nil {
+		if err := json.Unmarshal(inspOut, &inspected); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		var lastErr error
+		allNotFound := true
+		for _, id := range ids {
+			singleOut, singleErr := runCmd(ctx, "inspect", "--", id)
+			if singleErr != nil {
+				lastErr = singleErr
+				if !isContainerNotFoundErr(singleErr) {
+					allNotFound = false
+				}
+				continue
+			}
+			var one []dockerInspectContainer
+			if uErr := json.Unmarshal(singleOut, &one); uErr != nil {
+				return nil, nil, uErr
+			}
+			inspected = append(inspected, one...)
+		}
+		if len(inspected) == 0 && !allNotFound && lastErr != nil {
+			return nil, nil, lastErr
+		}
 	}
 
 	var events []DockerEvent
@@ -402,43 +577,160 @@ func ScanRunningContainers(ctx context.Context) ([]DockerEvent, map[string]uint6
 			Labels:      item.Config.Labels,
 			Preexisting: true,
 		})
-		if ino, err := DefaultResolveContainerCgroupInode(item.Id); err == nil && ino != 0 {
-			inodes[item.Id] = ino
+		if resolveFn != nil {
+			if ino, err := resolveFn(item.Id); err == nil && ino != 0 {
+				inodes[item.Id] = ino
+			}
 		}
 	}
 	return events, inodes, nil
 }
 
+func runDockerInspectPID(ctx context.Context, containerID string) (string, error) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Pid}}", "--", containerID).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(bytes.TrimSpace(out))), nil
+}
+
+func isASCIIAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func DefaultResolveContainerCgroupInode(containerID string) (uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerInspectTimeout)
+	defer cancel()
+	return resolveContainerCgroupInode(ctx, "/sys/fs/cgroup", "/proc", containerID, runDockerInspectPID, statInode)
+}
+
+func resolveContainerCgroupInode(
+	ctx context.Context,
+	cgroupRoot string,
+	procRoot string,
+	containerID string,
+	inspectPIDFn func(context.Context, string) (string, error),
+	statFn func(string) (uint64, error),
+) (uint64, error) {
+	if containerID == "" || strings.HasPrefix(containerID, "-") || statFn == nil {
+		return 0, os.ErrNotExist
+	}
 	candidates := []string{
-		filepath.Join("/sys/fs/cgroup/system.slice", fmt.Sprintf("docker-%s.scope", containerID)),
-		filepath.Join("/sys/fs/cgroup/docker", containerID),
+		filepath.Join(cgroupRoot, "system.slice", fmt.Sprintf("docker-%s.scope", containerID)),
+		filepath.Join(cgroupRoot, "docker", containerID),
 	}
 	for _, p := range candidates {
-		if ino, err := statInode(p); err == nil && ino != 0 {
+		if ino, err := statFn(p); err == nil && ino != 0 {
 			return ino, nil
 		}
 	}
-	out, err := exec.Command("docker", "inspect", "--format", "{{.State.Pid}}", containerID).Output()
-	if err != nil {
-		return 0, err
-	}
-	pid := strings.TrimSpace(string(bytes.TrimSpace(out)))
-	if pid == "" || pid == "0" {
-		return 0, os.ErrNotExist
-	}
-	cgBytes, err := os.ReadFile(filepath.Join("/proc", pid, "cgroup"))
-	if err != nil {
-		return 0, err
-	}
-	for _, line := range strings.Split(string(cgBytes), "\n") {
-		parts := strings.SplitN(strings.TrimSpace(line), ":", 3)
-		if len(parts) == 3 && parts[2] != "" {
-			fullPath := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(parts[2], "/"))
-			if ino, err := statInode(fullPath); err == nil && ino != 0 {
-				return ino, nil
+	if inspectPIDFn != nil {
+		pid, err := inspectPIDFn(ctx, containerID)
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		if err == nil && isASCIIAllDigits(pid) && pid != "0" {
+			if cgBytes, err := os.ReadFile(filepath.Join(procRoot, pid, "cgroup")); err == nil {
+				if ino, err := resolveContainerCgroupInodeFromProc(cgroupRoot, cgBytes, containerID, statFn); err == nil && ino != 0 {
+					return ino, nil
+				}
 			}
 		}
+	}
+	return findCgroupDirByContainerID(cgroupRoot, containerID, statFn)
+}
+
+func resolveContainerCgroupInodeFromProc(
+	cgroupRoot string,
+	cgBytes []byte,
+	containerID string,
+	statFn func(string) (uint64, error),
+) (uint64, error) {
+	cidLower := strings.ToLower(containerID)
+	if cidLower == "" || statFn == nil {
+		return 0, os.ErrNotExist
+	}
+	cleanRoot := filepath.Clean(cgroupRoot)
+	var v2Paths, v1Paths []string
+	for _, rawLine := range strings.Split(string(cgBytes), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		rel := strings.TrimPrefix(parts[2], "/")
+		// Reject host root "/" and path traversals, and verify container ID match
+		// so DinD PID namespace collisions never bind an unrelated host cgroup.
+		if rel == "" || rel == "." || strings.Contains(rel, "..") {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(rel), cidLower) {
+			continue
+		}
+		if parts[0] == "0" && parts[1] == "" {
+			v2Paths = append(v2Paths, rel)
+		} else {
+			v1Paths = append(v1Paths, rel)
+		}
+	}
+	for _, rel := range append(v2Paths, v1Paths...) {
+		fullPath := filepath.Clean(filepath.Join(cleanRoot, filepath.FromSlash(rel)))
+		if fullPath == cleanRoot || !strings.HasPrefix(fullPath, cleanRoot+string(filepath.Separator)) {
+			continue
+		}
+		if ino, err := statFn(fullPath); err == nil && ino != 0 {
+			return ino, nil
+		}
+	}
+	return 0, os.ErrNotExist
+}
+
+func findCgroupDirByContainerID(cgroupRoot, containerID string, statFn func(string) (uint64, error)) (uint64, error) {
+	cidLower := strings.ToLower(containerID)
+	if cidLower == "" || statFn == nil {
+		return 0, os.ErrNotExist
+	}
+	cleanRoot := filepath.Clean(cgroupRoot)
+	var matched uint64
+	stopWalk := fs.SkipAll
+	_ = filepath.WalkDir(cleanRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return fs.SkipDir
+		}
+		rel, rErr := filepath.Rel(cleanRoot, path)
+		if rErr != nil || rel == "." {
+			return nil
+		}
+		if strings.Count(rel, string(filepath.Separator)) > 6 {
+			return fs.SkipDir
+		}
+		if strings.Contains(strings.ToLower(d.Name()), cidLower) {
+			if ino, sErr := statFn(path); sErr == nil && ino != 0 {
+				matched = ino
+				return stopWalk
+			}
+		}
+		return nil
+	})
+	if matched != 0 {
+		return matched, nil
 	}
 	return 0, os.ErrNotExist
 }

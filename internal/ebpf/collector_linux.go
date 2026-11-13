@@ -38,17 +38,18 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 		return nil, fmt.Errorf("remove memlock rlimit: %w", err)
 	}
 
-	objPath := resolveBPFObjectPath(bpfObjPath)
+	useEmbedded, objPath := SelectBPFCollectionSource(bpfObjPath, len(embeddedBPFObj), resolveBPFObjectPath)
 	var spec *cebpf.CollectionSpec
 	var err error
-	if _, statErr := os.Stat(objPath); statErr == nil {
-		spec, err = cebpf.LoadCollectionSpec(objPath)
-	} else if len(embeddedBPFObj) > 0 {
+	if useEmbedded {
 		spec, err = cebpf.LoadCollectionSpecFromReader(bytes.NewReader(embeddedBPFObj))
 	} else {
 		spec, err = cebpf.LoadCollectionSpec(objPath)
 	}
 	if err != nil {
+		if useEmbedded {
+			return nil, fmt.Errorf("load embedded BPF collection spec: %w", err)
+		}
 		return nil, fmt.Errorf("load BPF collection spec %q: %w", objPath, err)
 	}
 

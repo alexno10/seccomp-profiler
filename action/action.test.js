@@ -179,3 +179,134 @@ test("prepareBaselineCheckout is a no-op outside pull_request events", () => {
     if (prevBase !== undefined) process.env.GITHUB_BASE_REF = prevBase;
   }
 });
+
+test("buildDaemonEnv sanitizes untrusted PATH entries and falls back cleanly", () => {
+  const env = buildDaemonEnv({
+    PATH: ".:/tmp/evil:/home/runner/.local/bin:/usr/local/bin:/usr/bin:/bin",
+  });
+  assert.equal(env.PATH, "/usr/local/bin:/usr/bin:/bin");
+
+  const fallback = buildDaemonEnv({ PATH: "/tmp/only-untrusted:." });
+  assert.equal(fallback.PATH, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+});
+
+test("daemonArgs omits --bpf-obj unless explicit SECCOMP_PROFILER_BPF_OBJ is configured", () => {
+  delete process.env.SECCOMP_PROFILER_BPF_OBJ;
+  const args = daemonArgs("/usr/local/bin/seccomp-profiler", null);
+  assert.equal(args.includes("--bpf-obj"), false);
+
+  const absCustom = path.resolve(os.tmpdir(), "custom.bpf.o");
+  process.env.SECCOMP_PROFILER_BPF_OBJ = absCustom;
+  try {
+    const argsCustom = daemonArgs("/usr/local/bin/seccomp-profiler", null);
+    const idx = argsCustom.indexOf("--bpf-obj");
+    assert.notEqual(idx, -1);
+    assert.equal(argsCustom[idx + 1], absCustom);
+  } finally {
+    delete process.env.SECCOMP_PROFILER_BPF_OBJ;
+  }
+});
+
+test("createDaemonLogPath allocates private mkdtemp dir instead of predictable /tmp log", () => {
+  const lib = require("./lib.js");
+  assert.equal(typeof lib.createDaemonLogPath, "function");
+  const { dir, logPath, fd } = lib.createDaemonLogPath();
+  try {
+    assert.notEqual(logPath, "/tmp/seccomp-profiler-daemon.log");
+    assert.equal(path.dirname(logPath), dir);
+    assert.equal(typeof fd, "number");
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("downloadFile rejects non-HTTPS URLs and non-HTTPS redirects", async () => {
+  const lib = require("./lib.js");
+  const dest = path.join(os.tmpdir(), `seccomp-dl-test-${Date.now()}`);
+  await assert.rejects(() => lib.downloadFile("http://example.com/file", dest), /HTTPS/i);
+  assert.equal(lib.validateDownloadUrl("https://github.com/alexno10/seccomp-profiler/releases/download/v1.1.1/a").protocol, "https:");
+  assert.throws(() => lib.validateDownloadUrl("http://github.com/foo"), /HTTPS/i);
+  assert.throws(() => lib.validateDownloadUrl("file:///etc/passwd"), /HTTPS/i);
+});
+
+test("validateBaselineRef rejects option injection and resolves pull_request_target and merge_group", () => {
+  const lib = require("./lib.js");
+  assert.throws(() => lib.validateGitRef("--upload-pack=/tmp/evil"), /invalid.*ref/i);
+  assert.throws(() => lib.validateGitRef("main..evil"), /invalid.*ref/i);
+  assert.equal(lib.validateGitRef("main"), "main");
+
+  assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "pull_request_target", GITHUB_BASE_REF: "main" }, ""), "main");
+  assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "merge_group", GITHUB_BASE_REF: "main" }, ""), "main");
+  assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "main" }, ""), "");
+});
+
+test("post hook prefers GITHUB_STATE over poisoned GITHUB_ENV and verifies cached binary SHA-256", () => {
+  const post = require("./post.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-post-test-"));
+  const evilBin = path.join(tmpDir, "evil");
+  const cachedBin = path.join(tmpDir, "cached");
+  const sock = path.join(tmpDir, "ctl.sock");
+  fs.writeFileSync(evilBin, "evil");
+  fs.writeFileSync(cachedBin, "tampered-cache");
+  fs.writeFileSync(sock, "");
+
+  try {
+    const resolved = post.resolvePostConfig(
+      {
+        STATE_STARTED_BIN: cachedBin,
+        STATE_STARTED_BIN_FROM_CACHE: "true",
+        STATE_STARTED_SOCKET: sock,
+        STATE_STARTED_STOPPED_MARKER: path.join(tmpDir, "stopped"),
+        SECCOMP_PROFILER_BIN: evilBin,
+        SECCOMP_PROFILER_SOCKET: "/tmp/poisoned.sock",
+        SECCOMP_PROFILER_STOPPED_MARKER: "/tmp/poisoned-stopped",
+      },
+      { CACHE_PATH: cachedBin }
+    );
+    assert.equal(resolved.binPath, cachedBin);
+    assert.equal(resolved.socketPath, sock);
+    assert.equal(resolved.requirePinnedVerify, true);
+
+    assert.throws(
+      () => post.verifyPostBinary(resolved.binPath, resolved.requirePinnedVerify, "amd64"),
+      /Pinned SHA-256 mismatch/
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("installBinaryAtomically creates root cache dir, installs staging file, and renames atomically", () => {
+  const lib = require("./lib.js");
+  const calls = [];
+  const fakeExec = (cmd, args, opts) => {
+    calls.push({ cmd, args, env: opts && opts.env });
+  };
+  lib.installBinaryAtomically("/tmp/dl/bin", "/opt/seccomp-profiler/v1.1.1", "/opt/seccomp-profiler/v1.1.1/seccomp-profiler", fakeExec);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0].args.slice(0, 2), ["install", "-d"]);
+  assert.equal(calls[1].args[0], "install");
+  assert.equal(calls[2].args[0], "mv");
+  assert.equal(calls[2].args.includes("-f"), true);
+});
+
+test("setState and setOutput encode multiline values safely using delimiters", () => {
+  const lib = require("./lib.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-env-test-"));
+  const outFile = path.join(tmpDir, "github_output");
+  fs.writeFileSync(outFile, "");
+  const prev = process.env.GITHUB_OUTPUT;
+  process.env.GITHUB_OUTPUT = outFile;
+  try {
+    lib.setOutput("profiles-dir", "safe/path");
+    lib.setOutput("tricky", "line1\nevil=1");
+    const content = fs.readFileSync(outFile, "utf8");
+    assert.match(content, /^profiles-dir=safe\/path\n/m);
+    assert.match(content, /^tricky<<ghadelim_/m);
+  } finally {
+    if (prev === undefined) delete process.env.GITHUB_OUTPUT;
+    else process.env.GITHUB_OUTPUT = prev;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

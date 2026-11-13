@@ -60,7 +60,7 @@ jobs:
           DAEMON_PID=$(pgrep -f "seccomp-profiler daemon" | head -n 1)
           test -n "$DAEMON_PID"
           echo "=== daemon log (attach diagnostics) ==="
-          sudo cat /tmp/seccomp-profiler-daemon.log || true
+          sudo cat /tmp/seccomp-profiler-log-*/daemon.log /tmp/seccomp-profiler-daemon.log 2>/dev/null || true
           echo "=== end daemon log ==="
           # sudo cat runs the reader as root; a plain "< /proc/..." redirect
           # would silently fail as the non-root step user and void the check.

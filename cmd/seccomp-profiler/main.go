@@ -78,16 +78,27 @@ func usage() {
 // cgroup id only from v5.19 (before that it is a truncated int, which cannot
 // be correlated with bpf_get_current_cgroup_id). Fail fast instead of silently
 // producing an empty profile.
+func parseLeadingDigits(s string) (int, error) {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, fmt.Errorf("missing numeric prefix in %q", s)
+	}
+	return strconv.Atoi(s[:i])
+}
+
 func kernelAtLeast(release string, major, minor int) bool {
 	parts := strings.SplitN(release, ".", 3)
 	if len(parts) < 2 {
 		return false
 	}
-	maj, err := strconv.Atoi(parts[0])
+	maj, err := parseLeadingDigits(parts[0])
 	if err != nil {
 		return false
 	}
-	min, err := strconv.Atoi(parts[1])
+	min, err := parseLeadingDigits(parts[1])
 	if err != nil {
 		return false
 	}
@@ -156,32 +167,21 @@ func runDaemon(args []string) error {
 		if runningEvents, inodes, err := docker.ScanRunningContainers(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: scan running containers failed: %v\n", err)
 		} else {
-			for _, ev := range runningEvents {
-				corr.RecordDockerEvent(ev)
-			}
 			for cid, ino := range inodes {
 				corr.BindCgroup(ino, cid)
 				_ = collector.TrackCgroup(ino)
+			}
+			for _, ev := range runningEvents {
+				corr.RecordDockerEvent(ev)
 			}
 		}
 	}
 
 	handleDockerEvent := func(ev docker.DockerEvent) {
-		corr.RecordDockerEvent(ev)
-		// Reclaim kernel map entries when a container dies so the maps stay
-		// bounded across large test suites. The final stats snapshot is kept
-		// by the correlator and merged at Stop.
-		if ev.Action == "die" || ev.Action == "destroy" {
-			for _, cgID := range corr.CgroupsForContainer(ev.ID) {
-				if st, ok, err := collector.FlushCgroup(cgID); err == nil && ok {
-					corr.RecordDeadStats(cgID, st)
-				}
-				_ = collector.DeleteCgroup(cgID)
-			}
-		}
+		handleDockerContainerEvent(ev, corr, collector)
 	}
 
-	startDockerEventWatcher(ctx, &dockerWg, docker.StreamDockerEvents, handleDockerEvent)
+	startDockerEventWatcher(ctx, &dockerWg, docker.NewDockerEventStreamer(), handleDockerEvent)
 
 	cfg := daemon.Config{
 		ControlAddr:       *sock,
@@ -216,6 +216,25 @@ func runDaemon(args []string) error {
 		return err
 	}
 	return srv.Wait()
+}
+
+func handleDockerContainerEvent(ev docker.DockerEvent, corr *docker.Correlator, collector ebpf.Collector) {
+	corr.RecordDockerEvent(ev)
+	// Reclaim kernel map entries when a container dies so the maps stay
+	// bounded across large test suites. The final stats snapshot is kept
+	// by the correlator and merged at Stop.
+	if ev.Action == "die" || ev.Action == "destroy" {
+		for _, cgID := range corr.CgroupsForContainer(ev.ID) {
+			docker.ReclaimCgroup(corr, collector, cgID)
+		}
+	}
+}
+
+func handleKernelCollectorEvent(ev ebpf.KernelEvent, corr *docker.Correlator, collector ebpf.Collector) {
+	corr.RecordKernelEvent(ev)
+	if ev.Type == ebpf.EventCgroupMkdir && corr.IsCgroupContainerDead(ev.CgroupID) {
+		docker.ReclaimCgroup(corr, collector, ev.CgroupID)
+	}
 }
 
 func startDockerEventWatcher(
@@ -315,8 +334,14 @@ func runDiff(args []string) error {
 	if err != nil {
 		return err
 	}
+	targetExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "target" {
+			targetExplicit = true
+		}
+	})
 	tName := *target
-	if tName == "default" {
+	if !targetExplicit && tName == "default" {
 		tName = strings.TrimSuffix(filepath.Base(*currentPath), ".json")
 	}
 	td, err := diff.Compare(tName, comm, curr, nil, approvals, time.Now().UTC())
@@ -355,22 +380,41 @@ func runMerge(args []string) error {
 		return err
 	}
 
+	if _, _, err := diff.EvaluateGate(nil, *onChange, *failOn); err != nil {
+		return err
+	}
+
+	seenRaw := make(map[string]bool)
 	var rawPaths []string
+	addRawPath := func(candidate string) error {
+		clean := filepath.Clean(candidate)
+		if abs, err := filepath.Abs(clean); err == nil {
+			clean = abs
+		}
+		if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+			clean = resolved
+		}
+		if seenRaw[clean] {
+			return nil
+		}
+		seenRaw[clean] = true
+		rawPaths = append(rawPaths, clean)
+		return nil
+	}
 	collectFromPath := func(p string) error {
 		info, err := os.Stat(p)
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
-			rawPaths = append(rawPaths, p)
-			return nil
+			return addRawPath(p)
 		}
 		return filepath.WalkDir(p, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
 			if !d.IsDir() && strings.HasSuffix(d.Name(), ".profile.v1.json") {
-				rawPaths = append(rawPaths, path)
+				return addRawPath(path)
 			}
 			return nil
 		})

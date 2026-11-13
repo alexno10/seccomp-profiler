@@ -94,7 +94,7 @@ func RenderMarkdown(in SummaryInput) string {
 	}
 	fmt.Fprintf(&b, "  -%d removed (informational)**\n\n", totalRemoved)
 	if in.GateReason != "" {
-		fmt.Fprintf(&b, "- **Security Gate:** `%s` — %s\n\n", gateBadge, in.GateReason)
+		fmt.Fprintf(&b, "- **Security Gate:** `%s` — %s\n\n", gateBadge, mdCell(in.GateReason))
 	}
 	if in.Prune {
 		fmt.Fprintf(&b, "- **Prune mode:** syscalls removed from the committed profile were NOT re-added; review removed syscalls below before merging.\n\n")
@@ -105,31 +105,32 @@ func RenderMarkdown(in SummaryInput) string {
 	if len(in.UpdatedPaths) > 0 {
 		fmt.Fprintf(&b, "- **on-change: update-pr** wrote updated profiles to:\n")
 		for _, p := range in.UpdatedPaths {
-			fmt.Fprintf(&b, "  - `%s`\n", p)
+			fmt.Fprintf(&b, "  - `%s`\n", mdCell(p))
 		}
 		fmt.Fprintf(&b, "\n  Commit these files to accept the new syscalls.\n\n")
 	}
 
+	renderedDiffs := make(map[string]bool)
 	for _, p := range in.Profiles {
 		tName := p.TargetName
-		fmt.Fprintf(&b, "### Target: `%s`\n\n", tName)
+		fmt.Fprintf(&b, "### Target: `%s`\n\n", mdCell(tName))
 		fmt.Fprintf(&b, "- **Group By:** `%s` | **Containers Merged:** `%d` | **Detected Runtimes:** `%s`\n",
-			p.Raw.Target.GroupBy,
+			mdCell(p.Raw.Target.GroupBy),
 			p.Raw.Target.ContainerCount,
-			strings.Join(p.Raw.Target.DetectedRuntimes, ", "),
+			mdCell(strings.Join(p.Raw.Target.DetectedRuntimes, ", ")),
 		)
 		if wr, ok := writeByTarget[tName]; ok {
 			if wr.ProtectedManualEdit {
-				fmt.Fprintf(&b, "- **Protected Hand-Edited Profile:** kept `%s` untouched; wrote suggested profile to `%s`\n", wr.ProfilePath, wr.SuggestedPath)
+				fmt.Fprintf(&b, "- **Protected Hand-Edited Profile:** kept `%s` untouched; wrote suggested profile to `%s`\n", mdCell(wr.ProfilePath), mdCell(wr.SuggestedPath))
 			} else {
-				fmt.Fprintf(&b, "- **Profile Output:** `%s` (raw: `%s`)\n", wr.ProfilePath, wr.RawPath)
+				fmt.Fprintf(&b, "- **Profile Output:** `%s` (raw: `%s`)\n", mdCell(wr.ProfilePath), mdCell(wr.RawPath))
 			}
 		}
 		fmt.Fprintln(&b)
 
 		if p.Raw.Target.CompatSyscallCount > 0 {
 			fmt.Fprintf(&b, "> [!WARNING]\n> 32-bit compatibility syscalls detected (%d calls) in target `%s`. seccomp-profiler does not support 32-bit compat: the generated profile covers native 64-bit syscalls only and the security gate fails. Rebuild the workload as 64-bit.\n\n",
-				p.Raw.Target.CompatSyscallCount, tName)
+				p.Raw.Target.CompatSyscallCount, mdCell(tName))
 		}
 
 		sourceCounts := make(map[string]int)
@@ -164,78 +165,31 @@ func RenderMarkdown(in SummaryInput) string {
 		fmt.Fprintf(&b, "#### Layer Provenance Breakdown\n\n")
 		fmt.Fprintf(&b, "| Source Layer | Syscall Count |\n|---|---|\n")
 		for _, k := range srcKeys {
-			fmt.Fprintf(&b, "| `%s` | %d |\n", k, sourceCounts[k])
+			fmt.Fprintf(&b, "| `%s` | %d |\n", mdCell(k), sourceCounts[k])
 		}
 		fmt.Fprintln(&b)
 
 		if len(neverObserved) > 0 {
-			fmt.Fprintf(&b, "- **Baseline syscalls never observed at runtime:** `%s`\n", strings.Join(neverObserved, "`, `"))
+			fmt.Fprintf(&b, "- **Baseline syscalls never observed at runtime:** `%s`\n", joinMDCode(neverObserved))
 		}
 		if len(lowCoverage) > 0 {
-			fmt.Fprintf(&b, "- **Low-coverage observed syscalls:** `%s`\n", strings.Join(lowCoverage, "`, `"))
+			fmt.Fprintf(&b, "- **Low-coverage observed syscalls:** `%s`\n", joinMDCode(lowCoverage))
 		}
 		fmt.Fprintln(&b)
 
 		if td, ok := diffByTarget[tName]; ok {
-			if len(td.Added) > 0 {
-				fmt.Fprintf(&b, "#### Newly Added Syscalls\n\n")
-				fmt.Fprintf(&b, "| Syscall | Risk | Sources | Containers Seen | Approval Status | Security Rationale |\n|---|---|---|---|---|---|\n")
-				for _, a := range td.Added {
-					status := "Unapproved"
-					if a.Approved {
-						status = fmt.Sprintf("Approved (%s)", mdCell(a.ApprovalReason))
-					} else if a.ApprovalExpired {
-						status = fmt.Sprintf("Expired (%s)", a.ApprovalExpires)
-					}
-					fmt.Fprintf(&b, "| `%s` | `%s` | `%s` | `%d/%d` | %s | %s |\n",
-						a.Name,
-						a.Risk,
-						strings.Join(a.Sources, ", "),
-						a.ContainersSeen,
-						a.ContainerTotal,
-						status,
-						mdCell(a.RiskReason),
-					)
-				}
-				fmt.Fprintln(&b)
-			}
-			if len(td.Escalated) > 0 {
-				fmt.Fprintf(&b, "#### Constraint Escalations (conditional -> unconditional)\n\n")
-				fmt.Fprintf(&b, "| Syscall | Risk | Security Rationale |\n|---|---|---|\n")
-				for _, e := range td.Escalated {
-					status := ""
-					if e.Approved {
-						status = fmt.Sprintf(" (approved: %s)", mdCell(e.ApprovalReason))
-					}
-					fmt.Fprintf(&b, "| `%s` | `%s` | %s%s |\n", e.Name, e.Risk, mdCell(e.RiskReason), status)
-				}
-				fmt.Fprintln(&b)
-			}
-			if len(td.ArgsChangeDetails) > 0 {
-				fmt.Fprintf(&b, "- **Changed argument constraints:**\n")
-				for _, ac := range td.ArgsChangeDetails {
-					status := "unapproved"
-					if ac.Approved {
-						status = fmt.Sprintf("approved: %s", mdCell(ac.ApprovalReason))
-					} else if ac.ApprovalExpired {
-						status = fmt.Sprintf("expired %s", ac.ApprovalExpires)
-					}
-					fmt.Fprintf(&b, "  - `%s` (`%s`, %s)\n", ac.Name, ac.Risk, status)
-				}
-				fmt.Fprintln(&b)
-			} else if len(td.ArgsChanged) > 0 {
-				fmt.Fprintf(&b, "- **Changed argument constraints:** `%s`\n\n", strings.Join(td.ArgsChanged, "`, `"))
-			}
-			if td.PermissiveDefaultAction {
-				fmt.Fprintf(&b, "> [!WARNING]\n> Target `%s` sets permissive `defaultAction` (`%s`).\n\n", tName, mdCell(td.NewDefaultAction))
-			}
-			if len(td.AddedArchitectures) > 0 {
-				fmt.Fprintf(&b, "> [!WARNING]\n> Target `%s` added unprofiled architecture(s): `%s`.\n\n", tName, strings.Join(td.AddedArchitectures, "`, `"))
-			}
-			if len(td.Removed) > 0 {
-				fmt.Fprintf(&b, "- **Removed syscalls (informational only — not auto-removed):** `%s`\n\n", strings.Join(td.Removed, "`, `"))
-			}
+			renderedDiffs[tName] = true
+			renderTargetDiff(&b, tName, td)
 		}
+	}
+
+	for _, td := range in.Diffs {
+		if td == nil || renderedDiffs[td.TargetName] {
+			continue
+		}
+		renderedDiffs[td.TargetName] = true
+		fmt.Fprintf(&b, "### Target: `%s`\n\n", mdCell(td.TargetName))
+		renderTargetDiff(&b, td.TargetName, td)
 	}
 
 	if len(in.Skipped) > 0 {
@@ -248,7 +202,7 @@ func RenderMarkdown(in SummaryInput) string {
 			}
 			sort.Strings(kv)
 			fmt.Fprintf(&b, "| `%s` | `%s` | `%s` | `%s` |\n",
-				s.ID, mdCell(s.Image), mdCell(strings.Join(kv, ",")), s.Reason)
+				mdCell(s.ID), mdCell(s.Image), mdCell(strings.Join(kv, ",")), mdCell(s.Reason))
 		}
 		fmt.Fprintln(&b)
 	}
@@ -261,4 +215,73 @@ func RenderMarkdown(in SummaryInput) string {
 	}
 
 	return b.String()
+}
+
+func joinMDCode(items []string) string {
+	escaped := make([]string, len(items))
+	for i, item := range items {
+		escaped[i] = mdCell(item)
+	}
+	return strings.Join(escaped, "`, `")
+}
+
+func renderTargetDiff(b *strings.Builder, tName string, td *diff.TargetDiff) {
+	if len(td.Added) > 0 {
+		fmt.Fprintf(b, "#### Newly Added Syscalls\n\n")
+		fmt.Fprintf(b, "| Syscall | Risk | Sources | Containers Seen | Approval Status | Security Rationale |\n|---|---|---|---|---|---|\n")
+		for _, a := range td.Added {
+			status := "Unapproved"
+			if a.Approved {
+				status = fmt.Sprintf("Approved (%s)", mdCell(a.ApprovalReason))
+			} else if a.ApprovalExpired {
+				status = fmt.Sprintf("Expired (%s)", mdCell(a.ApprovalExpires))
+			}
+			fmt.Fprintf(b, "| `%s` | `%s` | `%s` | `%d/%d` | %s | %s |\n",
+				mdCell(a.Name),
+				mdCell(string(a.Risk)),
+				mdCell(strings.Join(a.Sources, ", ")),
+				a.ContainersSeen,
+				a.ContainerTotal,
+				status,
+				mdCell(a.RiskReason),
+			)
+		}
+		fmt.Fprintln(b)
+	}
+	if len(td.Escalated) > 0 {
+		fmt.Fprintf(b, "#### Constraint Escalations (conditional -> unconditional)\n\n")
+		fmt.Fprintf(b, "| Syscall | Risk | Security Rationale |\n|---|---|---|\n")
+		for _, e := range td.Escalated {
+			status := ""
+			if e.Approved {
+				status = fmt.Sprintf(" (approved: %s)", mdCell(e.ApprovalReason))
+			}
+			fmt.Fprintf(b, "| `%s` | `%s` | %s%s |\n", mdCell(e.Name), mdCell(string(e.Risk)), mdCell(e.RiskReason), status)
+		}
+		fmt.Fprintln(b)
+	}
+	if len(td.ArgsChangeDetails) > 0 {
+		fmt.Fprintf(b, "- **Changed argument constraints:**\n")
+		for _, ac := range td.ArgsChangeDetails {
+			status := "unapproved"
+			if ac.Approved {
+				status = fmt.Sprintf("approved: %s", mdCell(ac.ApprovalReason))
+			} else if ac.ApprovalExpired {
+				status = fmt.Sprintf("expired %s", mdCell(ac.ApprovalExpires))
+			}
+			fmt.Fprintf(b, "  - `%s` (`%s`, %s)\n", mdCell(ac.Name), mdCell(string(ac.Risk)), status)
+		}
+		fmt.Fprintln(b)
+	} else if len(td.ArgsChanged) > 0 {
+		fmt.Fprintf(b, "- **Changed argument constraints:** `%s`\n\n", joinMDCode(td.ArgsChanged))
+	}
+	if td.PermissiveDefaultAction {
+		fmt.Fprintf(b, "> [!WARNING]\n> Target `%s` sets permissive `defaultAction` (`%s`).\n\n", mdCell(tName), mdCell(td.NewDefaultAction))
+	}
+	if len(td.AddedArchitectures) > 0 {
+		fmt.Fprintf(b, "> [!WARNING]\n> Target `%s` added unprofiled architecture(s): `%s`.\n\n", mdCell(tName), joinMDCode(td.AddedArchitectures))
+	}
+	if len(td.Removed) > 0 {
+		fmt.Fprintf(b, "- **Removed syscalls (informational only — not auto-removed):** `%s`\n\n", joinMDCode(td.Removed))
+	}
 }

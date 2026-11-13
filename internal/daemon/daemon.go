@@ -83,6 +83,22 @@ func ValidateConfig(cfg Config) error {
 	if fo != "" && fo != "none" && fo != "high-risk" && fo != "any-new" {
 		return fmt.Errorf("invalid fail-on %q: must be none, high-risk, or any-new", cfg.FailOn)
 	}
+	gb := strings.TrimSpace(cfg.GroupBy)
+	gbLower := strings.ToLower(gb)
+	switch {
+	case gb == "", gbLower == "auto", gbLower == "compose-service", gbLower == "image":
+	case strings.HasPrefix(gbLower, "label:"):
+		if strings.TrimSpace(gb[len("label:"):]) == "" {
+			return fmt.Errorf("invalid group-by %q: label key must not be empty", cfg.GroupBy)
+		}
+	default:
+		return fmt.Errorf("invalid group-by %q: must be auto, compose-service, image, or label:<key>", cfg.GroupBy)
+	}
+	if strings.HasPrefix(cfg.ControlAddr, "tcp://") {
+		if err := validateLoopbackTCPAddr(strings.TrimPrefix(cfg.ControlAddr, "tcp://")); err != nil {
+			return err
+		}
+	}
 	for _, extra := range cfg.ExtraAllow {
 		for _, tok := range strings.FieldsFunc(extra, func(r rune) bool {
 			return r == '\n' || r == '\r' || r == ',' || r == ' ' || r == '\t'
@@ -99,6 +115,24 @@ func ValidateConfig(cfg Config) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func validateLoopbackTCPAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid tcp control address %q: %w", addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("non-loopback tcp control address %q is not allowed (must bind to loopback)", addr)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("non-loopback tcp control address %q is not allowed (must bind to 127.0.0.1, ::1, or localhost)", addr)
 	}
 	return nil
 }
@@ -210,6 +244,13 @@ func (s *Server) Start(ctx context.Context) error {
 						return
 					}
 					s.correlator.RecordKernelEvent(ev)
+					if ev.Type == ebpf.EventCgroupMkdir && s.correlator.IsCgroupContainerDead(ev.CgroupID) {
+						s.mu.Lock()
+						if !s.shuttingDown {
+							docker.ReclaimCgroup(s.correlator, s.collector, ev.CgroupID)
+						}
+						s.mu.Unlock()
+					}
 				case <-s.doneCh:
 					return
 				}
@@ -287,24 +328,28 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 	cmd := strings.TrimSpace(sc.Text())
+	_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	switch cmd {
 	case "PING":
 		_, _ = fmt.Fprintln(conn, `{"ok":true}`)
 	case "STOP":
+		s.wg.Add(1)
+		defer func() {
+			go func() {
+				defer s.wg.Done()
+				select {
+				case <-time.After(50 * time.Millisecond):
+					s.shutdown()
+				case <-s.doneCh:
+				}
+			}()
+		}()
 		resp := s.executeStop()
 		b, _ := json.Marshal(resp)
 		_, _ = conn.Write(append(b, '\n'))
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			select {
-			case <-time.After(50 * time.Millisecond):
-				s.shutdown()
-			case <-s.doneCh:
-			}
-		}()
 	default:
-		_, _ = fmt.Fprintf(conn, `{"ok":false,"error":"unknown command %q"}`+"\n", cmd)
+		b, _ := json.Marshal(StopResponse{OK: false, Error: fmt.Sprintf("unknown command %q", cmd)})
+		_, _ = conn.Write(append(b, '\n'))
 	}
 }
 
@@ -481,7 +526,7 @@ func (s *Server) executeStop() *StopResponse {
 
 	if kernelErrs.Any() {
 		summary := fmt.Sprintf("kernel error counters non-zero (%s): some containers or syscalls were not recorded, the generated profile may be incomplete", kernelErrs.String())
-		if s.cfg.FailOn != "none" {
+		if !strings.EqualFold(strings.TrimSpace(s.cfg.FailOn), "none") {
 			gatePassed = false
 			gateReason = summary
 		}
@@ -513,9 +558,8 @@ func (s *Server) executeStop() *StopResponse {
 	}
 
 	if s.cfg.StoppedMarkerPath != "" {
-		_ = os.MkdirAll(filepath.Dir(s.cfg.StoppedMarkerPath), 0o755)
 		if b, err := json.Marshal(resp); err == nil {
-			_ = os.WriteFile(s.cfg.StoppedMarkerPath, b, 0o644)
+			_ = writeMarkerAtomic(s.cfg.StoppedMarkerPath, b)
 		}
 	}
 
@@ -547,19 +591,40 @@ func Ping(addr string) error {
 	return nil
 }
 
-func Stop(addr string, stoppedMarkerPath string) (*StopResponse, error) {
-	if stoppedMarkerPath != "" {
-		if data, err := os.ReadFile(stoppedMarkerPath); err == nil && len(data) > 0 {
-			var cached StopResponse
-			if err := json.Unmarshal(data, &cached); err == nil && cached.OK {
-				return &cached, nil
-			}
-		}
+func writeMarkerAtomic(path string, data []byte) error {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to overwrite symlink %q", path)
 	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".stopped-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
 
+func Stop(addr string, stoppedMarkerPath string) (*StopResponse, error) {
 	network, address := parseControlAddr(addr)
 	conn, err := dialControl(network, address, 5*time.Second)
 	if err != nil {
+		// Fall back to the stopped marker only after confirming the live
+		// daemon is unreachable (e.g. second idempotent stop from post hook).
 		if stoppedMarkerPath != "" {
 			if data, readErr := os.ReadFile(stoppedMarkerPath); readErr == nil && len(data) > 0 {
 				var cached StopResponse

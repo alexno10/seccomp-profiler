@@ -9,9 +9,10 @@ const crypto = require("node:crypto");
 const https = require("node:https");
 const { execFileSync } = require("node:child_process");
 
-const SOCKET_PATH = process.env.SECCOMP_PROFILER_SOCKET || "/run/seccomp-profiler/ctl.sock";
-const STOPPED_MARKER = process.env.SECCOMP_PROFILER_STOPPED_MARKER || "/run/seccomp-profiler/stopped";
-const DAEMON_LOG_PATH = "/tmp/seccomp-profiler-daemon.log";
+const DEFAULT_SOCKET_PATH = "/run/seccomp-profiler/ctl.sock";
+const DEFAULT_STOPPED_MARKER = "/run/seccomp-profiler/stopped";
+const SOCKET_PATH = process.env.SECCOMP_PROFILER_SOCKET || DEFAULT_SOCKET_PATH;
+const STOPPED_MARKER = process.env.SECCOMP_PROFILER_STOPPED_MARKER || DEFAULT_STOPPED_MARKER;
 
 const PINNED_RELEASE_REPO = "alexno10/seccomp-profiler";
 const PINNED_RELEASE_VERSION = "v1.1.1";
@@ -37,6 +38,9 @@ const COSIGN_CERT_IDENTITY_REGEXP =
   "^https://github\\.com/alexno10/seccomp-profiler/\\.github/workflows/release\\.yml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$";
 const COSIGN_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 
+const SAFE_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const TRUSTED_PATH_DIR_RE = /^\/(?:usr\/(?:local\/)?(?:sbin|bin)|sbin|bin)$/;
+
 const DAEMON_ENV_ALLOWLIST = Object.freeze([
   "PATH",
   "HOME",
@@ -54,6 +58,21 @@ const DAEMON_ENV_ALLOWLIST = Object.freeze([
   "SECCOMP_PROFILER_BIN",
 ]);
 
+function sudoBin() {
+  return fs.existsSync("/usr/bin/sudo") ? "/usr/bin/sudo" : "sudo";
+}
+
+function sanitizePath(rawPath) {
+  if (typeof rawPath !== "string" || rawPath.trim() === "") {
+    return SAFE_SYSTEM_PATH;
+  }
+  const kept = rawPath
+    .split(":")
+    .map((p) => p.trim())
+    .filter((p) => TRUSTED_PATH_DIR_RE.test(p));
+  return kept.length > 0 ? kept.join(":") : SAFE_SYSTEM_PATH;
+}
+
 function getInput(name, fallback = "") {
   const upper = name.toUpperCase();
   const hyphenKey = "INPUT_" + upper;
@@ -62,17 +81,51 @@ function getInput(name, fallback = "") {
   return val !== undefined && val !== "" ? val.trim() : fallback;
 }
 
+function validateAbsoluteFilePath(p, label) {
+  if (!path.isAbsolute(p)) {
+    throw new Error(`${label} must be an absolute path: ${p}`);
+  }
+  return p;
+}
+
+function getSocketPath(env = process.env) {
+  const raw = env.STATE_STARTED_SOCKET || env.SECCOMP_PROFILER_SOCKET || DEFAULT_SOCKET_PATH;
+  return validateAbsoluteFilePath(raw, "SECCOMP_PROFILER_SOCKET");
+}
+
+function getStoppedMarker(env = process.env) {
+  const raw = env.STATE_STARTED_STOPPED_MARKER || env.SECCOMP_PROFILER_STOPPED_MARKER || DEFAULT_STOPPED_MARKER;
+  return validateAbsoluteFilePath(raw, "SECCOMP_PROFILER_STOPPED_MARKER");
+}
+
 function resolveBpfObjPath() {
   if (process.env.SECCOMP_PROFILER_BPF_OBJ) {
-    return process.env.SECCOMP_PROFILER_BPF_OBJ;
+    return validateAbsoluteFilePath(process.env.SECCOMP_PROFILER_BPF_OBJ, "SECCOMP_PROFILER_BPF_OBJ");
   }
   return path.resolve(__dirname, "..", "bpf", "profiler.bpf.o");
 }
 
+function appendCommandFile(filePath, key, value) {
+  if (!filePath) return;
+  const k = String(key);
+  if (/[\r\n=]|<</.test(k)) {
+    throw new Error(`Invalid GitHub Actions command-file key: ${k}`);
+  }
+  const str = String(value ?? "");
+  if (str.includes("\n") || str.includes("\r")) {
+    const delim = `ghadelim_${crypto.randomBytes(12).toString("hex")}`;
+    fs.appendFileSync(filePath, `${k}<<${delim}\n${str}\n${delim}\n`, "utf8");
+    return;
+  }
+  fs.appendFileSync(filePath, `${k}=${str}\n`, "utf8");
+}
+
 function setOutput(key, value) {
-  const outPath = process.env.GITHUB_OUTPUT;
-  if (!outPath) return;
-  fs.appendFileSync(outPath, `${key}=${value}\n`, "utf8");
+  appendCommandFile(process.env.GITHUB_OUTPUT, key, value);
+}
+
+function saveState(key, value) {
+  appendCommandFile(process.env.GITHUB_STATE, key, value);
 }
 
 function appendStepSummary(markdown) {
@@ -81,35 +134,82 @@ function appendStepSummary(markdown) {
   fs.appendFileSync(summaryPath, markdown + "\n", "utf8");
 }
 
+function createDaemonLogPath() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-profiler-log-"));
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch (_) {}
+  const logPath = path.join(dir, "daemon.log");
+  const fd = fs.openSync(logPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+  return { dir, logPath, fd };
+}
+
+function validateDownloadUrl(rawUrl) {
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== "https:") {
+    throw new Error(`Refusing non-HTTPS URL protocol "${parsed.protocol}" for ${parsed.hostname || rawUrl}`);
+  }
+  return parsed;
+}
+
 function downloadFile(url, dest, depth = 0) {
   return new Promise((resolve, reject) => {
     if (depth > 5) {
       return reject(new Error(`Too many redirects fetching ${url}`));
     }
-    const req = https.get(url, { timeout: 120000 }, (res) => {
+    let parsed;
+    try {
+      parsed = validateDownloadUrl(url);
+    } catch (err) {
+      return reject(err);
+    }
+
+    const req = https.get(parsed, { timeout: 120000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        const next = new URL(res.headers.location, url).toString();
+        let next;
+        try {
+          next = validateDownloadUrl(new URL(res.headers.location, parsed).toString()).toString();
+        } catch (err) {
+          return reject(err);
+        }
         return resolve(downloadFile(next, dest, depth + 1));
       }
       if (res.statusCode !== 200) {
         res.resume();
         return reject(new Error(`HTTP ${res.statusCode} fetching ${url}`));
       }
-      const file = fs.createWriteStream(dest);
-      res.pipe(file);
+      const file = fs.createWriteStream(dest, { mode: 0o600 });
+      const fail = (err) => {
+        res.destroy();
+        file.destroy();
+        try {
+          fs.rmSync(dest, { force: true });
+        } catch (_) {}
+        reject(err);
+      };
+      res.on("error", fail);
+      file.on("error", fail);
       file.on("finish", () => file.close(resolve));
-      file.on("error", (err) => reject(err));
+      res.pipe(file);
     });
     req.on("timeout", () => req.destroy(new Error(`Timeout fetching ${url}`)));
     req.on("error", reject);
   });
 }
 
+function assertRegularFileNotSymlink(filePath, label) {
+  const st = fs.lstatSync(filePath);
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error(`${label} must be a regular non-symlink file: ${filePath}`);
+  }
+}
+
 function verifyPinnedSha256(filePath, expectedHex, label) {
   if (!expectedHex || !/^[0-9a-f]{64}$/i.test(expectedHex)) {
     throw new Error(`Invalid or missing pinned SHA-256 digest for ${label}`);
   }
+  assertRegularFileNotSymlink(filePath, label);
   const fileBytes = fs.readFileSync(filePath);
   const actualHash = crypto.createHash("sha256").update(fileBytes).digest("hex");
   if (actualHash.toLowerCase() !== expectedHex.toLowerCase()) {
@@ -118,6 +218,7 @@ function verifyPinnedSha256(filePath, expectedHex, label) {
 }
 
 function verifySha256(filePath, checksumsPath, assetName) {
+  assertRegularFileNotSymlink(filePath, assetName);
   const fileBytes = fs.readFileSync(filePath);
   const actualHash = crypto.createHash("sha256").update(fileBytes).digest("hex");
   const lines = fs.readFileSync(checksumsPath, "utf8").split(/\r?\n/);
@@ -193,11 +294,29 @@ async function downloadReleaseAssets(repo, version, assetName, tmpDir) {
   return { binTmp, sigTmp, certTmp, sumsTmp, sumsSigTmp, sumsCertTmp };
 }
 
+function installBinaryAtomically(srcPath, destDir, destPath, execFn = execFileSync) {
+  const sudo = sudoBin();
+  const env = buildDaemonEnv();
+  execFn(sudo, ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", destDir], { stdio: "inherit", env });
+  const stagePath = `${destPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    execFn(sudo, ["install", "-o", "root", "-g", "root", "-m", "0755", srcPath, stagePath], { stdio: "inherit", env });
+    execFn(sudo, ["mv", "-f", stagePath, destPath], { stdio: "inherit", env });
+  } catch (err) {
+    try {
+      execFn(sudo, ["rm", "-f", stagePath], { stdio: "ignore", env });
+    } catch (_) {}
+    throw err;
+  }
+}
+
 async function ensureBinary() {
   // Explicit override (repo CI testing a fresh build, local development):
   // the caller takes responsibility for the binary.
   if (process.env.SECCOMP_PROFILER_BIN) {
-    return process.env.SECCOMP_PROFILER_BIN;
+    const binPath = validateAbsoluteFilePath(process.env.SECCOMP_PROFILER_BIN, "SECCOMP_PROFILER_BIN");
+    assertRegularFileNotSymlink(binPath, "SECCOMP_PROFILER_BIN");
+    return { binPath, fromCache: false };
   }
 
   const arch = process.arch === "arm64" ? "arm64" : "amd64";
@@ -208,7 +327,7 @@ async function ensureBinary() {
     // commit-locked digest (shared runners can be poisoned between jobs).
     try {
       verifyPinnedSha256(BIN_CACHE_PATH, PINNED_BINARY_SHA256[arch], `cached ${assetName}`);
-      return BIN_CACHE_PATH;
+      return { binPath: BIN_CACHE_PATH, fromCache: true };
     } catch (err) {
       console.log(`Cached binary failed verification (${err.message}); re-downloading.`);
     }
@@ -218,37 +337,43 @@ async function ensureBinary() {
   const version = PINNED_RELEASE_VERSION;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-profiler-"));
 
-  const { binTmp, sigTmp, certTmp, sumsTmp, sumsSigTmp, sumsCertTmp } = await downloadReleaseAssets(
-    repo,
-    version,
-    assetName,
-    tmpDir
-  );
+  try {
+    const { binTmp, sigTmp, certTmp, sumsTmp, sumsSigTmp, sumsCertTmp } = await downloadReleaseAssets(
+      repo,
+      version,
+      assetName,
+      tmpDir
+    );
 
-  const cosignBin = await ensureCosign(arch, tmpDir);
+    const cosignBin = await ensureCosign(arch, tmpDir);
 
-  // 1. Verify Cosign signature on checksums.txt before trusting its contents.
-  verifyCosignSignature(cosignBin, sumsTmp, sumsSigTmp, sumsCertTmp);
+    // 1. Verify Cosign signature on checksums.txt before trusting its contents.
+    verifyCosignSignature(cosignBin, sumsTmp, sumsSigTmp, sumsCertTmp);
 
-  // 2. Verify binary digest against signed checksums.txt AND against commit-locked PINNED_BINARY_SHA256.
-  verifySha256(binTmp, sumsTmp, assetName);
-  verifyPinnedSha256(binTmp, PINNED_BINARY_SHA256[arch], assetName);
+    // 2. Verify binary digest against signed checksums.txt AND against commit-locked PINNED_BINARY_SHA256.
+    verifySha256(binTmp, sumsTmp, assetName);
+    verifyPinnedSha256(binTmp, PINNED_BINARY_SHA256[arch], assetName);
 
-  // 3. Verify Cosign signature on the binary itself.
-  verifyCosignSignature(cosignBin, binTmp, sigTmp, certTmp);
+    // 3. Verify Cosign signature on the binary itself.
+    verifyCosignSignature(cosignBin, binTmp, sigTmp, certTmp);
 
-  fs.chmodSync(binTmp, 0o755);
-  execFileSync("sudo", ["mkdir", "-p", BIN_CACHE_DIR], { stdio: "inherit" });
-  execFileSync("sudo", ["cp", binTmp, BIN_CACHE_PATH], { stdio: "inherit" });
-  return BIN_CACHE_PATH;
+    fs.chmodSync(binTmp, 0o755);
+    installBinaryAtomically(binTmp, BIN_CACHE_DIR, BIN_CACHE_PATH);
+    return { binPath: BIN_CACHE_PATH, fromCache: true };
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
 function buildDaemonEnv(baseEnv = process.env) {
   const env = {};
   for (const key of DAEMON_ENV_ALLOWLIST) {
     if (baseEnv[key] !== undefined) {
-      env[key] = baseEnv[key];
+      env[key] = key === "PATH" ? sanitizePath(baseEnv[key]) : baseEnv[key];
     }
+  }
+  if (env.PATH === undefined) {
+    env.PATH = SAFE_SYSTEM_PATH;
   }
   return env;
 }
@@ -260,32 +385,61 @@ function sudoArgv(argv) {
   return ["--preserve-env=" + DAEMON_ENV_ALLOWLIST.join(",")].concat(argv);
 }
 
+function validateGitRef(ref) {
+  if (typeof ref !== "string" || ref.length === 0 || ref.startsWith("-")) {
+    throw new Error(`Invalid baseline git ref: ${ref}`);
+  }
+  if (/[\s\x00-\x1f\x7f~^:?*\[\\]/.test(ref) || ref.includes("..") || ref.includes("@{")) {
+    throw new Error(`Invalid baseline git ref: ${ref}`);
+  }
+  return ref;
+}
+
+function resolveBaselineRef(env = process.env, explicit = getInput("baseline-ref", "")) {
+  const eventName = env.GITHUB_EVENT_NAME || "";
+  const baseRef = env.GITHUB_BASE_REF || "";
+  if (explicit && explicit.toLowerCase() !== "none") {
+    return validateGitRef(explicit);
+  }
+  if ((eventName === "pull_request" || eventName === "pull_request_target" || eventName === "merge_group") && baseRef) {
+    return validateGitRef(baseRef);
+  }
+  return "";
+}
+
 // Review item 1: read the committed profile and approvals from the pristine
 // PR base ref instead of the working tree, so a PR cannot widen its own
 // baseline or self-approve syscalls via accepted.yml.
 function prepareBaselineCheckout() {
-  const explicit = getInput("baseline-ref", "");
-  const eventName = process.env.GITHUB_EVENT_NAME || "";
-  const baseRef = process.env.GITHUB_BASE_REF || "";
-  let ref = "";
-  if (explicit && explicit.toLowerCase() !== "none") {
-    ref = explicit;
-  } else if (eventName === "pull_request" && baseRef) {
-    ref = baseRef;
-  }
+  const ref = resolveBaselineRef();
   if (!ref) {
     return null;
   }
   console.log(`Fetching pristine baseline from origin/${ref} (committed profile & approvals are read from the base ref).`);
-  execFileSync("git", ["fetch", "--depth=1", "--quiet", "origin", ref], {
+  execFileSync("git", ["fetch", "--depth=1", "--quiet", "--", "origin", ref], {
     stdio: ["ignore", "ignore", "inherit"],
   });
   const sha = execFileSync("git", ["rev-parse", "FETCH_HEAD"], { encoding: "utf8" }).trim();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-profiler-baseline-"));
-  execFileSync("git", ["worktree", "add", "--detach", "--quiet", dir, sha], {
-    stdio: ["ignore", "ignore", "inherit"],
-  });
+  try {
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", "--", dir, sha], {
+      stdio: ["ignore", "ignore", "inherit"],
+    });
+  } catch (err) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
   return dir;
+}
+
+function cleanupBaselineCheckout(dir) {
+  if (!dir) return;
+  try {
+    execFileSync("git", ["worktree", "remove", "--force", "--", dir], { stdio: "ignore" });
+  } catch (_) {}
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (_) {}
 }
 
 function daemonArgs(binPath, baselineDir) {
@@ -307,45 +461,53 @@ function daemonArgs(binPath, baselineDir) {
     workingAllow = path.isAbsolute(allowInput) ? allowInput : path.resolve(process.cwd(), allowInput);
   }
 
-  return [
+  const args = [
     "setsid",
     binPath,
     "daemon",
     "--socket",
-    SOCKET_PATH,
+    getSocketPath(),
     "--stopped-marker",
-    STOPPED_MARKER,
-    "--bpf-obj",
-    resolveBpfObjPath(),
-    "--targets",
-    getInput("targets", ""),
-    "--group-by",
-    getInput("group-by", "auto"),
-    "--exclude-images",
-    getInput("exclude-images", ""),
-    "--output-dir",
-    getInput("output-dir", ".seccomp-profiler/profiles"),
-    "--committed-profile",
-    committedArg,
-    "--working-committed-profile",
-    workingCommitted,
-    "--working-allow-file",
-    workingAllow,
-    "--baseline",
-    getInput("baseline", "standard"),
-    "--runtime",
-    getInput("runtime", "auto"),
-    "--extra-allow",
-    getInput("extra-allow", ""),
-    "--on-change",
-    getInput("on-change", "report"),
-    "--fail-on",
-    getInput("fail-on", "high-risk"),
-    "--allow-file",
-    allowArg,
-    "--compose-project",
-    getInput("compose-project", ""),
-  ]
+    getStoppedMarker(),
+  ];
+
+  // Omit --bpf-obj by default so the binary loads its embedded release-signed
+  // eBPF object instead of ambient workspace files. Only pass when explicitly set.
+  if (process.env.SECCOMP_PROFILER_BPF_OBJ) {
+    args.push("--bpf-obj", validateAbsoluteFilePath(process.env.SECCOMP_PROFILER_BPF_OBJ, "SECCOMP_PROFILER_BPF_OBJ"));
+  }
+
+  return args
+    .concat([
+      "--targets",
+      getInput("targets", ""),
+      "--group-by",
+      getInput("group-by", "auto"),
+      "--exclude-images",
+      getInput("exclude-images", ""),
+      "--output-dir",
+      getInput("output-dir", ".seccomp-profiler/profiles"),
+      "--committed-profile",
+      committedArg,
+      "--working-committed-profile",
+      workingCommitted,
+      "--working-allow-file",
+      workingAllow,
+      "--baseline",
+      getInput("baseline", "standard"),
+      "--runtime",
+      getInput("runtime", "auto"),
+      "--extra-allow",
+      getInput("extra-allow", ""),
+      "--on-change",
+      getInput("on-change", "report"),
+      "--fail-on",
+      getInput("fail-on", "high-risk"),
+      "--allow-file",
+      allowArg,
+      "--compose-project",
+      getInput("compose-project", ""),
+    ])
     .concat(getInput("include-preexisting", "false").toLowerCase() === "true" ? ["--include-preexisting"] : [])
     .concat(getInput("prune", "false").toLowerCase() === "true" ? ["--prune"] : []);
 }
@@ -363,11 +525,11 @@ function applyStopOutputs(resp, fallbackProfilesDir, fallbackRawDir) {
   }
 }
 
-function stopDaemon(binPath) {
+function stopDaemon(binPath, socketPath = getSocketPath(), stoppedMarker = getStoppedMarker()) {
   const rawJson = execFileSync(
-    "sudo",
-    sudoArgv([binPath, "stop", "--json", "--socket", SOCKET_PATH, "--stopped-marker", STOPPED_MARKER]),
-    { encoding: "utf8" }
+    sudoBin(),
+    sudoArgv([binPath, "stop", "--json", "--socket", socketPath, "--stopped-marker", stoppedMarker]),
+    { encoding: "utf8", env: buildDaemonEnv() }
   );
   const resp = JSON.parse(rawJson.trim());
   applyStopOutputs(resp, getInput("output-dir", ".seccomp-profiler/profiles"), ".seccomp-profiler/raw");
@@ -379,18 +541,34 @@ function stopDaemon(binPath) {
 }
 
 module.exports = {
+  DEFAULT_SOCKET_PATH,
+  DEFAULT_STOPPED_MARKER,
   SOCKET_PATH,
   STOPPED_MARKER,
   BIN_CACHE_DIR,
   BIN_CACHE_PATH,
+  SAFE_SYSTEM_PATH,
+  sudoBin,
+  sanitizePath,
+  getSocketPath,
+  getStoppedMarker,
+  setOutput,
+  saveState,
+  createDaemonLogPath,
+  validateDownloadUrl,
+  downloadFile,
   verifySha256,
   verifyPinnedSha256,
   verifyCosignSignature,
+  installBinaryAtomically,
   getInput,
   resolveBpfObjPath,
   buildDaemonEnv,
   sudoArgv,
+  validateGitRef,
+  resolveBaselineRef,
   prepareBaselineCheckout,
+  cleanupBaselineCheckout,
   daemonArgs,
   ensureBinary,
   applyStopOutputs,

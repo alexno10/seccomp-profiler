@@ -354,7 +354,7 @@ func saveLockFile(lockFile string, lock lockFileSchema) error {
 	if strings.TrimSpace(lockFile) == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(lockFile), 0o755); err != nil {
+	if err := mkdirAllChown(filepath.Dir(lockFile), 0o755); err != nil {
 		return err
 	}
 	lockBytes, err := json.MarshalIndent(lock, "", "  ")
@@ -384,10 +384,10 @@ func LoadLockHashes(lockFile string) (map[string]string, error) {
 }
 
 func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([]WriteResult, error) {
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	if err := mkdirAllChown(outDir, 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+	if err := mkdirAllChown(rawDir, 0o755); err != nil {
 		return nil, err
 	}
 
@@ -537,7 +537,7 @@ func SyncCommittedProfiles(
 		} else if !os.IsNotExist(err) {
 			return nil, err
 		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := mkdirAllChown(filepath.Dir(path), 0o755); err != nil {
 			return nil, err
 		}
 		if err := writeFileAtomic(path, ociBytes); err != nil {
@@ -617,7 +617,40 @@ func ValidateTargetName(name string) error {
 	return nil
 }
 
+func mkdirAllChown(dir string, perm os.FileMode) error {
+	if strings.TrimSpace(dir) == "" || dir == "." {
+		return nil
+	}
+	var missing []string
+	cur := filepath.Clean(dir)
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		missing = append(missing, cur)
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	if err := os.MkdirAll(dir, perm); err != nil {
+		return err
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		chownToSudoUser(missing[i])
+	}
+	return nil
+}
+
 func writeFileAtomic(path string, data []byte) error {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to overwrite symlink %s", path)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".seccomp-profiler-*")
 	if err != nil {
@@ -629,6 +662,10 @@ func writeFileAtomic(path string, data []byte) error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
@@ -636,6 +673,7 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	chownToSudoUser(tmpName)
 	return os.Rename(tmpName, path)
 }
 
@@ -649,11 +687,14 @@ func chownToSudoUser(paths ...string) {
 	}
 	uid := -1
 	gid := -1
-	if v, err := strconv.Atoi(uidStr); err == nil {
+	if v, err := strconv.Atoi(uidStr); err == nil && v >= 0 {
 		uid = v
 	}
-	if v, err := strconv.Atoi(gidStr); err == nil {
+	if v, err := strconv.Atoi(gidStr); err == nil && v >= 0 {
 		gid = v
+	}
+	if uid < 0 && gid < 0 {
+		return
 	}
 	for _, p := range paths {
 		_ = os.Chown(p, uid, gid)
@@ -716,13 +757,28 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 	for _, tName := range targetOrder {
 		shards := byTarget[tName]
 		first := shards[0]
-		arch := syscalls.Arch(first.Host.Arch)
+		var resolvedArch syscalls.Arch
+		for _, s := range shards {
+			sArch, err := normalizeTargetArch(s.Host.Arch)
+			if err != nil {
+				return nil, fmt.Errorf("target %s: %w", tName, err)
+			}
+			if sArch != "" {
+				if resolvedArch == "" {
+					resolvedArch = sArch
+				} else if resolvedArch != sArch {
+					return nil, fmt.Errorf("cannot merge shards for target %s with mismatched architectures %q and %q", tName, resolvedArch, sArch)
+				}
+			}
+		}
+		arch := resolvedArch
 		if arch == "" {
 			arch = syscalls.ArchAMD64
 		}
 
-		seenContainers := make(map[string]bool)
+		containerIdx := make(map[string]int)
 		var mergedContainers []RawContainerInfo
+		summaryOnlyContainers := 0
 		runtimeSet := make(map[string]bool)
 		var compatCount uint32
 		mergedSyscalls := make(map[string]*RawSyscallEntry)
@@ -734,12 +790,18 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 					runtimeSet[rt] = true
 				}
 			}
+			if len(s.Target.Containers) == 0 && s.Target.ContainerCount > 0 {
+				summaryOnlyContainers += s.Target.ContainerCount
+			}
 			for _, c := range s.Target.Containers {
-				if c.ID != "" && seenContainers[c.ID] {
-					continue
-				}
 				if c.ID != "" {
-					seenContainers[c.ID] = true
+					if idx, ok := containerIdx[c.ID]; ok {
+						if c.Preexisting {
+							mergedContainers[idx].Preexisting = true
+						}
+						continue
+					}
+					containerIdx[c.ID] = len(mergedContainers)
 				}
 				mergedContainers = append(mergedContainers, c)
 			}
@@ -766,12 +828,7 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 			}
 		}
 
-		totalContainers := len(mergedContainers)
-		if totalContainers == 0 {
-			for _, s := range shards {
-				totalContainers += s.Target.ContainerCount
-			}
-		}
+		totalContainers := len(mergedContainers) + summaryOnlyContainers
 		if mergedContainers == nil {
 			mergedContainers = []RawContainerInfo{}
 		}
@@ -802,10 +859,12 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 			DefaultErrnoRet: &eni,
 			Architectures:   syscalls.SeccompArchitectures(arch, false),
 		}
-		// Apply the same clone/clone3 constraint as profile.Build.
+		// Apply the same clone/clone3 constraint as profile.Build unless explicitly
+		// allowed unconditionally via extra-allow provenance.
 		var plainNames, cloneNames []string
 		for _, name := range allNames {
-			if name == "clone" || name == "clone3" {
+			entry := mergedSyscalls[name]
+			if (name == "clone" || name == "clone3") && (entry == nil || !hasSource(entry.Sources, "extra-allow")) {
 				cloneNames = append(cloneNames, name)
 				continue
 			}
@@ -874,50 +933,154 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 //   - arg-constrained rules from BOTH profiles are preserved verbatim, so a
 //     conditional allow can never silently become unconditional;
 //   - non-allow rules (explicit denies) from the committed profile survive.
+func hasSource(sources []string, want string) bool {
+	for _, s := range sources {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeTargetArch(raw string) (syscalls.Arch, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", nil
+	case "amd64", "x86_64":
+		return syscalls.ArchAMD64, nil
+	case "arm64", "aarch64":
+		return syscalls.ArchARM64, nil
+	default:
+		return "", fmt.Errorf("unsupported host architecture %q", raw)
+	}
+}
+
+func canonicalOCIArgs(args []OCISyscallArg) ([]OCISyscallArg, string) {
+	if len(args) == 0 {
+		return nil, "[]"
+	}
+	canon := append([]OCISyscallArg(nil), args...)
+	sort.Slice(canon, func(i, j int) bool {
+		if canon[i].Index != canon[j].Index {
+			return canon[i].Index < canon[j].Index
+		}
+		if canon[i].Op != canon[j].Op {
+			return canon[i].Op < canon[j].Op
+		}
+		if canon[i].Value != canon[j].Value {
+			return canon[i].Value < canon[j].Value
+		}
+		ai, _ := json.Marshal(canon[i])
+		bj, _ := json.Marshal(canon[j])
+		return string(ai) < string(bj)
+	})
+	raw, _ := json.Marshal(canon)
+	return canon, string(raw)
+}
+
 func MergeCommittedIntoOCI(curr *OCISeccompProfile, committed *OCISeccompProfile) {
 	if curr == nil || committed == nil {
 		return
 	}
 	allowSet := make(map[string]bool)
-	var extraRules []OCISyscallRule
-	for _, r := range curr.Syscalls {
-		if len(r.Args) > 0 || r.ErrnoRet != nil {
-			extraRules = append(extraRules, r)
-			continue
-		}
-		if r.Action == "SCMP_ACT_ALLOW" {
+	allRules := make([]OCISyscallRule, 0, len(curr.Syscalls)+len(committed.Syscalls))
+	allRules = append(allRules, curr.Syscalls...)
+	allRules = append(allRules, committed.Syscalls...)
+
+	for _, r := range allRules {
+		if len(r.Args) == 0 && r.ErrnoRet == nil && r.Action == "SCMP_ACT_ALLOW" {
 			for _, n := range r.Names {
-				allowSet[n] = true
+				if n != "" {
+					allowSet[n] = true
+				}
 			}
-		} else if r.Action != "" {
-			extraRules = append(extraRules, r)
 		}
 	}
-	for _, r := range committed.Syscalls {
-		if len(r.Args) > 0 || r.ErrnoRet != nil {
-			extraRules = append(extraRules, r)
+
+	type extraRuleBucket struct {
+		action   string
+		errnoRet *uint32
+		args     []OCISyscallArg
+		nameSet  map[string]bool
+	}
+	var extraOrder []string
+	extraByKey := make(map[string]*extraRuleBucket)
+
+	for _, r := range allRules {
+		if r.Action == "" || (len(r.Args) == 0 && r.ErrnoRet == nil && r.Action == "SCMP_ACT_ALLOW") {
 			continue
 		}
-		if r.Action == "SCMP_ACT_ALLOW" {
-			for _, n := range r.Names {
-				allowSet[n] = true
+		var kept []string
+		for _, n := range r.Names {
+			if n != "" && !allowSet[n] {
+				kept = append(kept, n)
 			}
-		} else if r.Action != "" {
-			extraRules = append(extraRules, r)
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		canonArgs, argsKey := canonicalOCIArgs(r.Args)
+		errnoKey := ""
+		var errnoCopy *uint32
+		if r.ErrnoRet != nil {
+			v := *r.ErrnoRet
+			errnoCopy = &v
+			errnoKey = strconv.FormatUint(uint64(v), 10)
+		}
+		key := r.Action + "|" + errnoKey + "|" + argsKey
+		bucket, ok := extraByKey[key]
+		if !ok {
+			bucket = &extraRuleBucket{
+				action:   r.Action,
+				errnoRet: errnoCopy,
+				args:     canonArgs,
+				nameSet:  make(map[string]bool),
+			}
+			extraByKey[key] = bucket
+			extraOrder = append(extraOrder, key)
+		}
+		for _, n := range kept {
+			bucket.nameSet[n] = true
 		}
 	}
+
 	var names []string
 	for n := range allowSet {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 
-	merged := OCISeccompProfile{}
+	merged := make([]OCISyscallRule, 0, 1+len(extraOrder))
 	if len(names) > 0 {
-		merged.Syscalls = append(merged.Syscalls, OCISyscallRule{Names: names, Action: "SCMP_ACT_ALLOW"})
+		merged = append(merged, OCISyscallRule{Names: names, Action: "SCMP_ACT_ALLOW"})
 	}
-	merged.Syscalls = append(merged.Syscalls, extraRules...)
-	curr.Syscalls = merged.Syscalls
+	for _, key := range extraOrder {
+		bucket := extraByKey[key]
+		extraNames := make([]string, 0, len(bucket.nameSet))
+		for n := range bucket.nameSet {
+			extraNames = append(extraNames, n)
+		}
+		sort.Strings(extraNames)
+		if len(extraNames) == 0 {
+			continue
+		}
+		var errnoCopy *uint32
+		if bucket.errnoRet != nil {
+			v := *bucket.errnoRet
+			errnoCopy = &v
+		}
+		var argsCopy []OCISyscallArg
+		if len(bucket.args) > 0 {
+			argsCopy = append([]OCISyscallArg(nil), bucket.args...)
+		}
+		merged = append(merged, OCISyscallRule{
+			Names:    extraNames,
+			Action:   bucket.action,
+			Args:     argsCopy,
+			ErrnoRet: errnoCopy,
+		})
+	}
+	curr.Syscalls = merged
 }
 
 // ErrnoForUnknownSyscalls returns the ENOSYS errno value used as
