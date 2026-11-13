@@ -372,11 +372,15 @@ int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx) {
 	if (!bpf_map_lookup_elem(&runtime_tids, &parent_tid)) {
 		__u64 cgroup_id = bpf_get_current_cgroup_id();
 		if (bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id)) {
+			bpf_printk("PROFILER_FORK_SKIP_CG ptid=%u cg=%llu", parent_tid, cgroup_id);
 			return 0;
 		}
 		char comm[16] = {};
 		bpf_get_current_comm(comm, sizeof(comm));
 		if (!is_runtime_family_comm(comm)) {
+			if (comm[0] == 'r' || comm[0] == 'c' || comm[0] == 'e') {
+				bpf_printk("PROFILER_FORK_SKIP_COMM ptid=%u cg=%llu comm=%s", parent_tid, cgroup_id, comm);
+			}
 			return 0;
 		}
 	}
@@ -395,6 +399,7 @@ int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx) {
 		return 0;
 	}
 	__u8 one = 1;
+	bpf_printk("PROFILER_FORK_MARK ptid=%u ctid=%u cg=%llu", parent_tid, child_tid, bpf_get_current_cgroup_id());
 	bpf_map_update_elem(&runtime_tids, &child_tid, &one, BPF_ANY);
 	return 0;
 }
@@ -407,13 +412,20 @@ static __inline int handle_exec_enter(void) {
 	if (!bpf_map_lookup_elem(&runtime_tids, &tid)) {
 		__u64 cgroup_id = bpf_get_current_cgroup_id();
 		if (bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id)) {
+			bpf_printk("PROFILER_EXEC_ENT_SKIP_CG tid=%u cg=%llu", tid, cgroup_id);
 			return 0;
 		}
 		char comm[16] = {};
 		bpf_get_current_comm(comm, sizeof(comm));
 		if (!is_runtime_family_comm(comm)) {
+			if (comm[0] == 'r' || comm[0] == 'c' || comm[0] == 'e') {
+				bpf_printk("PROFILER_EXEC_ENT_SKIP_COMM tid=%u cg=%llu comm=%s", tid, cgroup_id, comm);
+			}
 			return 0;
 		}
+		bpf_printk("PROFILER_EXEC_ENT_COMM tid=%u cg=%llu comm=%s", tid, cgroup_id, comm);
+	} else {
+		bpf_printk("PROFILER_EXEC_ENT_RT tid=%u cg=%llu", tid, bpf_get_current_cgroup_id());
 	}
 	__u8 one = 1;
 	bpf_map_update_elem(&exec_pending, &tid, &one, BPF_ANY);
@@ -440,6 +452,10 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	} else {
 		struct syscall_stats *existing = bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id);
 		if (!existing) {
+			__u32 k = (__u32)bpf_get_current_pid_tgid();
+			if (bpf_map_lookup_elem(&runtime_tids, &k) || bpf_map_lookup_elem(&exec_pending, &k)) {
+				bpf_printk("PROFILER_EXEC_DONE_NO_CG tid=%u cg=%llu", k, cgroup_id);
+			}
 			return 0;
 		}
 	}
@@ -465,6 +481,7 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 		// An unreadable filename would look like a self-ref exec and keep
 		// runtime marked; treat it as a workload exec instead (fail open to
 		// recording, never to suppression).
+		bpf_printk("PROFILER_EXEC_BADREAD tid=%u ret=%ld off=%u", tid, read_ok, offset);
 		bpf_map_delete_elem(&runtime_tids, &tid);
 		bpf_map_delete_elem(&exec_pending, &tid);
 		if (cand_state == STATE_PENDING_EXEC) {
@@ -501,6 +518,7 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 		// runc bootstrap re-exec: keep the tid suppressed until it
 		// execs the real container workload. Do not match on comm so
 		// container entrypoints named "runc"/"crun" are never suppressed.
+		bpf_printk("PROFILER_EXEC_KEEP tid=%u cg=%llu path=%s", tid, cgroup_id, ev->path);
 		__u8 one = 1;
 		bpf_map_update_elem(&runtime_tids, &tid, &one, BPF_ANY);
 		return 0;
@@ -509,6 +527,7 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	// Any other exec - the container entrypoint itself, secondary
 	// "docker exec" workloads, application /proc/self/exe re-execs - is a
 	// workload thread: unmark and record.
+	bpf_printk("PROFILER_EXEC_DROP tid=%u pend=%u path=%s", tid, pending, ev->path);
 	bpf_map_delete_elem(&runtime_tids, &tid);
 
 	if (cand_state == STATE_PENDING_EXEC) {
@@ -541,6 +560,9 @@ SEC("tracepoint/sched/sched_process_exit")
 int handle_sched_process_exit(void *ctx) {
 	(void)ctx;
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	if (bpf_map_lookup_elem(&runtime_tids, &tid)) {
+		bpf_printk("PROFILER_EXIT_RT tid=%u cg=%llu", tid, bpf_get_current_cgroup_id());
+	}
 	bpf_map_delete_elem(&runtime_tids, &tid);
 	bpf_map_delete_elem(&exec_pending, &tid);
 	return 0;

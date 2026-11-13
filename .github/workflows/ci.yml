@@ -70,10 +70,12 @@ jobs:
           fi
 
           # 1. Ultra-short-lived (<100ms) container
+          sudo sh -c 'echo > /sys/kernel/tracing/trace' || true
           docker run --rm alpine:3.20 true
 
           # 2. Container with secondary docker exec (also exercises die-cleanup)
           CID=$(docker run -d --rm alpine:3.20 sleep 5)
+          echo "Container2 ID=$CID"
           docker exec "$CID" uname -a
           docker stop -t 1 "$CID" || true
 
@@ -118,6 +120,12 @@ jobs:
               echo "ERROR: ${leaked} leaked into alpine.json"
               echo "--- daemon log ---"
               sudo cat /tmp/seccomp-profiler-daemon.log || true
+              echo "--- kernel bpf trace ---"
+              sudo grep 'PROFILER_' /sys/kernel/tracing/trace | tail -n 200 || true
+              echo "--- versions ---"
+              docker --version || true
+              runc --version || true
+              uname -a || true
               echo "--- leaked syscall provenance ---"
               node -e '
                 const r = require("./.seccomp-profiler/raw/alpine.profile.v1.json");
