@@ -133,9 +133,16 @@ static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static long (*bpf_get_current_comm)(void *buf, __u32 size_of_buf) = (void *)16;
 static void *(*bpf_get_current_task)(void) = (void *)35;
 static __u64 (*bpf_get_current_cgroup_id)(void) = (void *)80;
+static long (*bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) = (void *)6;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *unsafe_ptr) = (void *)113;
 static long (*bpf_probe_read_kernel_str)(void *dst, __u32 size, const void *unsafe_ptr) = (void *)115;
 static long (*bpf_ringbuf_output)(void *ringbuf, void *data, __u64 size, __u64 flags) = (void *)130;
+
+#define bpf_printk(fmt, ...)                                           \
+	({                                                             \
+		char ____fmt[] = fmt;                                  \
+		bpf_trace_printk(____fmt, sizeof(____fmt), __VA_ARGS__); \
+	})
 
 struct trace_event_raw_cgroup_mkdir {
 	__u64 unused;
