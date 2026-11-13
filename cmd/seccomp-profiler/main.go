@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -142,7 +143,11 @@ func runDaemon(args []string) error {
 
 	corr := docker.NewCorrelator(nil)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	var dockerWg sync.WaitGroup
+	defer func() {
+		cancel()
+		dockerWg.Wait()
+	}()
 
 	if *includePreexist {
 		// Pre-scan already-running containers before signaling readiness.
@@ -176,20 +181,7 @@ func runDaemon(args []string) error {
 		}
 	}
 
-	go func() {
-		for {
-			err := docker.StreamDockerEvents(ctx, handleDockerEvent)
-			if ctx.Err() != nil {
-				return
-			}
-			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: docker events stream ended (%v); reconnecting in 2s\n", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(2 * time.Second):
-			}
-		}
-	}()
+	startDockerEventWatcher(ctx, &dockerWg, docker.StreamDockerEvents, handleDockerEvent)
 
 	cfg := daemon.Config{
 		ControlAddr:       *sock,
@@ -224,6 +216,30 @@ func runDaemon(args []string) error {
 		return err
 	}
 	return srv.Wait()
+}
+
+func startDockerEventWatcher(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	streamFn func(context.Context, func(docker.DockerEvent)) error,
+	onEvent func(docker.DockerEvent),
+) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			err := streamFn(ctx, onEvent)
+			if ctx.Err() != nil {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: docker events stream ended (%v); reconnecting in 2s\n", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}()
 }
 
 func daemonKernel() string {
@@ -330,9 +346,11 @@ func runMerge(args []string) error {
 	rawDir := fs.String("raw-dir", ".seccomp-profiler/raw", "Output directory for merged raw v1 profiles")
 	lockFile := fs.String("lock-file", ".seccomp-profiler/lock.json", "Lock file path")
 	committedPattern := fs.String("committed-profile", ".seccomp-profiler/profiles/{name}.json", "Committed profile path/template")
+	workingCommitted := fs.String("working-committed-profile", "", "Working-tree committed profile path/template (for update-pr/drift reporting)")
 	allowFile := fs.String("allow-file", ".seccomp-profiler/accepted.yml", "Approvals file path")
 	onChange := fs.String("on-change", "report", "on-change policy (report|fail|update-pr)")
 	failOn := fs.String("fail-on", "high-risk", "fail-on policy (none|high-risk|any-new)")
+	prune := fs.Bool("prune", false, "Allow removing syscalls not observed in this run from committed profile")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -409,15 +427,32 @@ func runMerge(args []string) error {
 		if cmpErr != nil {
 			return cmpErr
 		}
-		if comm != nil {
+		if !*prune && comm != nil {
 			profile.MergeCommittedIntoOCI(&b.OCI, comm)
 		}
 		diffs = append(diffs, td)
 	}
 
+	preLock, err := profile.LoadLockHashes(*lockFile)
+	if err != nil {
+		return err
+	}
 	writeRes, err := profile.WriteTargetFiles(*outDir, *rawDir, *lockFile, built)
 	if err != nil {
 		return err
+	}
+	var updatedPaths []string
+	if strings.EqualFold(strings.TrimSpace(*onChange), "update-pr") {
+		targetCommitted := *workingCommitted
+		if targetCommitted == "" {
+			targetCommitted = *committedPattern
+		}
+		if targetCommitted != "" {
+			updatedPaths, err = profile.SyncCommittedProfiles(targetCommitted, *outDir, *lockFile, writeRes, preLock, built)
+			if err != nil {
+				return fmt.Errorf("update committed profiles: %w", err)
+			}
+		}
 	}
 	passed, reason, err := diff.EvaluateGate(diffs, *onChange, *failOn)
 	if err != nil {
@@ -427,6 +462,8 @@ func runMerge(args []string) error {
 		Profiles:     built,
 		WriteResults: writeRes,
 		Diffs:        diffs,
+		UpdatedPaths: updatedPaths,
+		Prune:        *prune,
 		GatePassed:   passed,
 		GateReason:   reason,
 	})

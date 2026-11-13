@@ -2,6 +2,8 @@ package profile_test
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -211,5 +213,117 @@ func TestMergeRawProfilesConstrainsClone(t *testing.T) {
 	}
 	if !reflect.DeepEqual(merged[0].OCI.Architectures, []string{"SCMP_ARCH_X86_64"}) {
 		t.Fatalf("expected native-only arch list, got %v", merged[0].OCI.Architectures)
+	}
+}
+
+func TestMergeCommittedIntoOCIDoesNotTreatEmptyActionAsAllow(t *testing.T) {
+	curr := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []profile.OCISyscallRule{
+			{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"},
+			{Names: []string{"mount"}, Action: ""},
+		},
+	}
+	committed := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []profile.OCISyscallRule{
+			{Names: []string{"write"}, Action: "SCMP_ACT_ALLOW"},
+			{Names: []string{"ptrace"}, Action: ""},
+		},
+	}
+	profile.MergeCommittedIntoOCI(curr, committed)
+	for _, r := range curr.Syscalls {
+		if r.Action == "SCMP_ACT_ALLOW" {
+			for _, name := range r.Names {
+				if name == "ptrace" || name == "mount" {
+					t.Fatalf("empty-action rule %q must not be promoted to SCMP_ACT_ALLOW: %+v", name, curr.Syscalls)
+				}
+			}
+		}
+	}
+	allowRule := findRule(*curr, "write")
+	if allowRule == nil || allowRule.Action != "SCMP_ACT_ALLOW" {
+		t.Fatalf("expected write to remain allowed, got %+v", curr.Syscalls)
+	}
+}
+
+func TestUpdateCommittedProfilesLockProtectionAndMultiTarget(t *testing.T) {
+	tmp := t.TempDir()
+	built := buildTarget(t, map[int]uint32{0: 1}, nil, syscalls.ArchAMD64)
+	handwritten := []byte("{\n  \"defaultAction\": \"SCMP_ACT_ERRNO\",\n  \"comment\": \"manual edit\"\n}\n")
+
+	// 1. Missing lock.json must protect existing profile and write .suggested.json instead.
+	commDir := filepath.Join(tmp, "comm-nolock")
+	if err := os.MkdirAll(commDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	targetPath := filepath.Join(commDir, "api.json")
+	if err := os.WriteFile(targetPath, handwritten, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := profile.UpdateCommittedProfiles(filepath.Join(commDir, "{name}.json"), filepath.Join(tmp, "missing-lock.json"), []*profile.BuiltProfile{built})
+	if err != nil {
+		t.Fatalf("UpdateCommittedProfiles failed: %v", err)
+	}
+	got, _ := os.ReadFile(targetPath)
+	if !reflect.DeepEqual(got, handwritten) {
+		t.Fatalf("existing committed profile was overwritten without lock.json")
+	}
+	suggestedPath := filepath.Join(commDir, "api.suggested.json")
+	if _, statErr := os.Stat(suggestedPath); statErr != nil {
+		t.Fatalf("expected api.suggested.json when lock.json is missing: %v", statErr)
+	}
+	if len(updated) != 1 || updated[0] != suggestedPath {
+		t.Fatalf("expected updated=[%s], got %v", suggestedPath, updated)
+	}
+
+	// 2. Lock file present without target key must also protect existing profile.
+	partialLock := filepath.Join(tmp, "partial-lock.json")
+	if err := os.WriteFile(partialLock, []byte(`{"files":{"other":"deadbeef"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commDir2 := filepath.Join(tmp, "comm-nokey")
+	if err := os.MkdirAll(commDir2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	targetPath2 := filepath.Join(commDir2, "api.json")
+	if err := os.WriteFile(targetPath2, handwritten, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := profile.UpdateCommittedProfiles(filepath.Join(commDir2, "{name}.json"), partialLock, []*profile.BuiltProfile{built}); err != nil {
+		t.Fatalf("UpdateCommittedProfiles nokey failed: %v", err)
+	}
+	got2, _ := os.ReadFile(targetPath2)
+	if !reflect.DeepEqual(got2, handwritten) {
+		t.Fatalf("existing committed profile was overwritten when key absent from lock.json")
+	}
+
+	// 3. Corrupt lock.json must fail closed in both WriteTargetFiles and UpdateCommittedProfiles.
+	corruptLock := filepath.Join(tmp, "corrupt-lock.json")
+	if err := os.WriteFile(corruptLock, []byte(`{not-json`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := profile.WriteTargetFiles(filepath.Join(tmp, "out-c"), filepath.Join(tmp, "raw-c"), corruptLock, []*profile.BuiltProfile{built}); err == nil {
+		t.Fatal("expected WriteTargetFiles to fail closed on corrupt lock.json")
+	}
+	if _, err := profile.UpdateCommittedProfiles(filepath.Join(commDir2, "{name}.json"), corruptLock, []*profile.BuiltProfile{built}); err == nil {
+		t.Fatal("expected UpdateCommittedProfiles to fail closed on corrupt lock.json")
+	}
+
+	// 4. Multi-target parity with diff.ResolveCommittedProfilePath when pattern ends in .json without {name}.
+	multiDir := filepath.Join(tmp, "multi")
+	worker := buildTarget(t, map[int]uint32{1: 1}, nil, syscalls.ArchAMD64)
+	worker.TargetName = "worker"
+	worker.Raw.Target.Name = "worker"
+	if _, err := profile.UpdateCommittedProfiles(filepath.Join(multiDir, "profile.json"), filepath.Join(tmp, "multi-lock.json"), []*profile.BuiltProfile{built, worker}); err != nil {
+		t.Fatalf("multi-target UpdateCommittedProfiles failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(multiDir, "api.json")); err != nil {
+		t.Fatalf("expected multi-target api.json: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(multiDir, "worker.json")); err != nil {
+		t.Fatalf("expected multi-target worker.json: %v", err)
 	}
 }

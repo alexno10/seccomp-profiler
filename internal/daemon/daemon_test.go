@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/alexno10/seccomp-profiler/internal/baseline"
@@ -15,6 +16,7 @@ import (
 )
 
 type mockCollector struct {
+	mu       sync.Mutex
 	eventsCh chan ebpf.KernelEvent
 	stats    map[uint64]ebpf.CgroupStats
 	tracked  []uint64
@@ -22,22 +24,36 @@ type mockCollector struct {
 }
 
 func (m *mockCollector) TrackCgroup(id uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.tracked = append(m.tracked, id)
 	return nil
 }
 func (m *mockCollector) Events() <-chan ebpf.KernelEvent { return m.eventsCh }
 func (m *mockCollector) Flush() (map[uint64]ebpf.CgroupStats, error) {
-	return m.stats, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[uint64]ebpf.CgroupStats, len(m.stats))
+	for k, v := range m.stats {
+		out[k] = v
+	}
+	return out, nil
 }
 func (m *mockCollector) FlushCgroup(id uint64) (ebpf.CgroupStats, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	st, ok := m.stats[id]
 	return st, ok, nil
 }
 func (m *mockCollector) DeleteCgroup(id uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.stats, id)
 	return nil
 }
 func (m *mockCollector) ErrorStats() (ebpf.ErrorStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.errs, nil
 }
 func (m *mockCollector) Detach() error { return nil }

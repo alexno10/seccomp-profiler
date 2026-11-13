@@ -120,11 +120,14 @@ type Server struct {
 	listener   net.Listener
 	listenAddr string
 
-	mu         sync.Mutex
-	stopped    bool
-	cachedResp *StopResponse
-	doneCh     chan struct{}
-	doneOnce   sync.Once
+	mu           sync.Mutex
+	stopped      bool
+	shuttingDown bool
+	cachedResp   *StopResponse
+	doneCh       chan struct{}
+	doneOnce     sync.Once
+	shutdownOnce sync.Once
+	wg           sync.WaitGroup
 }
 
 func NewServer(cfg Config, collector ebpf.Collector, correlator *docker.Correlator) (*Server, error) {
@@ -196,13 +199,25 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	if s.collector != nil {
+		eventsCh := s.collector.Events()
+		s.wg.Add(1)
 		go func() {
-			for ev := range s.collector.Events() {
-				s.correlator.RecordKernelEvent(ev)
+			defer s.wg.Done()
+			for {
+				select {
+				case ev, ok := <-eventsCh:
+					if !ok {
+						return
+					}
+					s.correlator.RecordKernelEvent(ev)
+				case <-s.doneCh:
+					return
+				}
 			}
 		}()
 	}
 
+	s.wg.Add(1)
 	go s.acceptLoop(ctx)
 	return nil
 }
@@ -213,6 +228,7 @@ func (s *Server) Addr() string {
 
 func (s *Server) Wait() error {
 	<-s.doneCh
+	s.wg.Wait()
 	return nil
 }
 
@@ -220,18 +236,34 @@ func (s *Server) closeDone() {
 	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
+// shutdown coordinates teardown across STOP and context cancellation so
+// listener/collector shutdown runs once and never overlaps an active executeStop.
+func (s *Server) shutdown() {
+	s.shutdownOnce.Do(func() {
+		if s.listener != nil {
+			_ = s.listener.Close()
+		}
+		s.mu.Lock()
+		s.shuttingDown = true
+		if s.collector != nil {
+			_ = s.collector.Close()
+		}
+		s.mu.Unlock()
+		s.closeDone()
+	})
+}
+
 func (s *Server) acceptLoop(ctx context.Context) {
+	defer s.wg.Done()
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		select {
 		case <-ctx.Done():
 			// SIGTERM/SIGINT: fully tear down (listener, eBPF programs) so
 			// the root daemon never outlives its parent on self-hosted
 			// runners.
-			_ = s.listener.Close()
-			if s.collector != nil {
-				_ = s.collector.Close()
-			}
-			s.closeDone()
+			s.shutdown()
 		case <-s.doneCh:
 		}
 	}()
@@ -262,13 +294,14 @@ func (s *Server) handleConn(conn net.Conn) {
 		resp := s.executeStop()
 		b, _ := json.Marshal(resp)
 		_, _ = conn.Write(append(b, '\n'))
+		s.wg.Add(1)
 		go func() {
-			time.Sleep(50 * time.Millisecond)
-			_ = s.listener.Close()
-			if s.collector != nil {
-				_ = s.collector.Close()
+			defer s.wg.Done()
+			select {
+			case <-time.After(50 * time.Millisecond):
+				s.shutdown()
+			case <-s.doneCh:
 			}
-			s.closeDone()
 		}()
 	default:
 		_, _ = fmt.Fprintf(conn, `{"ok":false,"error":"unknown command %q"}`+"\n", cmd)
@@ -281,6 +314,9 @@ func (s *Server) executeStop() *StopResponse {
 
 	if s.stopped && s.cachedResp != nil {
 		return s.cachedResp
+	}
+	if s.shuttingDown {
+		return &StopResponse{OK: false, Error: "daemon shutting down"}
 	}
 
 	var stats map[uint64]ebpf.CgroupStats
@@ -390,6 +426,13 @@ func (s *Server) executeStop() *StopResponse {
 		}
 	}
 
+	preLock, err := profile.LoadLockHashes(s.cfg.LockFile)
+	if err != nil {
+		resp := &StopResponse{OK: false, Error: err.Error()}
+		s.cachedResp = resp
+		return resp
+	}
+
 	writeResults, err := profile.WriteTargetFiles(s.cfg.OutputDir, s.cfg.RawDir, s.cfg.LockFile, builtProfiles)
 	if err != nil {
 		resp := &StopResponse{OK: false, Error: err.Error()}
@@ -398,12 +441,18 @@ func (s *Server) executeStop() *StopResponse {
 	}
 
 	var updatedPaths []string
-	if strings.EqualFold(strings.TrimSpace(s.cfg.OnChange), "update-pr") && s.cfg.WorkingCommitted != "" {
-		updatedPaths, err = profile.UpdateCommittedProfiles(s.cfg.WorkingCommitted, s.cfg.LockFile, builtProfiles)
-		if err != nil {
-			resp := &StopResponse{OK: false, Error: fmt.Sprintf("update committed profiles: %v", err)}
-			s.cachedResp = resp
-			return resp
+	if strings.EqualFold(strings.TrimSpace(s.cfg.OnChange), "update-pr") {
+		targetCommitted := s.cfg.WorkingCommitted
+		if targetCommitted == "" {
+			targetCommitted = s.cfg.CommittedProfile
+		}
+		if targetCommitted != "" {
+			updatedPaths, err = profile.SyncCommittedProfiles(targetCommitted, s.cfg.OutputDir, s.cfg.LockFile, writeResults, preLock, builtProfiles)
+			if err != nil {
+				resp := &StopResponse{OK: false, Error: fmt.Sprintf("update committed profiles: %v", err)}
+				s.cachedResp = resp
+				return resp
+			}
 		}
 	}
 

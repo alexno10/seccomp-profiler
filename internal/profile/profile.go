@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -328,6 +329,60 @@ func Build(target selector.MatchedTarget, opts BuildOptions) (*BuiltProfile, err
 	}, nil
 }
 
+func loadLockFile(lockFile string) (lockFileSchema, error) {
+	lock := lockFileSchema{Files: make(map[string]string)}
+	if strings.TrimSpace(lockFile) == "" {
+		return lock, nil
+	}
+	lockData, err := os.ReadFile(lockFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return lock, nil
+		}
+		return lockFileSchema{}, fmt.Errorf("read lock file %q: %w", lockFile, err)
+	}
+	if err := json.Unmarshal(lockData, &lock); err != nil {
+		return lockFileSchema{}, fmt.Errorf("parse lock file %q: %w", lockFile, err)
+	}
+	if lock.Files == nil {
+		lock.Files = make(map[string]string)
+	}
+	return lock, nil
+}
+
+func saveLockFile(lockFile string, lock lockFileSchema) error {
+	if strings.TrimSpace(lockFile) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(lockFile), 0o755); err != nil {
+		return err
+	}
+	lockBytes, err := json.MarshalIndent(lock, "", "  ")
+	if err != nil {
+		return err
+	}
+	lockBytes = append(lockBytes, '\n')
+	if err := writeFileAtomic(lockFile, lockBytes); err != nil {
+		return err
+	}
+	chownToSudoUser(lockFile)
+	return nil
+}
+
+// LoadLockHashes loads a snapshot of existing target->sha256 entries from
+// lockFile. Missing lockFile returns an empty map; corrupt lockFile fails.
+func LoadLockHashes(lockFile string) (map[string]string, error) {
+	lock, err := loadLockFile(lockFile)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(lock.Files))
+	for k, v := range lock.Files {
+		out[k] = v
+	}
+	return out, nil
+}
+
 func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([]WriteResult, error) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, err
@@ -336,12 +391,9 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 		return nil, err
 	}
 
-	lock := lockFileSchema{Files: make(map[string]string)}
-	if lockData, err := os.ReadFile(lockFile); err == nil {
-		_ = json.Unmarshal(lockData, &lock)
-		if lock.Files == nil {
-			lock.Files = make(map[string]string)
-		}
+	lock, err := loadLockFile(lockFile)
+	if err != nil {
+		return nil, err
 	}
 
 	var results []WriteResult
@@ -389,6 +441,8 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 				results = append(results, res)
 				continue
 			}
+		} else if !os.IsNotExist(err) {
+			return nil, err
 		}
 
 		if err := writeFileAtomic(profilePath, ociBytes); err != nil {
@@ -399,19 +453,8 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 		results = append(results, res)
 	}
 
-	if lockFile != "" {
-		if err := os.MkdirAll(filepath.Dir(lockFile), 0o755); err != nil {
-			return nil, err
-		}
-		lockBytes, err := json.MarshalIndent(lock, "", "  ")
-		if err != nil {
-			return nil, err
-		}
-		lockBytes = append(lockBytes, '\n')
-		if err := writeFileAtomic(lockFile, lockBytes); err != nil {
-			return nil, err
-		}
-		chownToSudoUser(lockFile)
+	if err := saveLockFile(lockFile, lock); err != nil {
+		return nil, err
 	}
 
 	return results, nil
@@ -419,41 +462,80 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 
 // UpdateCommittedProfiles implements on-change: update-pr. It writes the newly
 // generated profiles to the committed-profile location in the working tree so
-// the PR author can commit them. Hand-edited profiles (lock mismatch) are
-// never overwritten; a .suggested.json is written next to them instead.
+// the PR author can commit them. Existing profiles without a matching lock
+// entry (missing lock file, missing key, or hash mismatch) are never
+// overwritten; a .suggested.json is written next to them instead.
 func UpdateCommittedProfiles(committedPattern, lockFile string, built []*BuiltProfile) ([]string, error) {
+	return SyncCommittedProfiles(committedPattern, "", lockFile, nil, nil, built)
+}
+
+// SyncCommittedProfiles updates committed profiles while honoring lock state
+// snapshotted before WriteTargetFiles (preLock) and reusing WriteTargetFiles
+// protection decisions when outDir and committedPattern resolve to the same file.
+func SyncCommittedProfiles(
+	committedPattern, outDir, lockFile string,
+	writeResults []WriteResult, preLock map[string]string,
+	built []*BuiltProfile,
+) ([]string, error) {
 	if strings.TrimSpace(committedPattern) == "" {
 		return nil, nil
 	}
+	lock, err := loadLockFile(lockFile)
+	if err != nil {
+		return nil, err
+	}
+	baselineHashes := lock.Files
+	if preLock != nil {
+		baselineHashes = preLock
+	}
+	wrByTarget := make(map[string]WriteResult, len(writeResults))
+	for _, w := range writeResults {
+		wrByTarget[w.TargetName] = w
+	}
+
 	var updated []string
+	lockDirty := false
 	for _, b := range built {
 		if err := ValidateTargetName(b.TargetName); err != nil {
 			return nil, err
 		}
-		path := ResolveTargetProfilePath(committedPattern, b.TargetName)
+		path := ResolveTargetProfilePathN(committedPattern, b.TargetName, len(built))
 		if path == "" {
 			continue
 		}
+		if outDir != "" {
+			outPath := filepath.Join(outDir, b.TargetName+".json")
+			if sameTargetPath(path, outPath) {
+				if wr, ok := wrByTarget[b.TargetName]; ok {
+					if wr.ProtectedManualEdit && wr.SuggestedPath != "" {
+						updated = append(updated, wr.SuggestedPath)
+					} else if wr.ProfilePath != "" {
+						updated = append(updated, wr.ProfilePath)
+					}
+					continue
+				}
+			}
+		}
+
 		ociBytes, err := json.MarshalIndent(b.OCI, "", "  ")
 		if err != nil {
 			return nil, err
 		}
 		ociBytes = append(ociBytes, '\n')
 
-		if existing, err := os.ReadFile(path); err == nil && lockFile != "" {
-			if lockData, lockErr := os.ReadFile(lockFile); lockErr == nil {
-				var lock lockFileSchema
-				_ = json.Unmarshal(lockData, &lock)
-				if locked, ok := lock.Files[b.TargetName]; ok && locked != sha256Hex(existing) {
-					suggested := filepath.Join(filepath.Dir(path), b.TargetName+".suggested.json")
-					if err := writeFileAtomic(suggested, ociBytes); err != nil {
-						return nil, err
-					}
-					chownToSudoUser(suggested)
-					updated = append(updated, suggested)
-					continue
+		if existing, err := os.ReadFile(path); err == nil {
+			locked, hasLock := baselineHashes[b.TargetName]
+			if !hasLock || locked != sha256Hex(existing) {
+				suggested := filepath.Join(filepath.Dir(path), b.TargetName+".suggested.json")
+				if err := writeFileAtomic(suggested, ociBytes); err != nil {
+					return nil, err
 				}
+				chownToSudoUser(suggested)
+				updated = append(updated, suggested)
+				continue
 			}
+		} else if !os.IsNotExist(err) {
+			return nil, err
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return nil, err
@@ -462,14 +544,38 @@ func UpdateCommittedProfiles(committedPattern, lockFile string, built []*BuiltPr
 			return nil, err
 		}
 		chownToSudoUser(path)
+		lock.Files[b.TargetName] = sha256Hex(ociBytes)
+		lockDirty = true
 		updated = append(updated, path)
+	}
+	if lockDirty {
+		if err := saveLockFile(lockFile, lock); err != nil {
+			return nil, err
+		}
 	}
 	return updated, nil
 }
 
-// ResolveTargetProfilePath mirrors diff.ResolveCommittedProfilePath without
-// importing the diff package (avoids an import cycle).
+func sameTargetPath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA == nil && errB == nil {
+		if runtime.GOOS == "windows" {
+			return strings.EqualFold(filepath.Clean(absA), filepath.Clean(absB))
+		}
+		return filepath.Clean(absA) == filepath.Clean(absB)
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+// ResolveTargetProfilePath mirrors diff.ResolveCommittedProfilePath for a single target.
 func ResolveTargetProfilePath(pattern, targetName string) string {
+	return ResolveTargetProfilePathN(pattern, targetName, 1)
+}
+
+// ResolveTargetProfilePathN mirrors diff.ResolveCommittedProfilePath without
+// importing the diff package (avoids an import cycle).
+func ResolveTargetProfilePathN(pattern, targetName string, totalTargets int) string {
 	p := strings.TrimSpace(pattern)
 	if p == "" {
 		return ""
@@ -482,6 +588,9 @@ func ResolveTargetProfilePath(pattern, targetName string) string {
 	}
 	if !strings.HasSuffix(strings.ToLower(p), ".json") {
 		return filepath.Join(p, targetName+".json")
+	}
+	if totalTargets > 1 {
+		return filepath.Join(filepath.Dir(p), targetName+".json")
 	}
 	return p
 }
@@ -776,24 +885,24 @@ func MergeCommittedIntoOCI(curr *OCISeccompProfile, committed *OCISeccompProfile
 			extraRules = append(extraRules, r)
 			continue
 		}
-		if r.Action == "SCMP_ACT_ALLOW" || r.Action == "" {
+		if r.Action == "SCMP_ACT_ALLOW" {
 			for _, n := range r.Names {
 				allowSet[n] = true
 			}
-		} else {
+		} else if r.Action != "" {
 			extraRules = append(extraRules, r)
 		}
 	}
 	for _, r := range committed.Syscalls {
-		if len(r.Args) > 0 {
+		if len(r.Args) > 0 || r.ErrnoRet != nil {
 			extraRules = append(extraRules, r)
 			continue
 		}
-		if r.Action == "SCMP_ACT_ALLOW" || r.Action == "" {
+		if r.Action == "SCMP_ACT_ALLOW" {
 			for _, n := range r.Names {
 				allowSet[n] = true
 			}
-		} else {
+		} else if r.Action != "" {
 			extraRules = append(extraRules, r)
 		}
 	}

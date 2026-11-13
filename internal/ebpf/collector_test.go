@@ -3,6 +3,9 @@ package ebpf_test
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/alexno10/seccomp-profiler/internal/ebpf"
@@ -102,5 +105,84 @@ func TestAnchor64HexDetectionExhaustiveOffsets(t *testing.T) {
 		if has64HexIDMirror(path) {
 			t.Fatalf("unexpected match for 63-hex string at offset %d", start)
 		}
+	}
+}
+
+func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
+	bpfSrc, err := os.ReadFile(filepath.Join("..", "..", "bpf", "profiler.bpf.c"))
+	if err != nil {
+		t.Fatalf("read profiler.bpf.c: %v", err)
+	}
+	src := string(bpfSrc)
+
+	// Task 1: error_stats must use BPF_MAP_TYPE_ARRAY so slot 0 is pre-allocated.
+	if !strings.Contains(src, "#define BPF_MAP_TYPE_ARRAY 2") {
+		t.Fatal("missing BPF_MAP_TYPE_ARRAY definition")
+	}
+	errorStatsIdx := strings.Index(src, "} error_stats SEC(\".maps\");")
+	if errorStatsIdx == -1 || errorStatsIdx < 160 {
+		t.Fatalf("unexpected error_stats definition in profiler.bpf.c")
+	}
+	errorStatsBlock := src[errorStatsIdx-160 : errorStatsIdx]
+	if !strings.Contains(errorStatsBlock, "BPF_MAP_TYPE_ARRAY") {
+		t.Fatalf("error_stats must use BPF_MAP_TYPE_ARRAY, got:\n%s", errorStatsBlock)
+	}
+
+	// Task 1: id < 0 must be checked before is_compat_syscall(id) so syscall(-1) hits oob_syscalls.
+	sysEnterIdx := strings.Index(src, "int handle_sys_enter(")
+	if sysEnterIdx == -1 {
+		t.Fatal("missing handle_sys_enter")
+	}
+	sysEnterBody := src[sysEnterIdx:]
+	negIdx := strings.Index(sysEnterBody, "id < 0")
+	compatIdx := strings.Index(sysEnterBody, "is_compat_syscall(id)")
+	if negIdx == -1 || compatIdx == -1 || negIdx > compatIdx {
+		t.Fatalf("handle_sys_enter must check id < 0 before is_compat_syscall(id) (negIdx=%d compatIdx=%d)", negIdx, compatIdx)
+	}
+
+	// Task 1: unsupported target arch must fail compile instead of defaulting to x86.
+	if !strings.Contains(src, "__TARGET_ARCH_x86") || !strings.Contains(src, "#error") {
+		t.Fatal("profiler.bpf.c must explicitly check __TARGET_ARCH_x86 and error on unsupported arch")
+	}
+
+	// Task 2: is_runtime_selfref must not treat empty filename as self-ref.
+	selfRefIdx := strings.Index(src, "int is_runtime_selfref(")
+	if selfRefIdx == -1 {
+		t.Fatal("missing is_runtime_selfref")
+	}
+	selfRefEnd := strings.Index(src[selfRefIdx:], "\n}")
+	selfRefBody := src[selfRefIdx : selfRefIdx+selfRefEnd]
+	if strings.Contains(selfRefBody, "filename[0] == '\\0'") {
+		t.Fatal("is_runtime_selfref must not treat empty filename as self-referential")
+	}
+
+	// Task 2: post-exec in handle_sched_process_exec must not keep tid suppressed solely via is_runtime_comm.
+	execIdx := strings.Index(src, "int handle_sched_process_exec(")
+	if execIdx == -1 {
+		t.Fatal("missing handle_sched_process_exec")
+	}
+	execBody := src[execIdx:sysEnterIdx]
+	if strings.Contains(execBody, "is_runtime_comm(comm)") {
+		t.Fatal("handle_sched_process_exec must not suppress workload entrypoints merely named runc/crun")
+	}
+
+	// Task 2: sched_process_exit cleanup must exist.
+	if !strings.Contains(src, "tracepoint/sched/sched_process_exit") {
+		t.Fatal("missing sched_process_exit cleanup hook")
+	}
+
+	// Task 2: fork/exec hooks must block non-runtime threads already inside syscalls_per_cgroup.
+	forkIdx := strings.Index(src, "int handle_sched_process_fork(")
+	execEnterIdx := strings.Index(src, "int handle_exec_enter(")
+	if forkIdx == -1 || execEnterIdx == -1 {
+		t.Fatal("missing fork or exec_enter hook")
+	}
+	forkBody := src[forkIdx:execEnterIdx]
+	if !strings.Contains(forkBody, "syscalls_per_cgroup") {
+		t.Fatal("handle_sched_process_fork must reject untracked threads inside tracked container cgroups")
+	}
+	execEnterBody := src[execEnterIdx:execIdx]
+	if !strings.Contains(execEnterBody, "syscalls_per_cgroup") {
+		t.Fatal("handle_exec_enter must reject untracked threads inside tracked container cgroups")
 	}
 }

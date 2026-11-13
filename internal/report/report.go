@@ -67,6 +67,14 @@ func RenderMarkdown(in SummaryInput) string {
 				unapprovedCount++
 			}
 		}
+		for _, ac := range d.ArgsChangeDetails {
+			if ac.Risk == diff.RiskHigh {
+				totalHighRisk++
+			}
+			if !ac.Approved {
+				unapprovedCount++
+			}
+		}
 	}
 
 	writeByTarget := make(map[string]profile.WriteResult)
@@ -203,8 +211,26 @@ func RenderMarkdown(in SummaryInput) string {
 				}
 				fmt.Fprintln(&b)
 			}
-			if len(td.ArgsChanged) > 0 {
-				fmt.Fprintf(&b, "- **Changed argument constraints (informational):** `%s`\n\n", strings.Join(td.ArgsChanged, "`, `"))
+			if len(td.ArgsChangeDetails) > 0 {
+				fmt.Fprintf(&b, "- **Changed argument constraints:**\n")
+				for _, ac := range td.ArgsChangeDetails {
+					status := "unapproved"
+					if ac.Approved {
+						status = fmt.Sprintf("approved: %s", mdCell(ac.ApprovalReason))
+					} else if ac.ApprovalExpired {
+						status = fmt.Sprintf("expired %s", ac.ApprovalExpires)
+					}
+					fmt.Fprintf(&b, "  - `%s` (`%s`, %s)\n", ac.Name, ac.Risk, status)
+				}
+				fmt.Fprintln(&b)
+			} else if len(td.ArgsChanged) > 0 {
+				fmt.Fprintf(&b, "- **Changed argument constraints:** `%s`\n\n", strings.Join(td.ArgsChanged, "`, `"))
+			}
+			if td.PermissiveDefaultAction {
+				fmt.Fprintf(&b, "> [!WARNING]\n> Target `%s` sets permissive `defaultAction` (`%s`).\n\n", tName, mdCell(td.NewDefaultAction))
+			}
+			if len(td.AddedArchitectures) > 0 {
+				fmt.Fprintf(&b, "> [!WARNING]\n> Target `%s` added unprofiled architecture(s): `%s`.\n\n", tName, strings.Join(td.AddedArchitectures, "`, `"))
 			}
 			if len(td.Removed) > 0 {
 				fmt.Fprintf(&b, "- **Removed syscalls (informational only — not auto-removed):** `%s`\n\n", strings.Join(td.Removed, "`, `"))

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -15,13 +17,20 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
+var errCollectorClosed = errors.New("eBPF collector closed")
+
 type linuxCollector struct {
-	coll     *cebpf.Collection
-	links    []link.Link
-	rbReader *ringbuf.Reader
-	eventsCh chan KernelEvent
-	doneCh   chan struct{}
-	detached bool
+	mu          sync.RWMutex
+	coll        *cebpf.Collection
+	links       []link.Link
+	rbReader    *ringbuf.Reader
+	eventsCh    chan KernelEvent
+	doneCh      chan struct{}
+	readDone    chan struct{}
+	readStarted bool
+	detached    bool
+	closed      bool
+	closeOnce   sync.Once
 }
 
 func NewCollector(bpfObjPath string) (Collector, error) {
@@ -52,6 +61,7 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 		coll:     coll,
 		eventsCh: make(chan KernelEvent, 1024),
 		doneCh:   make(chan struct{}),
+		readDone: make(chan struct{}),
 	}
 
 	mkdirProg := coll.Programs["handle_cgroup_mkdir"]
@@ -111,6 +121,11 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: %v; runtime-suppression degraded: secondary docker exec setup syscalls may be recorded\n", err)
 		}
 	}
+	if exitProg := coll.Programs["handle_sched_process_exit"]; exitProg != nil {
+		if err := attach("sched", "sched_process_exit", exitProg); err != nil {
+			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: %v; exiting runtime tids will rely on LRU eviction\n", err)
+		}
+	}
 
 	l3, err := link.AttachRawTracepoint(link.RawTracepointOptions{
 		Name:    "sys_enter",
@@ -133,12 +148,14 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 		return nil, fmt.Errorf("open events ringbuf reader: %w", err)
 	}
 	c.rbReader = rb
+	c.readStarted = true
 
 	go c.readLoop()
 	return c, nil
 }
 
 func (c *linuxCollector) readLoop() {
+	defer close(c.readDone)
 	defer close(c.eventsCh)
 	for {
 		rec, err := c.rbReader.Read()
@@ -146,7 +163,12 @@ func (c *linuxCollector) readLoop() {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return
 			}
-			continue
+			select {
+			case <-c.doneCh:
+				return
+			case <-time.After(5 * time.Millisecond):
+				continue
+			}
 		}
 		ev, err := DecodeKernelEvent(rec.RawSample)
 		if err != nil {
@@ -161,6 +183,11 @@ func (c *linuxCollector) readLoop() {
 }
 
 func (c *linuxCollector) TrackCgroup(cgroupID uint64) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed || c.coll == nil {
+		return errCollectorClosed
+	}
 	m := c.coll.Maps["syscalls_per_cgroup"]
 	if m == nil {
 		return fmt.Errorf("syscalls_per_cgroup map not found")
@@ -178,6 +205,11 @@ func (c *linuxCollector) Events() <-chan KernelEvent {
 }
 
 func (c *linuxCollector) Flush() (map[uint64]CgroupStats, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed || c.coll == nil {
+		return nil, errCollectorClosed
+	}
 	m := c.coll.Maps["syscalls_per_cgroup"]
 	if m == nil {
 		return nil, fmt.Errorf("syscalls_per_cgroup map not found")
@@ -196,6 +228,11 @@ func (c *linuxCollector) Flush() (map[uint64]CgroupStats, error) {
 }
 
 func (c *linuxCollector) FlushCgroup(cgroupID uint64) (CgroupStats, bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed || c.coll == nil {
+		return CgroupStats{}, false, errCollectorClosed
+	}
 	m := c.coll.Maps["syscalls_per_cgroup"]
 	if m == nil {
 		return CgroupStats{}, false, fmt.Errorf("syscalls_per_cgroup map not found")
@@ -211,6 +248,11 @@ func (c *linuxCollector) FlushCgroup(cgroupID uint64) (CgroupStats, bool, error)
 }
 
 func (c *linuxCollector) DeleteCgroup(cgroupID uint64) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed || c.coll == nil {
+		return errCollectorClosed
+	}
 	stats := c.coll.Maps["syscalls_per_cgroup"]
 	candidates := c.coll.Maps["candidate_cgroups"]
 	if stats == nil || candidates == nil {
@@ -222,6 +264,11 @@ func (c *linuxCollector) DeleteCgroup(cgroupID uint64) error {
 }
 
 func (c *linuxCollector) ErrorStats() (ErrorStats, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed || c.coll == nil {
+		return ErrorStats{}, errCollectorClosed
+	}
 	m := c.coll.Maps["error_stats"]
 	if m == nil {
 		return ErrorStats{}, fmt.Errorf("error_stats map not found")
@@ -229,41 +276,54 @@ func (c *linuxCollector) ErrorStats() (ErrorStats, error) {
 	var key uint32 = 0
 	var val ErrorStats
 	if err := m.Lookup(&key, &val); err != nil {
-		if errors.Is(err, cebpf.ErrKeyNotExist) {
-			return ErrorStats{}, nil
-		}
-		return ErrorStats{}, err
+		return ErrorStats{}, fmt.Errorf("lookup error_stats[0]: %w", err)
 	}
 	return val, nil
 }
 
-// Detach unhooks all BPF programs (idempotent). After Detach no new map
-// updates or events are produced, so Flush sees a stable snapshot.
-func (c *linuxCollector) Detach() error {
+func (c *linuxCollector) detachLocked() {
 	if c.detached {
-		return nil
+		return
 	}
 	c.detached = true
 	for _, l := range c.links {
 		_ = l.Close()
 	}
 	c.links = nil
+}
+
+// Detach unhooks all BPF programs (idempotent). After Detach no new map
+// updates or events are produced, so Flush sees a stable snapshot.
+func (c *linuxCollector) Detach() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.detachLocked()
 	return nil
 }
 
 func (c *linuxCollector) Close() error {
-	select {
-	case <-c.doneCh:
-	default:
+	c.closeOnce.Do(func() {
 		close(c.doneCh)
-	}
-	if c.rbReader != nil {
-		_ = c.rbReader.Close()
-	}
-	_ = c.Detach()
-	if c.coll != nil {
-		c.coll.Close()
-	}
+		c.mu.RLock()
+		rb := c.rbReader
+		waitRead := c.readStarted
+		c.mu.RUnlock()
+		if rb != nil {
+			_ = rb.Close()
+		}
+		if waitRead {
+			<-c.readDone
+		}
+		c.mu.Lock()
+		c.closed = true
+		c.detachLocked()
+		if c.coll != nil {
+			c.coll.Close()
+			c.coll = nil
+		}
+		c.rbReader = nil
+		c.mu.Unlock()
+	})
 	return nil
 }
 

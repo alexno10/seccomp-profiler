@@ -10,12 +10,12 @@
 //   3. tracepoint/sched/sched_process_exec: an exec is only treated as a
 //      runtime self-exec when the exec was *initiated by runc/crun* (pending
 //      flag) AND lands on a self-referential binary (/proc/self/*, /dev/fd/*,
-//      /memfd:*) or keeps the runtime comm. Every other exec unmarks the tid
-//      and activates/records the cgroup - including application re-execs via
-//      /proc/self/exe and fexecve, which the profiler must record.
-//   4. raw_tracepoint/sys_enter: suppression is keyed ONLY on the tid map.
-//      There is no comm check here, so a container renaming itself to "runc"
-//      with prctl(PR_SET_NAME) cannot hide its syscalls anymore.
+//      /memfd:*). Every other exec unmarks the tid and activates/records the
+//      cgroup - including container entrypoints named "runc"/"crun",
+//      application re-execs via /proc/self/exe, and fexecve.
+//   4. raw_tracepoint/sys_enter: suppression is keyed ONLY on the tid map,
+//      and workload threads inside syscalls_per_cgroup can never add tids to
+//      runtime_tids or exec_pending via prctl(PR_SET_NAME, "runc").
 
 typedef unsigned char __u8;
 typedef unsigned short __u16;
@@ -27,6 +27,7 @@ typedef unsigned long long __u64;
 #define __type(name, val) typeof(val) *name
 
 #define BPF_MAP_TYPE_HASH 1
+#define BPF_MAP_TYPE_ARRAY 2
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_MAP_TYPE_LRU_HASH 9
 #define BPF_MAP_TYPE_RINGBUF 27
@@ -103,10 +104,11 @@ struct {
 	__type(value, __u8);
 } exec_pending SEC(".maps");
 
-// Kernel-side error counters: any non-zero value means visibility was lost
-// and userspace must warn or fail the gate (fail-closed, not fail-open).
+// Kernel-side error counters: BPF_MAP_TYPE_ARRAY pre-allocates slot 0 so
+// increments always succeed without userspace map initialization. Any non-zero
+// value means visibility was lost and userspace must fail closed.
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
 	__type(value, struct error_counters);
@@ -246,13 +248,10 @@ struct task_struct {
 	int pid;
 } __attribute__((preserve_access_index));
 
-// Self-referential exec targets used by runc/crun bootstrap re-execs. Only
-// consulted for execs that runc/crun initiated (exec_pending), so application
+// Self-referential exec targets used by runc bootstrap re-execs. Only
+// consulted for execs that runtime initiated (exec_pending), so application
 // re-execs of /proc/self/exe or fexecve/memfd payloads are never suppressed.
 static __inline int is_runtime_selfref(const char *filename) {
-	if (filename[0] == '\0' || (filename[0] == '/' && filename[1] == '\0')) {
-		return 1;
-	}
 	// "/proc/self/" (covers both "/proc/self/exe" and "/proc/self/fd/<N>")
 	if (filename[0] == '/' && filename[1] == 'p' && filename[2] == 'r' && filename[3] == 'o' &&
 	    filename[4] == 'c' && filename[5] == '/' && filename[6] == 's' && filename[7] == 'e' &&
@@ -286,8 +285,8 @@ static __inline int is_compat_syscall(long id) {
 		}
 	}
 	return 0;
-#else
-	if (id & 0x40000000L) {
+#elif defined(__TARGET_ARCH_x86)
+	if (id >= 0 && (id & 0x40000000L)) {
 		return 1;
 	}
 	void *task = bpf_get_current_task();
@@ -301,6 +300,8 @@ static __inline int is_compat_syscall(long id) {
 		}
 	}
 	return 0;
+#else
+#error "unsupported target architecture: define __TARGET_ARCH_x86 or __TARGET_ARCH_arm64"
 #endif
 }
 
@@ -314,6 +315,9 @@ int handle_cgroup_mkdir(struct trace_event_raw_cgroup_mkdir *ctx) {
 
 	__u32 data_loc = ctx->__data_loc_path;
 	__u16 offset = data_loc & 0xffff;
+	if (offset < 12U || offset >= 4096U) {
+		return 0;
+	}
 	const char *path_ptr = (const char *)ctx + offset;
 
 	__builtin_memset(ev->path, 0, sizeof(ev->path));
@@ -350,8 +354,9 @@ int handle_cgroup_mkdir(struct trace_event_raw_cgroup_mkdir *ctx) {
 
 // Children forked by the runtime family (runc/crun/containerd-shim) are
 // pre-marked so their pre-first-exec setup syscalls (setns, mount, ...)
-// inside an already-active container cgroup are suppressed. The marker is
-// cleared as soon as the child execs the workload.
+// inside an already-active container cgroup are suppressed. Threads already
+// running inside an active tracked container (syscalls_per_cgroup) without
+// existing runtime membership cannot mark children via prctl(PR_SET_NAME).
 //
 // Attached as a RAW tracepoint: sched_process_fork carries no dynamic data,
 // so the kernel's tracepoint-link ctx-size check
@@ -361,6 +366,14 @@ int handle_cgroup_mkdir(struct trace_event_raw_cgroup_mkdir *ctx) {
 // is resolved via CO-RE by member name.
 SEC("raw_tracepoint/sched_process_fork")
 int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx) {
+	__u32 parent_tid = (__u32)bpf_get_current_pid_tgid();
+	if (!bpf_map_lookup_elem(&runtime_tids, &parent_tid)) {
+		__u64 cgroup_id = bpf_get_current_cgroup_id();
+		if (bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id)) {
+			return 0;
+		}
+	}
+
 	char comm[16] = {};
 	bpf_get_current_comm(comm, sizeof(comm));
 	if (!is_runtime_family_comm(comm)) {
@@ -386,12 +399,18 @@ int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx) {
 }
 
 static __inline int handle_exec_enter(void) {
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	if (!bpf_map_lookup_elem(&runtime_tids, &tid)) {
+		__u64 cgroup_id = bpf_get_current_cgroup_id();
+		if (bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id)) {
+			return 0;
+		}
+	}
 	char comm[16] = {};
 	bpf_get_current_comm(comm, sizeof(comm));
 	if (!is_runtime_family_comm(comm)) {
 		return 0;
 	}
-	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u8 one = 1;
 	bpf_map_update_elem(&exec_pending, &tid, &one, BPF_ANY);
 	return 0;
@@ -429,17 +448,18 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 
-	char comm[16] = {};
-	bpf_get_current_comm(comm, sizeof(comm));
-
 	__u32 data_loc = ctx->__data_loc_filename;
 	__u16 offset = data_loc & 0xffff;
-	const char *fname_ptr = (const char *)ctx + offset;
 
 	__builtin_memset(ev->path, 0, sizeof(ev->path));
-	if (bpf_probe_read_kernel_str(ev->path, sizeof(ev->path), fname_ptr) <= 0) {
+	long read_ok = -1;
+	if (offset >= 12U && offset < 4096U) {
+		const char *fname_ptr = (const char *)ctx + offset;
+		read_ok = bpf_probe_read_kernel_str(ev->path, sizeof(ev->path), fname_ptr);
+	}
+	if (read_ok <= 0) {
 		// An unreadable filename would look like a self-ref exec and keep
-		// runc marked; treat it as a workload exec instead (fail open to
+		// runtime marked; treat it as a workload exec instead (fail open to
 		// recording, never to suppression).
 		bpf_map_delete_elem(&runtime_tids, &tid);
 		bpf_map_delete_elem(&exec_pending, &tid);
@@ -447,11 +467,22 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 			__u8 active = STATE_ACTIVE;
 			bpf_map_update_elem(&candidate_cgroups, &cgroup_id, &active, BPF_ANY);
 		}
-		bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
+		long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
+		if (ret != 0 && ret != -17 /* -EEXIST: secondary execs, expected */) {
+			struct error_counters *e = get_error_counters();
+			if (e) {
+				__sync_fetch_and_add(&e->cgroup_map_full, 1);
+			}
+		}
 		ev->type = EVENT_EXEC;
 		ev->pad = 0;
 		ev->cgroup_id = cgroup_id;
-		bpf_ringbuf_output(&events, ev, sizeof(*ev), 0);
+		if (bpf_ringbuf_output(&events, ev, sizeof(*ev), 0) != 0) {
+			struct error_counters *e = get_error_counters();
+			if (e) {
+				__sync_fetch_and_add(&e->ringbuf_drops, 1);
+			}
+		}
 		return 0;
 	}
 
@@ -462,9 +493,10 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	}
 	bpf_map_delete_elem(&exec_pending, &tid);
 
-	if (pending && (is_runtime_comm(comm) || is_runtime_selfref(ev->path))) {
-		// runc/crun bootstrap re-exec: keep the tid suppressed until it
-		// execs the real container workload.
+	if (pending && is_runtime_selfref(ev->path)) {
+		// runc bootstrap re-exec: keep the tid suppressed until it
+		// execs the real container workload. Do not match on comm so
+		// container entrypoints named "runc"/"crun" are never suppressed.
 		__u8 one = 1;
 		bpf_map_update_elem(&runtime_tids, &tid, &one, BPF_ANY);
 		return 0;
@@ -501,6 +533,15 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	return 0;
 }
 
+SEC("tracepoint/sched/sched_process_exit")
+int handle_sched_process_exit(void *ctx) {
+	(void)ctx;
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&runtime_tids, &tid);
+	bpf_map_delete_elem(&exec_pending, &tid);
+	return 0;
+}
+
 SEC("raw_tracepoint/sys_enter")
 int handle_sys_enter(struct bpf_raw_tracepoint_args *ctx) {
 	__u64 cgroup_id = bpf_get_current_cgroup_id();
@@ -517,12 +558,19 @@ int handle_sys_enter(struct bpf_raw_tracepoint_args *ctx) {
 	}
 
 	long id = (long)ctx->args[1];
+	if (id < 0) {
+		struct error_counters *e = get_error_counters();
+		if (e) {
+			__sync_fetch_and_add(&e->oob_syscalls, 1);
+		}
+		return 0;
+	}
 	if (is_compat_syscall(id)) {
 		__sync_fetch_and_add(&stats->compat_count, 1);
 		return 0;
 	}
 	__u64 uid = (__u64)id;
-	if (id < 0 || uid >= MAX_SYSCALLS) {
+	if (uid >= MAX_SYSCALLS) {
 		struct error_counters *e = get_error_counters();
 		if (e) {
 			__sync_fetch_and_add(&e->oob_syscalls, 1);
