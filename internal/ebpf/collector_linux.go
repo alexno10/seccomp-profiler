@@ -67,11 +67,8 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 	mkdirProg := coll.Programs["handle_cgroup_mkdir"]
 	execProg := coll.Programs["handle_sched_process_exec"]
 	sysEnterProg := coll.Programs["handle_sys_enter"]
-	execEnterProg := coll.Programs["handle_sys_enter_execve"]
-	execEnterAtProg := coll.Programs["handle_sys_enter_execveat"]
 	forkProg := coll.Programs["handle_sched_process_fork"]
-	if mkdirProg == nil || execProg == nil || sysEnterProg == nil ||
-		execEnterProg == nil || execEnterAtProg == nil || forkProg == nil {
+	if mkdirProg == nil || execProg == nil || sysEnterProg == nil || forkProg == nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("missing required BPF programs in %q", objPath)
 	}
@@ -108,18 +105,6 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 		fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: attach raw_tracepoint/sched_process_fork: %v; runtime-suppression degraded: secondary docker exec setup syscalls may be recorded\n", err)
 	} else {
 		c.links = append(c.links, l4)
-	}
-	for _, h := range []struct {
-		cat  string
-		name string
-		prog *cebpf.Program
-	}{
-		{"syscalls", "sys_enter_execve", execEnterProg},
-		{"syscalls", "sys_enter_execveat", execEnterAtProg},
-	} {
-		if err := attach(h.cat, h.name, h.prog); err != nil {
-			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: %v; runtime-suppression degraded: secondary docker exec setup syscalls may be recorded\n", err)
-		}
 	}
 	if exitProg := coll.Programs["handle_sched_process_exit"]; exitProg != nil {
 		if err := attach("sched", "sched_process_exit", exitProg); err != nil {

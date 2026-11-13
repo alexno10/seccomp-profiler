@@ -228,4 +228,30 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 	}
 	assertRuntimeGuardWrapsCommCheck("handle_sched_process_fork", forkBody)
 	assertRuntimeGuardWrapsCommCheck("handle_exec_enter", execEnterBody)
+
+	// Task 2: execve/execveat must be dispatched from raw_tracepoint/sys_enter (not
+	// tracepoint/syscalls/sys_enter_execve{,at}) because cilium/ebpf link.Tracepoint
+	// attaches perf events on CPU 0 only and misses syscalls on CPUs 1..N on Linux 7.0+.
+	for _, banned := range []string{"sys_enter_execve", "sys_enter_execveat", "bpf_trace_printk", "bpf_printk("} {
+		if strings.Contains(src, banned) {
+			t.Fatalf("profiler.bpf.c must not use %q", banned)
+		}
+	}
+	if !strings.Contains(src, "int is_execve_syscall(") {
+		t.Fatal("missing is_execve_syscall helper in profiler.bpf.c")
+	}
+	execDispatchIdx := strings.Index(sysEnterBody, "if (is_execve_syscall(id))")
+	statsCheckIdx := strings.Index(sysEnterBody, "if (!stats)")
+	if execDispatchIdx == -1 || statsCheckIdx == -1 || execDispatchIdx > statsCheckIdx {
+		t.Fatalf("handle_sys_enter must dispatch is_execve_syscall(id) before !stats early return (execIdx=%d statsIdx=%d)", execDispatchIdx, statsCheckIdx)
+	}
+	collectorLinuxSrc, err := os.ReadFile(filepath.Join(".", "collector_linux.go"))
+	if err != nil {
+		t.Fatalf("read collector_linux.go: %v", err)
+	}
+	for _, banned := range []string{"sys_enter_execve", "sys_enter_execveat"} {
+		if strings.Contains(string(collectorLinuxSrc), banned) {
+			t.Fatalf("collector_linux.go must not attach per-syscall tracepoint %q", banned)
+		}
+	}
 }
