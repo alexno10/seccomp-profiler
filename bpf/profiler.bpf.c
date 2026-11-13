@@ -367,17 +367,18 @@ int handle_cgroup_mkdir(struct trace_event_raw_cgroup_mkdir *ctx) {
 SEC("raw_tracepoint/sched_process_fork")
 int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx) {
 	__u32 parent_tid = (__u32)bpf_get_current_pid_tgid();
+	// Already-tracked runtime tids keep propagating to forked children even if
+	// kernel comm is temporarily "exe" across /proc/self/exe before prctl(PR_SET_NAME).
 	if (!bpf_map_lookup_elem(&runtime_tids, &parent_tid)) {
 		__u64 cgroup_id = bpf_get_current_cgroup_id();
 		if (bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id)) {
 			return 0;
 		}
-	}
-
-	char comm[16] = {};
-	bpf_get_current_comm(comm, sizeof(comm));
-	if (!is_runtime_family_comm(comm)) {
-		return 0;
+		char comm[16] = {};
+		bpf_get_current_comm(comm, sizeof(comm));
+		if (!is_runtime_family_comm(comm)) {
+			return 0;
+		}
 	}
 	// args[0] = parent task_struct, args[1] = child task_struct (TP_PROTO).
 	__u64 child_ptr = 0;
@@ -400,16 +401,19 @@ int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx) {
 
 static __inline int handle_exec_enter(void) {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	// Already-tracked runtime tids retain exec_pending across self-reexecs such as
+	// runc's ensure_cloned_binary() fexecve(memfd), where kernel comm is "exe"
+	// after execve("/proc/self/exe") and before prctl(PR_SET_NAME).
 	if (!bpf_map_lookup_elem(&runtime_tids, &tid)) {
 		__u64 cgroup_id = bpf_get_current_cgroup_id();
 		if (bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id)) {
 			return 0;
 		}
-	}
-	char comm[16] = {};
-	bpf_get_current_comm(comm, sizeof(comm));
-	if (!is_runtime_family_comm(comm)) {
-		return 0;
+		char comm[16] = {};
+		bpf_get_current_comm(comm, sizeof(comm));
+		if (!is_runtime_family_comm(comm)) {
+			return 0;
+		}
 	}
 	__u8 one = 1;
 	bpf_map_update_elem(&exec_pending, &tid, &one, BPF_ANY);

@@ -185,4 +185,47 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 	if !strings.Contains(execEnterBody, "syscalls_per_cgroup") {
 		t.Fatal("handle_exec_enter must reject untracked threads inside tracked container cgroups")
 	}
+
+	// Tracked runtime_tids (e.g. runc child whose comm became "exe" after execve("/proc/self/exe")
+	// before ensure_cloned_binary()'s fexecve(memfd) and before prctl(PR_SET_NAME)) must keep
+	// exec_pending and fork propagation without re-checking is_runtime_family_comm.
+	assertRuntimeGuardWrapsCommCheck := func(fnName, body string) {
+		t.Helper()
+		guardIdx := strings.Index(body, "if (!bpf_map_lookup_elem(&runtime_tids")
+		if guardIdx == -1 {
+			t.Fatalf("%s missing !runtime_tids guard", fnName)
+		}
+		openIdx := strings.Index(body[guardIdx:], "{")
+		if openIdx == -1 {
+			t.Fatalf("%s malformed !runtime_tids block", fnName)
+		}
+		depth := 0
+		blockEnd := -1
+		for i := guardIdx + openIdx; i < len(body); i++ {
+			switch body[i] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					blockEnd = i + 1
+				}
+			}
+			if blockEnd != -1 {
+				break
+			}
+		}
+		if blockEnd == -1 {
+			t.Fatalf("%s unclosed !runtime_tids block", fnName)
+		}
+		guardBlock := body[guardIdx:blockEnd]
+		if !strings.Contains(guardBlock, "syscalls_per_cgroup") || !strings.Contains(guardBlock, "is_runtime_family_comm") {
+			t.Fatalf("%s must check is_runtime_family_comm only inside the !runtime_tids guard so runtime tids renamed to \"exe\" across /proc/self/exe are not dropped", fnName)
+		}
+		if strings.Contains(body[blockEnd:], "is_runtime_family_comm") {
+			t.Fatalf("%s must not require is_runtime_family_comm outside the !runtime_tids guard", fnName)
+		}
+	}
+	assertRuntimeGuardWrapsCommCheck("handle_sched_process_fork", forkBody)
+	assertRuntimeGuardWrapsCommCheck("handle_exec_enter", execEnterBody)
 }
