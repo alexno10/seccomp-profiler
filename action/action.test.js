@@ -71,11 +71,11 @@ test("buildDaemonEnv strips RUNNER_TRACKING_ID and all GitHub/secret tokens from
 
 test("release version, repo, and binary/cosign SHA-256 digests are immutably pinned in code", () => {
   assert.equal(PINNED_RELEASE_REPO, "alexno10/seccomp-profiler");
-  assert.equal(PINNED_RELEASE_VERSION, "v1.1.1");
+  assert.equal(PINNED_RELEASE_VERSION, "v1.2.0");
   assert.equal(COSIGN_SHA256.amd64, "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b");
   assert.equal(COSIGN_SHA256.arm64, "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a");
-  assert.equal(PINNED_BINARY_SHA256.amd64, "e302fd3c82253384ce9a07f3d02451f54d8effd20c781a2f5ced12a916367629");
-  assert.equal(PINNED_BINARY_SHA256.arm64, "e60901f533def882faa3f75115429191dd95e71ceda3230742027227f8d9132c");
+  assert.equal(PINNED_BINARY_SHA256.amd64, "bab765be0ac7b24b8831e62818f3d4d783e5481aee9527ed54bff052a005d1ce");
+  assert.equal(PINNED_BINARY_SHA256.arm64, "5da3813ecb4374acd02cef045098181c24fe4ab5daf49efa85aab79e4ec79bba");
 });
 
 test("COSIGN_CERT_IDENTITY_REGEXP is strictly anchored and rejects other workflows, repos, or refs", () => {
@@ -225,7 +225,7 @@ test("downloadFile rejects non-HTTPS URLs and non-HTTPS redirects", async () => 
   const lib = require("./lib.js");
   const dest = path.join(os.tmpdir(), `seccomp-dl-test-${Date.now()}`);
   await assert.rejects(() => lib.downloadFile("http://example.com/file", dest), /HTTPS/i);
-  assert.equal(lib.validateDownloadUrl("https://github.com/alexno10/seccomp-profiler/releases/download/v1.1.1/a").protocol, "https:");
+  assert.equal(lib.validateDownloadUrl("https://github.com/alexno10/seccomp-profiler/releases/download/v1.2.0/a").protocol, "https:");
   assert.throws(() => lib.validateDownloadUrl("http://github.com/foo"), /HTTPS/i);
   assert.throws(() => lib.validateDownloadUrl("file:///etc/passwd"), /HTTPS/i);
 });
@@ -283,7 +283,7 @@ test("installBinaryAtomically creates root cache dir, installs staging file, and
   const fakeExec = (cmd, args, opts) => {
     calls.push({ cmd, args, env: opts && opts.env });
   };
-  lib.installBinaryAtomically("/tmp/dl/bin", "/opt/seccomp-profiler/v1.1.1", "/opt/seccomp-profiler/v1.1.1/seccomp-profiler", fakeExec);
+  lib.installBinaryAtomically("/tmp/dl/bin", "/opt/seccomp-profiler/v1.2.0", "/opt/seccomp-profiler/v1.2.0/seccomp-profiler", fakeExec);
   assert.equal(calls.length, 3);
   assert.deepEqual(calls[0].args.slice(0, 2), ["install", "-d"]);
   assert.equal(calls[1].args[0], "install");

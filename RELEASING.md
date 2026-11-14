@@ -17,7 +17,7 @@ The release flow is intentionally rigid: published assets are never overwritten,
 The running action downloads the release binary pinned in `action/lib.js`:
 
 ```js
-const PINNED_RELEASE_VERSION = "v1.1.1";
+const PINNED_RELEASE_VERSION = "v1.2.0";
 const PINNED_BINARY_SHA256 = { amd64: "...", arm64: "..." };
 ```
 

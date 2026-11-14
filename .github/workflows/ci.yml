@@ -232,16 +232,16 @@ jobs:
 
       - name: Pre-pull test container image
         run: |
-          test ! -f /opt/seccomp-profiler/v1.1.1/seccomp-profiler
+          test ! -f /opt/seccomp-profiler/v1.2.0/seccomp-profiler
           docker pull alpine:3.20
 
-      - name: Start Seccomp Profiler Action (downloads v1.1.1 release, verifies checksums.txt.sig + pinned SHA-256 + Cosign, auto-stops in post hook)
+      - name: Start Seccomp Profiler Action (downloads v1.2.0 release, verifies checksums.txt.sig + pinned SHA-256 + Cosign, auto-stops in post hook)
         uses: ./
 
       - name: Run container workload and verify negative Cosign identity rejection
         run: |
-          test -x /opt/seccomp-profiler/v1.1.1/seccomp-profiler
-          docker run --rm alpine:3.20 echo "testing v1.1.1 release binary + cosign + automatic post hook teardown"
+          test -x /opt/seccomp-profiler/v1.2.0/seccomp-profiler
+          docker run --rm alpine:3.20 echo "testing v1.2.0 release binary + cosign + automatic post hook teardown"
 
           # Negative Test: Sign a binary with THIS workflow's OIDC identity (ci.yml@refs/heads/main)
           # and prove that verifyCosignSignature rejects both wrong workflow/ref and wrong repository!
@@ -260,13 +260,13 @@ jobs:
           /tmp/cosign-neg sign-blob --yes \
             --output-signature /tmp/ci-signed.sig \
             --output-certificate /tmp/ci-signed.pem \
-            /opt/seccomp-profiler/v1.1.1/seccomp-profiler
+            /opt/seccomp-profiler/v1.2.0/seccomp-profiler
 
           # 1. Must FAIL when verified against the strict release.yml@refs/tags/v... identity in action/lib.js
           node -e '
             const { verifyCosignSignature } = require("./action/lib.js");
             try {
-              verifyCosignSignature("/tmp/cosign-neg", "/opt/seccomp-profiler/v1.1.1/seccomp-profiler", "/tmp/ci-signed.sig", "/tmp/ci-signed.pem");
+              verifyCosignSignature("/tmp/cosign-neg", "/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "/tmp/ci-signed.sig", "/tmp/ci-signed.pem");
               console.error("ERROR: verifyCosignSignature accepted a certificate signed by ci.yml instead of release.yml!");
               process.exit(1);
             } catch (err) {
@@ -280,7 +280,7 @@ jobs:
             try {
               verifyCosignSignature(
                 "/tmp/cosign-neg",
-                "/opt/seccomp-profiler/v1.1.1/seccomp-profiler",
+                "/opt/seccomp-profiler/v1.2.0/seccomp-profiler",
                 "/tmp/ci-signed.sig",
                 "/tmp/ci-signed.pem",
                 "^https://github\\.com/other-owner/seccomp-profiler/\\.github/workflows/ci\\.yml@refs/heads/main$"
