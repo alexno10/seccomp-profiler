@@ -42,6 +42,61 @@ func TestLoadApprovalsParserHardening(t *testing.T) {
 	if entries, err := diff.LoadApprovals(write("version: 1\n")); err != nil || len(entries) != 0 {
 		t.Fatalf("empty accepted list must be valid: %v %v", entries, err)
 	}
+
+	// UTF-8 BOM and unquoted apostrophe before # inline comment must work.
+	bomAndApostrophe := "\xef\xbb\xbfversion: 1\naccepted:\n  - target: api\n    syscall: bpf\n    reason: app's debug probe # inline comment\n    expires: 2027-01-01\n"
+	if entries, err := diff.LoadApprovals(write(bomAndApostrophe)); err != nil || len(entries) != 1 || entries[0].Reason != "app's debug probe" {
+		t.Fatalf("expected BOM + apostrophe + inline comment to parse cleanly, got entries=%+v err=%v", entries, err)
+	}
+
+	// JSON accepted.yml with unknown fields must be rejected.
+	if _, err := diff.LoadApprovals(write(`{"version": 1, "accepted": [{"target": "api", "syscall": "bpf", "expiry": "2020-01-01"}]}`)); err == nil {
+		t.Fatal("expected JSON accepted.yml with unknown field 'expiry' to be rejected")
+	}
+
+	// JSON trailing garbage after root object must be rejected.
+	if _, err := diff.LoadApprovals(write(`{"version": 1, "accepted": []} trailing`)); err == nil {
+		t.Fatal("expected JSON accepted.yml with trailing tokens to be rejected")
+	}
+
+	// YAML entries missing target or syscall must be rejected.
+	if _, err := diff.LoadApprovals(write("accepted:\n  - target: api\n    reason: missing syscall\n")); err == nil {
+		t.Fatal("expected YAML entry missing syscall to be rejected")
+	}
+	if _, err := diff.LoadApprovals(write("accepted:\n  - syscall: bpf\n    reason: missing target\n")); err == nil {
+		t.Fatal("expected YAML entry missing target to be rejected")
+	}
+	if _, err := diff.LoadApprovals(write("accepted:\n  - reason: missing both\n")); err == nil {
+		t.Fatal("expected YAML entry missing target and syscall to be rejected")
+	}
+
+	// Non-KV garbage line inside accepted: must be rejected.
+	if _, err := diff.LoadApprovals(write("accepted:\n  - target: api\n    syscall: bpf\n    not_a_kv_line\n")); err == nil {
+		t.Fatal("expected non-KV garbage line inside accepted: to be rejected")
+	}
+
+	// Stray key before first list item inside accepted: must be rejected.
+	if _, err := diff.LoadApprovals(write("accepted:\n  target: api\n")); err == nil {
+		t.Fatal("expected stray KV before first '-' list item to be rejected")
+	}
+
+	// Unknown top-level key must be rejected.
+	if _, err := diff.LoadApprovals(write("typo_top: 1\n")); err == nil {
+		t.Fatal("expected unknown top-level key to be rejected")
+	}
+
+	// Invalid expires date format in YAML and JSON must be rejected.
+	if _, err := diff.LoadApprovals(write("accepted:\n  - target: api\n    syscall: bpf\n    expires: not-a-date\n")); err == nil {
+		t.Fatal("expected invalid YAML expires format to be rejected")
+	}
+	if _, err := diff.LoadApprovals(write(`{"version": 1, "accepted": [{"target": "api", "syscall": "bpf", "expires": "not-a-date"}]}`)); err == nil {
+		t.Fatal("expected invalid JSON expires format to be rejected")
+	}
+
+	// Duplicate (target, syscall) entries must be rejected.
+	if _, err := diff.LoadApprovals(write("accepted:\n  - target: api\n    syscall: bpf\n  - target: api\n    syscall: bpf\n")); err == nil {
+		t.Fatal("expected duplicate (target, syscall) entry to be rejected")
+	}
 }
 
 // Review item 2: a syscall that was only allowed under argument constraints
@@ -144,9 +199,17 @@ func TestExpandedHighRiskList(t *testing.T) {
 		"clock_settime", "settimeofday", "adjtimex", "sethostname",
 		"personality", "fanotify_init", "move_pages", "migrate_pages",
 		"uselib", "vhangup",
+		"quotactl_fd", "clock_adjtime", "modify_ldt", "lsm_set_self_attr",
 	} {
 		if risk, _ := diff.ClassifySyscall(name); risk != diff.RiskHigh {
 			t.Fatalf("expected %q to be high risk, got %s", name, risk)
+		}
+	}
+	for _, name := range []string{
+		"setgroups", "setfsuid", "setfsgid", "fchmodat2",
+	} {
+		if risk, _ := diff.ClassifySyscall(name); risk != diff.RiskMedium {
+			t.Fatalf("expected %q to be medium risk, got %s", name, risk)
 		}
 	}
 }

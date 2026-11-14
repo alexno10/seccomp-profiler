@@ -4,6 +4,7 @@
 
 | Version | Supported |
 |---|---|
+| 1.1.x | ✅ |
 | 1.0.x | ✅ |
 | < 1.0 | ❌ |
 
@@ -26,7 +27,7 @@ Please open a [private security advisory](https://github.com/alexno10/seccomp-pr
 
 ### Explicitly out of scope / known limitations
 - 32-bit compat workloads: detected and failed, not profiled.
-- The `tcp://` control endpoint (testing only) has no authentication.
+- The `tcp://` control endpoint (testing only, restricted to loopback addresses) has no authentication.
 - Branch protection is still required for the CODEOWNERS mechanism to be enforceable.
 
 ## Hardening Recommendations for Users

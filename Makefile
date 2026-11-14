@@ -17,7 +17,7 @@ GO_LDFLAGS ?= -s -w -buildid= -X main.version=$(VERSION)
 all: bpf build
 
 generate:
-	$(GO) generate ./internal/syscalls/...
+	$(GO) generate ./...
 
 bpf:
 	$(CLANG) $(BPF_CFLAGS) -c bpf/profiler.bpf.c -o bpf/profiler.bpf.o

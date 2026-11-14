@@ -59,31 +59,26 @@ type Collector interface {
 	Close() error
 }
 
-type rawKernelEvent struct {
-	Type     uint32
-	Pad      uint32
-	CgroupID uint64
-	Path     [256]byte
-}
+const RawKernelEventSize = 272
 
 func DecodeKernelEvent(raw []byte) (KernelEvent, error) {
-	if len(raw) < binary.Size(rawKernelEvent{}) {
+	if len(raw) < RawKernelEventSize {
 		return KernelEvent{}, fmt.Errorf("short kernel event buffer: %d bytes", len(raw))
 	}
-	var r rawKernelEvent
-	if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &r); err != nil {
-		return KernelEvent{}, err
-	}
-	str := cString(r.Path[:])
+	evType := binary.LittleEndian.Uint32(raw[0:4])
+	cgroupID := binary.LittleEndian.Uint64(raw[8:16])
+	str := cString(raw[16:RawKernelEventSize])
 	ev := KernelEvent{
-		Type:     r.Type,
-		CgroupID: r.CgroupID,
+		Type:     evType,
+		CgroupID: cgroupID,
 	}
-	switch r.Type {
+	switch evType {
 	case EventCgroupMkdir:
 		ev.CgroupPath = str
 	case EventExec:
 		ev.ExecFilename = str
+	default:
+		return KernelEvent{}, fmt.Errorf("unknown kernel event type: %d", evType)
 	}
 	return ev, nil
 }

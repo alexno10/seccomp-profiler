@@ -9,6 +9,10 @@ const (
 	ArchARM64 Arch = "arm64"
 )
 
+func IsKnownArch(arch Arch) bool {
+	return arch == ArchAMD64 || arch == ArchARM64
+}
+
 func NameByNumber(arch Arch, nr int) (string, bool) {
 	switch arch {
 	case ArchAMD64:
@@ -37,15 +41,17 @@ func NumberByName(arch Arch, name string) (int, bool) {
 
 func SeccompArchitectures(arch Arch, includeCompat bool) []string {
 	switch arch {
+	case ArchAMD64:
+		if includeCompat {
+			return []string{"SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"}
+		}
+		return []string{"SCMP_ARCH_X86_64"}
 	case ArchARM64:
 		if includeCompat {
 			return []string{"SCMP_ARCH_AARCH64", "SCMP_ARCH_ARM"}
 		}
 		return []string{"SCMP_ARCH_AARCH64"}
 	default:
-		if includeCompat {
-			return []string{"SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"}
-		}
-		return []string{"SCMP_ARCH_X86_64"}
+		return nil
 	}
 }

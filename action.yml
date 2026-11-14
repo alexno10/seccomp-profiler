@@ -50,7 +50,7 @@ inputs:
     required: false
     default: "auto"
   extra-allow:
-    description: "Newline-separated list of additional syscalls to allow"
+    description: "Comma- or newline-separated list of additional syscalls to allow"
     required: false
     default: ""
   prune:

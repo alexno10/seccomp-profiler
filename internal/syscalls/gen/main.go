@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,20 +19,27 @@ type entry struct {
 }
 
 func main() {
-	amd64, err := parseTbl(filepath.Join("gen", "syscall_64.tbl"))
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		panic("failed to resolve caller path for internal/syscalls/gen")
+	}
+	genDir := filepath.Dir(thisFile)
+	syscallsDir := filepath.Dir(genDir)
+
+	amd64, err := parseTbl(filepath.Join(genDir, "syscall_64.tbl"))
 	if err != nil {
 		panic(err)
 	}
-	arm64, err := parseHeader(filepath.Join("gen", "unistd_arm64.h"))
+	arm64, err := parseHeader(filepath.Join(genDir, "unistd_arm64.h"))
 	if err != nil {
 		panic(err)
 	}
 	// Go treats *_amd64.go and *_arm64.go as mutually exclusive GOARCH build constraints.
 	// Emit both tables into each file so cross-arch lookups (e.g. ArchARM64 on an amd64 host) work on both target architectures.
-	if err := writeTables("zsyscalls_amd64.go", amd64, arm64); err != nil {
+	if err := writeTables(filepath.Join(syscallsDir, "zsyscalls_amd64.go"), amd64, arm64); err != nil {
 		panic(err)
 	}
-	if err := writeTables("zsyscalls_arm64.go", amd64, arm64); err != nil {
+	if err := writeTables(filepath.Join(syscallsDir, "zsyscalls_arm64.go"), amd64, arm64); err != nil {
 		panic(err)
 	}
 }
@@ -86,6 +94,9 @@ func parseHeader(path string) ([]entry, error) {
 			continue
 		}
 		name := strings.TrimPrefix(fields[1], "__NR_")
+		if name == "syscalls" {
+			continue
+		}
 		nr, err := strconv.Atoi(fields[2])
 		if err != nil || nr < 0 || nr >= 512 {
 			continue

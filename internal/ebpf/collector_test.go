@@ -290,3 +290,53 @@ func TestSelectBPFCollectionSourcePrecedence(t *testing.T) {
 		t.Fatal("collector_linux.go must use SelectBPFCollectionSource to ensure embeddedBPFObj precedence")
 	}
 }
+
+func TestDecodeKernelEventErrorsAndEdgeCases(t *testing.T) {
+	// 1. Short buffers must fail.
+	for _, sz := range []int{0, 16, ebpf.RawKernelEventSize - 1} {
+		if _, err := ebpf.DecodeKernelEvent(make([]byte, sz)); err == nil {
+			t.Fatalf("expected error for short buffer of %d bytes", sz)
+		}
+	}
+
+	// 2. Unknown event types (0, 99) must fail instead of returning a zero-path KernelEvent.
+	for _, badType := range []uint32{0, 99} {
+		buf := make([]byte, ebpf.RawKernelEventSize)
+		binary.LittleEndian.PutUint32(buf[0:4], badType)
+		if _, err := ebpf.DecodeKernelEvent(buf); err == nil {
+			t.Fatalf("expected error for unknown event type %d", badType)
+		}
+	}
+
+	// 3. Full 256-byte non-NUL-terminated path is truncated safely to 256 bytes without NUL.
+	buf := make([]byte, ebpf.RawKernelEventSize)
+	binary.LittleEndian.PutUint32(buf[0:4], ebpf.EventExec)
+	binary.LittleEndian.PutUint64(buf[8:16], 12345)
+	for i := 16; i < ebpf.RawKernelEventSize; i++ {
+		buf[i] = 'a'
+	}
+	ev, err := ebpf.DecodeKernelEvent(buf)
+	if err != nil {
+		t.Fatalf("DecodeKernelEvent full non-NUL buffer failed: %v", err)
+	}
+	if len(ev.ExecFilename) != 256 || ev.CgroupPath != "" || ev.CgroupID != 12345 {
+		t.Fatalf("unexpected decoded event: %+v (len=%d)", ev, len(ev.ExecFilename))
+	}
+
+	// 4. ErrorStats helpers.
+	if (ebpf.ErrorStats{}).Any() {
+		t.Fatal("zero ErrorStats.Any() must be false")
+	}
+	for _, es := range []ebpf.ErrorStats{
+		{CgroupMapFull: 1},
+		{RingbufDrops: 2},
+		{OobSyscalls: 3},
+	} {
+		if !es.Any() {
+			t.Fatalf("expected Any() true for %+v", es)
+		}
+		if es.String() == "" {
+			t.Fatal("expected non-empty String()")
+		}
+	}
+}

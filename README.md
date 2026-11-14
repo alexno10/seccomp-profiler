@@ -174,7 +174,7 @@ seccomp-profiler merge \
 
 ## Architecture & Security Documentation
 
-For a deep technical overview of the 3-hook eBPF kernel tracer, Anchor-64 verifier optimization, runc/crun suppression model (and why `prctl(PR_SET_NAME, "runc")` no longer hides syscalls), 4-layer provenance model, hand-edit lock protection, and Sigstore Cosign OIDC verification, see [**`docs/ARCHITECTURE.md`**](docs/ARCHITECTURE.md). For the security policy see [**`SECURITY.md`**](SECURITY.md).
+For a deep technical overview of the 5-hook eBPF kernel tracer, Anchor-64 verifier optimization, runc/crun suppression model (and why `prctl(PR_SET_NAME, "runc")` no longer hides syscalls), 4-layer provenance model, hand-edit lock protection, and Sigstore Cosign OIDC verification, see [**`docs/ARCHITECTURE.md`**](docs/ARCHITECTURE.md). For the security policy see [**`SECURITY.md`**](SECURITY.md).
 
 ---
 

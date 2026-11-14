@@ -12,14 +12,14 @@ flowchart LR
     subgraph Kernel["Linux Kernel (5.19+ / Cgroup v2)"]
         T1["tracepoint/cgroup/cgroup_mkdir"]
         T2["tracepoint/sched/sched_process_exec"]
-        T4["tracepoint/sched/sched_process_fork"]
-        T5["tracepoint/syscalls/sys_enter_execve{,at}"]
+        T4["raw_tracepoint/sched_process_fork"]
+        T5["tracepoint/sched/sched_process_exit"]
         T3["raw_tracepoint/sys_enter"]
         M1[("candidate_cgroups\n(BPF_MAP_TYPE_HASH)")]
         M2[("syscalls_per_cgroup\n(BPF_MAP_TYPE_HASH)")]
         M3[("runtime_tids\n(BPF_MAP_TYPE_LRU_HASH)")]
         M4[("exec_pending\n(BPF_MAP_TYPE_LRU_HASH)")]
-        M5[("error_stats\n(BPF_MAP_TYPE_HASH)")]
+        M5[("error_stats\n(BPF_MAP_TYPE_ARRAY)")]
         RB[("events\n(BPF_MAP_TYPE_RINGBUF)")]
         T1 --> M1
         T1 --> M5
@@ -30,9 +30,13 @@ flowchart LR
         T2 --> M4
         T2 --> M5
         T2 --> RB
+        T4 --> M2
         T4 --> M3
+        T5 --> M3
         T5 --> M4
         T3 --> M2
+        T3 --> M3
+        T3 --> M4
         T3 --> M5
     end
 
@@ -72,7 +76,7 @@ To filter out host systemd units without hitting the Linux BPF verifier's 1,000,
 - Instead of maintaining a loop-carried run counter across 256 iterations (which multiplies verifier branch states), `check_hex_anchor` inspects those three anchor positions and counts contiguous hex bytes `[0-9a-f]` to the left and right.
 - Matching cgroup IDs are inserted into `candidate_cgroups` with `STATE_PENDING_EXEC` and emitted to userspace over the `events` ring buffer.
 
-### 2.2 Runtime Suppression Model (Hooks 2/4/5) — Hardened Against Comm Spoofing
+### 2.2 Runtime Suppression Model (Hooks 2–5) — Hardened Against Comm Spoofing
 
 The old design trusted `current->comm` inside `sys_enter`, which meant:
 - application re-execs via `/proc/self/exe` or `fexecve` (Chromium zygotes, Go re-execs, memfd loaders) were misclassified as runtime self-execs and their syscalls were silently dropped;
@@ -80,10 +84,11 @@ The old design trusted `current->comm` inside `sys_enter`, which meant:
 
 The redesigned suppression uses the *pre-exec* comm as the only runtime signal:
 
-1. **`tracepoint/syscalls/sys_enter_execve` + `sys_enter_execveat`:** if the thread's comm **before** the exec is `runc`/`crun`, the TID is recorded in `exec_pending` (LRU map).
-2. **`tracepoint/sched/sched_process_fork`:** children forked by `runc`/`crun` are pre-marked in `runtime_tids` so their pre-first-exec setup syscalls (e.g. crun's `setns`/`mount`) are suppressed.
-3. **`tracepoint/sched/sched_process_exec`:** an exec is treated as a runtime bootstrap re-exec **only** when the exec was initiated by the runtime (`exec_pending`) **and** lands on a self-referential binary (`/proc/self/*`, `/dev/fd/*`, `/memfd:*`) or keeps the runtime comm. In that case the TID stays suppressed. **Every other exec unmarks the TID and activates/records the cgroup** — including the container entrypoint, secondary `docker exec` workloads, and application `/proc/self/exe` re-execs.
-4. **`raw_tracepoint/sys_enter`:** suppression is keyed **only** on the TID map. There is no comm check, so renaming a process to `runc` no longer hides anything. An unreadable exec filename fails open to *recording* (never to suppression).
+1. **`raw_tracepoint/sys_enter` (`execve` / `execveat` dispatch):** if the thread is already in `runtime_tids`, or is outside any tracked container cgroup (`!syscalls_per_cgroup`) with a `runc`/`crun`/`containerd-shim` comm, the TID is recorded in `exec_pending` (LRU map). Dispatching from `raw_tracepoint/sys_enter` avoids single-CPU attachment limitations on per-syscall tracepoints.
+2. **`raw_tracepoint/sched_process_fork`:** children forked by `runtime_tids` (or by pre-container `runc`/`crun`/`containerd-shim` outside tracked cgroups) are pre-marked in `runtime_tids` so their pre-first-exec setup syscalls (e.g. crun's `setns`/`mount`) are suppressed. Raw tracepoint + CO-RE `task_struct->pid` avoids kernel 6.8+ tracepoint context-size restrictions.
+3. **`tracepoint/sched/sched_process_exec`:** an exec is treated as a runtime bootstrap re-exec **only** when the exec was initiated by the runtime (`exec_pending`) **and** lands on a self-referential binary (`/proc/self/*`, `/dev/fd/*`, `/memfd:*`). In that case the TID stays suppressed. **Every other exec unmarks the TID and activates/records the cgroup** — including the container entrypoint, secondary `docker exec` workloads, and application `/proc/self/exe` re-execs.
+4. **`tracepoint/sched/sched_process_exit`:** deletes exiting TIDs from `runtime_tids` and `exec_pending` to prevent TID-reuse suppression and stale map entries.
+5. **`raw_tracepoint/sys_enter`:** suppression is keyed **only** on the TID map. There is no comm check, so renaming a process to `runc` no longer hides anything. An unreadable exec filename fails open to *recording* (never to suppression).
 
 Both suppression decisions and their absence are covered by e2e tests: the CI asserts that `unshare` inside a container is observed (gate counts it high-risk) and that a `/proc/self/exe` re-exec is recorded.
 

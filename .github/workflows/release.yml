@@ -6,8 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
   unit-tests:
@@ -17,11 +16,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: "go.mod"
+
+      - name: Verify generated syscall tables are up to date
+        run: |
+          go generate ./...
+          git diff --exit-code
 
       - name: Run unit tests (a release is never cut from untested code)
         run: |
@@ -36,9 +42,14 @@ jobs:
   release:
     needs: unit-tests
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
@@ -48,16 +59,28 @@ jobs:
       - name: Install pinned Clang/LLVM and SHA-256 verified Cosign
         run: |
           sudo apt-get update && sudo apt-get install -y clang-18 llvm-18
-          curl -fsSL https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64 -o /tmp/cosign
-          echo "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  /tmp/cosign" | sha256sum -c -
-          chmod +x /tmp/cosign
-          sudo mv /tmp/cosign /usr/local/bin/cosign
+          COSIGN_DIR=$(mktemp -d)
+          curl -fsSL https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64 -o "${COSIGN_DIR}/cosign"
+          echo "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  ${COSIGN_DIR}/cosign" | sha256sum -c -
+          sudo install -m 0755 "${COSIGN_DIR}/cosign" /usr/local/bin/cosign
+          rm -rf "${COSIGN_DIR}"
           cosign version
 
       - name: Build deterministic multi-arch release binaries with embedded eBPF bytecode
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: release tag ${TAG_NAME} must match vX.Y.Z"
+            exit 1
+          fi
+          EXPECTED_VER="${TAG_NAME#v}"
+          CODE_VER="$(sed -nE 's/^var version = "([^"]+)"/\1/p' cmd/seccomp-profiler/main.go)"
+          if [ "$CODE_VER" != "$EXPECTED_VER" ]; then
+            echo "ERROR: cmd/seccomp-profiler/main.go version (${CODE_VER}) does not match tag (${EXPECTED_VER})"
+            exit 1
+          fi
+
           mkdir -p dist
 
           make bpf-amd64 CLANG=clang-18

@@ -99,6 +99,9 @@ func ValidateConfig(cfg Config) error {
 			return err
 		}
 	}
+	if _, err := selector.ParseTargetsInputWithErr(cfg.Targets); err != nil {
+		return fmt.Errorf("invalid targets: %w", err)
+	}
 	for _, extra := range cfg.ExtraAllow {
 		for _, tok := range strings.FieldsFunc(extra, func(r rune) bool {
 			return r == '\n' || r == '\r' || r == ',' || r == ' ' || r == '\t'
@@ -392,8 +395,14 @@ func (s *Server) executeStop() *StopResponse {
 	}
 
 	records := s.correlator.BuildRecords(stats)
+	rules, err := selector.ParseTargetsInputWithErr(s.cfg.Targets)
+	if err != nil {
+		resp := &StopResponse{OK: false, Error: fmt.Sprintf("parse targets: %v", err)}
+		s.cachedResp = resp
+		return resp
+	}
 	selCfg := selector.Config{
-		Rules:          selector.ParseTargetsInput(s.cfg.Targets),
+		Rules:          rules,
 		GroupBy:        s.cfg.GroupBy,
 		ExtraExcludes:  s.cfg.ExcludeImages,
 		ComposeProject: s.cfg.ComposeProject,

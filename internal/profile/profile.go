@@ -131,6 +131,9 @@ func Build(target selector.MatchedTarget, opts BuildOptions) (*BuiltProfile, err
 	// 32-bit compat syscalls are reported but deliberately not profiled:
 	// the profile stays native-only and the diff gate fails on compat hits.
 	seccompArchs := syscalls.SeccompArchitectures(arch, false)
+	if len(seccompArchs) == 0 {
+		return nil, fmt.Errorf("unsupported architecture %q", arch)
+	}
 	primarySeccompArch := seccompArchs[0]
 
 	var detectedRuntimes []string
@@ -601,8 +604,11 @@ func ValidateTargetName(name string) error {
 	if name == "" || len(name) > 100 {
 		return fmt.Errorf("invalid target name %q: must be 1-100 characters", name)
 	}
-	if name == "." || strings.HasPrefix(name, "..") {
+	if name == "." || strings.Contains(name, "..") {
 		return fmt.Errorf("invalid target name %q: must not be a relative path component", name)
+	}
+	if strings.HasSuffix(strings.ToLower(name), ".suggested") {
+		return fmt.Errorf("invalid target name %q: must not end with .suggested", name)
 	}
 	for _, r := range name {
 		switch {

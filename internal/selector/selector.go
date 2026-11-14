@@ -1,8 +1,10 @@
 package selector
 
 import (
+	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 type ContainerRecord struct {
@@ -89,7 +91,10 @@ func isValidTargetName(name string) bool {
 	if name == "" || len(name) > 100 {
 		return false
 	}
-	if name == "." || strings.HasPrefix(name, "..") {
+	if name == "." || strings.Contains(name, "..") {
+		return false
+	}
+	if strings.HasSuffix(strings.ToLower(name), ".suggested") {
 		return false
 	}
 	for _, r := range name {
@@ -248,7 +253,8 @@ func matchRules(rules []TargetRule, c ContainerRecord) (TargetRule, bool) {
 		}
 		labelsMatch := true
 		for k, v := range r.Labels {
-			if c.Labels[k] != v {
+			val, exists := c.Labels[k]
+			if !exists || val != v {
 				labelsMatch = false
 				break
 			}
@@ -297,38 +303,421 @@ func matchGlob(pattern, str string) bool {
 	return strings.HasSuffix(str, last)
 }
 
+// ParseTargetsInput parses target selector rules, discarding errors for
+// callers that do not validate configuration. Prefer ParseTargetsInputWithErr.
 func ParseTargetsInput(raw string) []TargetRule {
-	var rules []TargetRule
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "-"))
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		var name, expr string
-		if parts := strings.SplitN(line, "->", 2); len(parts) == 2 {
-			expr = strings.TrimSpace(parts[0])
-			name = strings.TrimSpace(parts[1])
-		} else {
-			expr = line
-		}
-		rule := TargetRule{Name: name}
-		for _, tok := range strings.Fields(expr) {
-			if strings.HasPrefix(tok, "labels:") {
-				rule.Labels = make(map[string]string)
-				for _, kv := range strings.Split(strings.TrimPrefix(tok, "labels:"), ",") {
-					if kvParts := strings.SplitN(kv, "=", 2); len(kvParts) == 2 {
-						rule.Labels[strings.TrimSpace(kvParts[0])] = strings.TrimSpace(kvParts[1])
-					}
-				}
-			} else if strings.HasPrefix(tok, "image:") {
-				rule.ImageGlob = strings.TrimPrefix(tok, "image:")
-			} else {
-				rule.ImageGlob = tok
-			}
-		}
-		if rule.ImageGlob != "" || len(rule.Labels) > 0 {
-			rules = append(rules, rule)
-		}
+	rules, err := ParseTargetsInputWithErr(raw)
+	if err != nil {
+		return nil
 	}
 	return rules
+}
+
+// ParseTargetsInputWithErr parses multiline shorthand rules or YAML list items
+// into TargetRules. Any non-empty input that fails validation returns an error
+// instead of silently degrading to auto-discovery.
+func ParseTargetsInputWithErr(raw string) ([]TargetRule, error) {
+	raw = strings.TrimPrefix(raw, "\xef\xbb\xbf")
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+
+	var rules []TargetRule
+	var cur *TargetRule
+	var curIndent int
+	var inLabels bool
+	var labelsIndent int
+	var expectingLabels bool
+	var hasName, hasImage, hasLabels bool
+	var hasContent bool
+
+	flushCur := func() error {
+		if cur == nil {
+			return nil
+		}
+		if expectingLabels {
+			return fmt.Errorf("targets rule %q: empty labels block", cur.Name)
+		}
+		if cur.ImageGlob == "" && len(cur.Labels) == 0 {
+			return fmt.Errorf("targets rule %q must specify image or labels", cur.Name)
+		}
+		if cur.Name != "" && !isValidTargetName(cur.Name) {
+			return fmt.Errorf("invalid target name %q", cur.Name)
+		}
+		rules = append(rules, *cur)
+		cur = nil
+		inLabels = false
+		expectingLabels = false
+		hasName = false
+		hasImage = false
+		hasLabels = false
+		return nil
+	}
+
+	applyYAMLField := func(lineNum int, r *TargetRule, k, v string, indent int) error {
+		switch k {
+		case "name":
+			if hasName {
+				return fmt.Errorf("targets line %d: duplicate field %q", lineNum, k)
+			}
+			val, err := unquoteTargetScalar(v)
+			if err != nil {
+				return fmt.Errorf("targets line %d: %w", lineNum, err)
+			}
+			if val == "" || !isValidTargetName(val) {
+				return fmt.Errorf("targets line %d: invalid target name %q", lineNum, val)
+			}
+			r.Name = val
+			hasName = true
+		case "image":
+			if hasImage {
+				return fmt.Errorf("targets line %d: duplicate field %q", lineNum, k)
+			}
+			val, err := unquoteTargetScalar(v)
+			if err != nil {
+				return fmt.Errorf("targets line %d: %w", lineNum, err)
+			}
+			if val == "" || strings.ContainsAny(val, " \t") {
+				return fmt.Errorf("targets line %d: invalid image selector %q", lineNum, v)
+			}
+			r.ImageGlob = val
+			hasImage = true
+		case "labels":
+			if hasLabels {
+				return fmt.Errorf("targets line %d: duplicate field %q", lineNum, k)
+			}
+			hasLabels = true
+			if v == "" {
+				r.Labels = make(map[string]string)
+				inLabels = true
+				labelsIndent = indent
+				expectingLabels = true
+			} else {
+				parsed, err := parseInlineLabels(lineNum, v)
+				if err != nil {
+					return err
+				}
+				r.Labels = parsed
+			}
+		default:
+			return fmt.Errorf("targets line %d: unknown YAML field %q", lineNum, k)
+		}
+		return nil
+	}
+
+	for idx, rawLine := range strings.Split(raw, "\n") {
+		lineNum := idx + 1
+		cleaned := stripTargetComment(rawLine)
+		trimmed := strings.TrimSpace(cleaned)
+		if trimmed == "" {
+			continue
+		}
+		hasContent = true
+		indent := countIndent(cleaned)
+
+		isDash := trimmed == "-" || strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "-\t")
+
+		if cur != nil && indent > curIndent && !isDash {
+			if inLabels && indent > labelsIndent {
+				k, v, ok := splitTargetKV(trimmed)
+				if !ok {
+					return nil, fmt.Errorf("targets line %d: invalid label entry %q", lineNum, trimmed)
+				}
+				key, err := unquoteTargetScalar(k)
+				if err != nil {
+					return nil, fmt.Errorf("targets line %d: %w", lineNum, err)
+				}
+				if key == "" {
+					return nil, fmt.Errorf("targets line %d: empty label key", lineNum)
+				}
+				val, err := unquoteTargetScalar(v)
+				if err != nil {
+					return nil, fmt.Errorf("targets line %d: %w", lineNum, err)
+				}
+				if cur.Labels == nil {
+					cur.Labels = make(map[string]string)
+				}
+				if _, exists := cur.Labels[key]; exists {
+					return nil, fmt.Errorf("targets line %d: duplicate label key %q", lineNum, key)
+				}
+				cur.Labels[key] = val
+				expectingLabels = false
+				continue
+			}
+			inLabels = false
+			if expectingLabels {
+				return nil, fmt.Errorf("targets line %d: empty labels block", lineNum)
+			}
+			k, v, ok := splitTargetKV(trimmed)
+			if !ok {
+				return nil, fmt.Errorf("targets line %d: expected key: value inside YAML item, got %q", lineNum, trimmed)
+			}
+			if err := applyYAMLField(lineNum, cur, k, v, indent); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		if err := flushCur(); err != nil {
+			return nil, err
+		}
+
+		if isDash {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
+			if rest == "" {
+				cur = &TargetRule{}
+				curIndent = indent
+				continue
+			}
+			if !strings.Contains(rest, "->") {
+				if k, v, ok := splitTargetKV(rest); ok && isYAMLTargetItemStart(k, v) {
+					cur = &TargetRule{}
+					curIndent = indent
+					if err := applyYAMLField(lineNum, cur, k, v, indent+2); err != nil {
+						return nil, err
+					}
+					continue
+				}
+			}
+			r, err := parseTargetShorthand(lineNum, rest)
+			if err != nil {
+				return nil, err
+			}
+			rules = append(rules, r)
+			continue
+		}
+
+		r, err := parseTargetShorthand(lineNum, trimmed)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, r)
+	}
+
+	if err := flushCur(); err != nil {
+		return nil, err
+	}
+	if hasContent && len(rules) == 0 {
+		return nil, fmt.Errorf("targets input produced no valid rules")
+	}
+	return rules, nil
+}
+
+func isYAMLTargetItemStart(k, v string) bool {
+	switch k {
+	case "name":
+		return true
+	case "labels":
+		return v == "" || (!strings.Contains(v, "=") && !strings.Contains(v, "image:"))
+	case "image":
+		return v != "" && !strings.ContainsAny(v, " \t")
+	default:
+		return false
+	}
+}
+
+func parseTargetShorthand(lineNum int, line string) (TargetRule, error) {
+	if strings.Count(line, "->") > 1 {
+		return TargetRule{}, fmt.Errorf("targets line %d: multiple '->' separators", lineNum)
+	}
+	var name, expr string
+	if idx := strings.Index(line, "->"); idx != -1 {
+		expr = strings.TrimSpace(line[:idx])
+		name = strings.TrimSpace(line[idx+2:])
+		if name == "" || !isValidTargetName(name) {
+			return TargetRule{}, fmt.Errorf("targets line %d: invalid target name %q", lineNum, name)
+		}
+	} else {
+		expr = line
+	}
+	if expr == "" {
+		return TargetRule{}, fmt.Errorf("targets line %d: missing selector matcher before '->'", lineNum)
+	}
+
+	rule := TargetRule{Name: name}
+	tokens := strings.Fields(expr)
+	for i := 0; i < len(tokens); {
+		tok := tokens[i]
+		switch {
+		case tok == "image:" || strings.HasPrefix(tok, "image:"):
+			if rule.ImageGlob != "" {
+				return TargetRule{}, fmt.Errorf("targets line %d: duplicate image selector", lineNum)
+			}
+			val := strings.TrimPrefix(tok, "image:")
+			if val == "" {
+				i++
+				if i >= len(tokens) {
+					return TargetRule{}, fmt.Errorf("targets line %d: missing pattern after 'image:'", lineNum)
+				}
+				val = tokens[i]
+			}
+			i++
+			unq, err := unquoteTargetScalar(val)
+			if err != nil || unq == "" || strings.HasPrefix(unq, "labels:") || strings.HasPrefix(unq, "image:") {
+				return TargetRule{}, fmt.Errorf("targets line %d: invalid image pattern %q", lineNum, val)
+			}
+			rule.ImageGlob = unq
+
+		case tok == "labels:" || strings.HasPrefix(tok, "labels:"):
+			if rule.Labels != nil {
+				return TargetRule{}, fmt.Errorf("targets line %d: duplicate labels selector", lineNum)
+			}
+			first := strings.TrimPrefix(tok, "labels:")
+			i++
+			var parts []string
+			if first != "" {
+				parts = append(parts, first)
+			} else {
+				if i >= len(tokens) {
+					return TargetRule{}, fmt.Errorf("targets line %d: missing k=v pairs after 'labels:'", lineNum)
+				}
+				parts = append(parts, tokens[i])
+				i++
+			}
+			for len(parts) > 0 {
+				last := parts[len(parts)-1]
+				if strings.HasSuffix(last, ",") {
+					if i >= len(tokens) {
+						return TargetRule{}, fmt.Errorf("targets line %d: trailing comma in labels", lineNum)
+					}
+					parts = append(parts, tokens[i])
+					i++
+					continue
+				}
+				if i < len(tokens) && strings.HasPrefix(tokens[i], ",") {
+					parts = append(parts, tokens[i])
+					i++
+					continue
+				}
+				break
+			}
+			parsed, err := parseInlineLabels(lineNum, strings.Join(parts, " "))
+			if err != nil {
+				return TargetRule{}, err
+			}
+			rule.Labels = parsed
+
+		default:
+			if strings.HasSuffix(tok, ":") {
+				return TargetRule{}, fmt.Errorf("targets line %d: unexpected key %q in selector", lineNum, tok)
+			}
+			if rule.ImageGlob != "" {
+				return TargetRule{}, fmt.Errorf("targets line %d: unexpected token %q", lineNum, tok)
+			}
+			unq, err := unquoteTargetScalar(tok)
+			if err != nil || unq == "" {
+				return TargetRule{}, fmt.Errorf("targets line %d: invalid token %q", lineNum, tok)
+			}
+			rule.ImageGlob = unq
+			i++
+		}
+	}
+
+	if rule.ImageGlob == "" && len(rule.Labels) == 0 {
+		return TargetRule{}, fmt.Errorf("targets line %d: rule must specify image or labels", lineNum)
+	}
+	return rule, nil
+}
+
+func parseInlineLabels(lineNum int, raw string) (map[string]string, error) {
+	out := make(map[string]string)
+	for _, seg := range strings.Split(raw, ",") {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			return nil, fmt.Errorf("targets line %d: empty label pair in %q", lineNum, raw)
+		}
+		kv := strings.SplitN(seg, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("targets line %d: label %q must use key=value syntax", lineNum, seg)
+		}
+		k, err := unquoteTargetScalar(strings.TrimSpace(kv[0]))
+		if err != nil {
+			return nil, fmt.Errorf("targets line %d: %w", lineNum, err)
+		}
+		v, err := unquoteTargetScalar(strings.TrimSpace(kv[1]))
+		if err != nil {
+			return nil, fmt.Errorf("targets line %d: %w", lineNum, err)
+		}
+		if k == "" {
+			return nil, fmt.Errorf("targets line %d: empty label key in %q", lineNum, seg)
+		}
+		if _, exists := out[k]; exists {
+			return nil, fmt.Errorf("targets line %d: duplicate label key %q", lineNum, k)
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("targets line %d: empty labels map", lineNum)
+	}
+	return out, nil
+}
+
+func splitTargetKV(line string) (string, string, bool) {
+	idx := strings.IndexByte(line, ':')
+	if idx == -1 {
+		return "", "", false
+	}
+	k := strings.TrimSpace(line[:idx])
+	if k == "" || strings.ContainsAny(k, " \t\"'") {
+		return "", "", false
+	}
+	return k, strings.TrimSpace(line[idx+1:]), true
+}
+
+func unquoteTargetScalar(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return "", nil
+	}
+	if s[0] != '"' && s[0] != '\'' {
+		return s, nil
+	}
+	if len(s) < 2 || s[len(s)-1] != s[0] {
+		return "", fmt.Errorf("unclosed quote in %q", s)
+	}
+	return s[1 : len(s)-1], nil
+}
+
+func stripTargetComment(line string) string {
+	var inSingle, inDouble bool
+	var prev rune
+	for i, r := range line {
+		switch {
+		case inDouble:
+			if r == '\\' && i+1 < len(line) {
+				prev = r
+				continue
+			}
+			if r == '"' && prev != '\\' {
+				inDouble = false
+			}
+		case inSingle:
+			if r == '\'' {
+				inSingle = false
+			}
+		default:
+			if r == '#' && (i == 0 || unicode.IsSpace(prev)) {
+				return line[:i]
+			}
+			if r == '"' && (i == 0 || unicode.IsSpace(prev) || prev == ':' || prev == '-') {
+				inDouble = true
+			} else if r == '\'' && (i == 0 || unicode.IsSpace(prev) || prev == ':' || prev == '-') {
+				inSingle = true
+			}
+		}
+		prev = r
+	}
+	return line
+}
+
+func countIndent(line string) int {
+	n := 0
+	for _, r := range line {
+		if r == ' ' {
+			n++
+		} else if r == '\t' {
+			n += 2
+		} else {
+			break
+		}
+	}
+	return n
 }
