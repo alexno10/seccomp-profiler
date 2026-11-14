@@ -125,7 +125,7 @@ func Build(target selector.MatchedTarget, opts BuildOptions) (*BuiltProfile, err
 	}
 	ver := opts.GeneratorVersion
 	if ver == "" {
-		ver = "1.1.1"
+		ver = "1.2.0"
 	}
 
 	// 32-bit compat syscalls are reported but deliberately not profiled:
@@ -739,7 +739,7 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 		generatedAt = time.Now().UTC()
 	}
 	if generatorVersion == "" {
-		generatorVersion = "1.1.1"
+		generatorVersion = "1.2.0"
 	}
 
 	byTarget := make(map[string][]*RawProfileV1)

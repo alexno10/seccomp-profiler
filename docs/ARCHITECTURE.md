@@ -90,7 +90,7 @@ The redesigned suppression uses the *pre-exec* comm as the only runtime signal:
 4. **`tracepoint/sched/sched_process_exit`:** deletes exiting TIDs from `runtime_tids` and `exec_pending` to prevent TID-reuse suppression and stale map entries.
 5. **`raw_tracepoint/sys_enter`:** suppression is keyed **only** on the TID map. There is no comm check, so renaming a process to `runc` no longer hides anything. An unreadable exec filename fails open to *recording* (never to suppression).
 
-Both suppression decisions and their absence are covered by e2e tests: the CI asserts that `unshare` inside a container is observed (gate counts it high-risk) and that a `/proc/self/exe` re-exec is recorded.
+Both suppression decisions and their absence are covered by e2e tests: the CI asserts that an unapproved high-risk syscall (`add_key` / `keyctl`) inside a container is observed (gate counts it high-risk) and that a `/proc/self/exe` re-exec is recorded.
 
 ### 2.3 Hook 3: `SEC("raw_tracepoint/sys_enter")` & 32-bit Compat Isolation
 - Looks up `syscalls_per_cgroup[cgroup_id]`. Non-container processes and containers still in pre-entrypoint `runc init` return `0` immediately.
@@ -148,11 +148,11 @@ On pull request events the committed reference profile **and** `accepted.yml` ar
 
 During Pull Requests, `diff.Compare` normalizes both the committed reference profile and the newly generated profile (ignoring syscall ordering) and classifies newly added syscalls into three risk tiers:
 
-- **`High` (Container Escape / Kernel Modification):** `ptrace`, `process_vm_readv/writev`, `process_madvise`, `pidfd_getfd`, `mount`, `umount2`, the new mount API (`fsopen`, `fsmount`, `fsconfig`, `fspick`, `move_mount`, `open_tree`, `mount_setattr`), `pivot_root`, `unshare`, `setns`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_*`, `keyctl`, `add_key`, `request_key`, `init_module`, `finit_module`, `delete_module`, `kexec_load/file_load`, `open_by_handle_at`, `name_to_handle_at`, `kcmp`, `ioperm`, `iopl`, `swapon/swapoff`, `reboot`, `acct`, `quotactl`, `syslog`, `clock_settime`, `settimeofday`, `adjtimex`, `sethostname`, `setdomainname`, `personality`, `fanotify_init`, `lookup_dcookie`, `move_pages`, `migrate_pages`, `uselib`, `vhangup`, and unconditional `clone`/`clone3`.
+- **`High` (Container Escape / Kernel Modification):** `ptrace`, `process_vm_readv/writev`, `process_madvise`, `pidfd_getfd`, `mount`, `umount2`, the new mount API (`fsopen`, `fsmount`, `fsconfig`, `fspick`, `move_mount`, `open_tree`, `mount_setattr`), `pivot_root`, `unshare`, `setns`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_*`, `keyctl`, `add_key`, `request_key`, `init_module`, `finit_module`, `delete_module`, `kexec_load/file_load`, `open_by_handle_at`, `name_to_handle_at`, `kcmp`, `ioperm`, `iopl`, `swapon/swapoff`, `reboot`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `clock_settime`, `clock_adjtime`, `settimeofday`, `adjtimex`, `sethostname`, `setdomainname`, `personality`, `fanotify_init`, `lookup_dcookie`, `move_pages`, `migrate_pages`, `uselib`, `vhangup`, `modify_ldt`, `lsm_set_self_attr`, and unconditional `clone`/`clone3`.
 - **`Medium` (Network / Process Execution / Privilege Change):** `socket`, `connect`, `bind`, `listen`, `accept/accept4`, `execve`, `execveat`, arg-constrained `clone`/`clone3`, `fork`, `vfork`, `chown*`, `chmod*`, `setuid/gid` family, `capset`, `chroot`, `mknod`, `ioctl`, etc.
 - **`Low`:** Standard in-namespace I/O, memory, time, and synchronization syscalls.
 
-**Constraint escalation** is a separate high-risk drift class: a syscall that existed only under argument constraints in the committed profile and now appears as an unconditional allow fails the gate (approvable via `accepted.yml` like any other high-risk syscall). Loosened/tightened arg constraints on conditional rules are reported informationally.
+**Constraint escalation** is a separate high-risk drift class: a syscall that existed only under argument constraints in the committed profile and now appears as an unconditional allow fails the gate (approvable via `accepted.yml` like any other high-risk syscall). Changed or loosened arg constraints on conditional rules (`ArgsChanged`), as well as `DefaultAction` or `Architectures` drift, also fail the security gate unless explicitly approved.
 
 Removed syscalls are reported as **informational only** and are preserved in the merged output profile (`MergeCommittedIntoOCI`) so partial test runs never break existing production capabilities; `prune: true` opts into keeping them removed. Arg-constrained rules from both profiles always survive the merge, so a conditional allow can never silently widen.
 
@@ -183,4 +183,4 @@ Unapproved syscalls that violate `fail-on` (`high-risk` or `any-new`) fail the C
 - 32-bit compat workloads are detected and failed, not profiled.
 - `accepted.yml` is parsed by a deliberately minimal YAML subset (flat `accepted:` list). Nested anchors are rejected as unknown keys rather than silently ignored.
 - Runtime auto-detection for Go recognizes the `go` tool and `golang`-derived image names; statically compiled Go binaries are not recognized by filename.
-- The `tcp://` control endpoint has no authentication; it is intended for local testing. The default is a root-only unix socket.
+- The `tcp://` control endpoint (restricted to loopback addresses) has no authentication; it is intended for local testing. The default is a root-only unix socket (`0600`).

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0 (2026-11-14)
+
+Comprehensive security, reliability, and parser hardening release across the eBPF tracer, security gate, Docker correlator, GitHub Action, and CLI.
+
+### Security
+
+- **eBPF runtime suppression & error counter hardening:** `error_stats` now uses `BPF_MAP_TYPE_ARRAY` so slot `0` is always kernel-allocated; `execve`/`execveat` dispatch runs from `raw_tracepoint/sys_enter` across all CPUs; `sched_process_exit` cleans up `runtime_tids` and `exec_pending` on thread exit; processes already inside an active tracked container cgroup cannot spoof `runc`/`crun`/`containerd-shim` comm names to suppress syscalls; negative syscall numbers are counted in `oob_syscalls` before compat checks.
+- **Closed security gate bypasses (`internal/diff`, `internal/profile`):** newly added conditional rules (`Args`), `SCMP_ACT_LOG` rules, multiple conditional rules per syscall, `ArgsChanged`, `DefaultAction` drift, and `Architectures` drift are all tracked and enforced by `EvaluateGate`; empty syscall actions are rejected.
+- **Hand-edit lock integrity (`lock.json`):** `UpdateCommittedProfiles` refuses to overwrite existing profiles when `lock.json` is missing, unreadable, or lacks the target entry, writing `.suggested.json` instead.
+- **GitHub Action & daemon privilege boundaries (`action/`, `internal/daemon`, `internal/ebpf`):** `post.js` prioritizes `GITHUB_STATE` over mutable `GITHUB_ENV` and re-verifies cached binary SHA-256 digests before `sudo` execution; binaries install atomically; embedded eBPF bytecode takes precedence over untrusted working-directory `.o` files unless `SECCOMP_PROFILER_BPF_OBJ` is explicitly set; `PATH` and git refs are sanitized; control sockets enforce `0600` (unix) or loopback-only binding (`tcp://`); root file writes reject symlinks.
+- **Expanded syscall risk tiers & fail-closed parsers:** added `quotactl_fd`, `clock_adjtime`, `modify_ldt`, and `lsm_set_self_attr` (high-risk) plus `setgroups`, `setfsuid`, `setfsgid`, and `fchmodat2` (medium-risk); `ParseTargetsInputWithErr` and `LoadApprovals` fail closed on malformed syntax, unknown keys, duplicate approvals, `.suggested` target suffixes, or missing-label empty matches.
+- **Release workflow hardening (`.github/workflows/release.yml`):** enforced job-scoped permissions, `persist-credentials: false`, `go generate` drift checks, tag/version consistency checks, and `mktemp -d` Cosign installation.
+
+### Fixed
+
+- **Docker & DinD/rootless cgroup correlation (`internal/docker`):** `ExtractContainerID` matches the innermost (last) 64-hex container ID for nested DinD paths; cgroup v2 (`0::`) entries take priority; `docker inspect` calls enforce timeouts; `<100ms` container `die`/`destroy` events drain late ring-buffer events before deleting BPF maps.
+- **Collector lifecycle & shutdown synchronization (`internal/ebpf`, `internal/daemon`):** synchronized `Close()`, `Detach()`, `Flush()`, `FlushCgroup()`, `DeleteCgroup()`, and `ErrorStats()` to prevent concurrent shutdown panics; direct little-endian decoding in `DecodeKernelEvent` rejects unknown event types.
+- **CLI & reporting (`cmd/seccomp-profiler`, `internal/report`):** `seccomp-profiler diff` renders per-target Markdown tables with full cell escaping; `merge` supports `--prune` and `--on-change`; `internal/syscalls/gen` resolves paths via `runtime.Caller(0)` and skips `__NR_syscalls`; `SeccompArchitectures` fails closed on unknown architectures.
+
 ## 1.1.1 (2026-11-10)
 
 Bugfix release for the v1.1.0 daemon on current CI runners.

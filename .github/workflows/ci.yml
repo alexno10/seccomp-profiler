@@ -117,7 +117,7 @@ jobs:
             if grep -q "\"${leaked}\"" .seccomp-profiler/profiles/alpine.json; then
               echo "ERROR: ${leaked} leaked into alpine.json"
               echo "--- daemon log ---"
-              sudo cat /tmp/seccomp-profiler-daemon.log || true
+              sudo cat /tmp/seccomp-profiler-log-*/daemon.log /tmp/seccomp-profiler-daemon.log 2>/dev/null || true
               echo "--- leaked syscall provenance ---"
               node -e '
                 const r = require("./.seccomp-profiler/raw/alpine.profile.v1.json");
