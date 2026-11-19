@@ -47,6 +47,19 @@ jobs:
           rm -f bpf/profiler.bpf.o internal/ebpf/profiler.bpf.o
           docker pull alpine:3.20
 
+      - name: Verify deterministic multi-arch release build (clang-18)
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          sudo apt-get install -y clang-18 llvm-18
+          EXPECTED_VER="$(sed -nE 's/^var version = "([^"]+)"/\1/p' cmd/seccomp-profiler/main.go)"
+          mkdir -p dist
+          make bpf-amd64 CLANG=clang-18
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${EXPECTED_VER}" -o dist/seccomp-profiler-linux-amd64 ./cmd/seccomp-profiler
+          make bpf-arm64 CLANG=clang-18
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${EXPECTED_VER}" -o dist/seccomp-profiler-linux-arm64 ./cmd/seccomp-profiler
+          sha256sum dist/seccomp-profiler-linux-amd64 dist/seccomp-profiler-linux-arm64
+          rm -rf dist bpf/profiler.bpf.o internal/ebpf/profiler.bpf.o
+
       - name: Start Seccomp Profiler Action (mode=start)
         uses: ./
         with:

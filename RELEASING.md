@@ -7,26 +7,25 @@ The release flow is intentionally rigid: published assets are never overwritten,
 1. Make sure `main` is green on both `ubuntu-24.04` and `ubuntu-24.04-arm`.
 2. Bump the version:
    - `cmd/seccomp-profiler/main.go` default `version` (used when built without ldflags — must match the git tag without the leading `v`, enforced by `release.yml`),
+   - `internal/profile/profile.go` default `ver` / `generatorVersion`,
    - `Makefile` `VERSION ?=`,
    - `CHANGELOG.md` section header (replace "unreleased").
-3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `Release` workflow runs unit tests, verifies generated syscall tables (`go generate ./...`), builds both architectures with pinned `clang-18`, signs with Cosign keyless OIDC, and publishes the release. It refuses to run for anything but tag pushes, rejects non-`vX.Y.Z` tags or version mismatches, and refuses to overwrite an existing release.
-4. (Optional) publish the new version to the GitHub Actions Marketplace from the release page.
+3. Pre-pin deterministic release digests before tagging:
+   - Extract the `amd64` / `arm64` SHA-256 digests produced by CI's `clang-18` deterministic build check (`Verify deterministic multi-arch release build (clang-18)`),
+   - Update `PINNED_RELEASE_VERSION`, `PINNED_BINARY_SHA256`, `action/action.test.js`, and `.github/workflows/ci.yml` on `main` BEFORE pushing tag `vX.Y.Z`, so the tagged commit itself already pins its own release binaries (avoiding tag/pin drift).
+4. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `Release` workflow runs unit tests, verifies generated syscall tables (`go generate ./...`), builds both architectures with pinned `clang-18`, signs with Cosign keyless OIDC, and publishes the release. It refuses to run for anything but tag pushes, rejects non-`vX.Y.Z` tags or version mismatches, and refuses to overwrite an existing release.
+5. (Optional) publish the new version to the GitHub Actions Marketplace from the release page.
 
-## Re-pin the action
+## Re-pin / Sync README After Release
 
 The running action downloads the release binary pinned in `action/lib.js`:
 
 ```js
-const PINNED_RELEASE_VERSION = "v1.2.0";
+const PINNED_RELEASE_VERSION = "v1.2.1";
 const PINNED_BINARY_SHA256 = { amd64: "...", arm64: "..." };
 ```
 
 After the release is published:
 
-1. `sha256sum dist/seccomp-profiler-linux-amd64 dist/seccomp-profiler-linux-arm64` (same values as the release's `checksums.txt`).
-2. Update `PINNED_RELEASE_VERSION` and both `PINNED_BINARY_SHA256` entries in `action/lib.js`.
-3. Update the matching version and SHA-256 assertions in `action/action.test.js` and the `/usr/lib/seccomp-profiler/vX.Y.Z/` binary cache path assertions in `.github/workflows/ci.yml`.
-4. Commit the updated pins to `main`, create the corresponding action tag (or re-tag if no consumers exist yet, e.g. `vX.Y.Z+1` patch release when needed) so tag refs never point at outdated `PINNED_RELEASE_VERSION` digests, and update the pinned `@<sha> # vX.Y.Z` references in `README.md` to match.
-5. Commit and push to `main`. Users who pin by commit SHA keep getting the exact binary they pinned; users tracking `main` get the new one.
-
-Until step 2 is done, CI in this repo still exercises freshly built binaries (`SECCOMP_PROFILER_BIN=/usr/lib/seccomp-profiler/seccomp-profiler` in `ci.yml`), so the pin refresh is not on the critical path of testing the first job (`test-and-ebpf-integration`).
+1. Verify `checksums.txt` from the published release matches `PINNED_BINARY_SHA256` bit-for-bit.
+2. Update the pinned `@<sha> # vX.Y.Z` references in `README.md` to the exact tag commit SHA on `main`, then commit and push `main` so users pinning by SHA or by tag both get the exact verified `vX.Y.Z` commit.
