@@ -85,40 +85,40 @@ test("buildDaemonEnv strips RUNNER_TRACKING_ID and all GitHub/secret tokens from
 
 test("release version, repo, and binary/cosign SHA-256 digests are immutably pinned in code", () => {
   assert.equal(PINNED_RELEASE_REPO, "alexno10/seccomp-profiler");
-  assert.equal(PINNED_RELEASE_VERSION, "v1.2.0");
+  assert.equal(PINNED_RELEASE_VERSION, "v1.2.1");
   assert.equal(COSIGN_SHA256.amd64, "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b");
   assert.equal(COSIGN_SHA256.arm64, "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a");
-  assert.equal(PINNED_BINARY_SHA256.amd64, "bab765be0ac7b24b8831e62818f3d4d783e5481aee9527ed54bff052a005d1ce");
-  assert.equal(PINNED_BINARY_SHA256.arm64, "5da3813ecb4374acd02cef045098181c24fe4ab5daf49efa85aab79e4ec79bba");
+  assert.equal(PINNED_BINARY_SHA256.amd64, "7f9a507dcb70b3735aaeec9558e764eed951a503b7ac6fc381ed1fe9da69cc9a");
+  assert.equal(PINNED_BINARY_SHA256.arm64, "0d7d262f2f7c990971c248491c07cbbc2e17f7c86fe5541a2d0a17cc02b03d4b");
 });
 
 test("COSIGN_CERT_IDENTITY_REGEXP is strictly anchored and pins release version", () => {
   assert.equal(
     COSIGN_CERT_IDENTITY_REGEXP,
-    "^https://github\\.com/alexno10/seccomp-profiler/\\.github/workflows/release\\.yml@refs/tags/v1\\.2\\.0$"
+    "^https://github\\.com/alexno10/seccomp-profiler/\\.github/workflows/release\\.yml@refs/tags/v1\\.2\\.1$"
   );
   assert.equal(COSIGN_OIDC_ISSUER, "https://token.actions.githubusercontent.com");
 
   const re = new RegExp(COSIGN_CERT_IDENTITY_REGEXP);
   assert.equal(
-    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0"),
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.1"),
     true
   );
   // Negative cases: older pinned version, different repo, prefix/suffix injection, different workflow, branch ref
   assert.equal(
-    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.1.1"),
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0"),
     false
   );
   assert.equal(
-    re.test("https://github.com/evil/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0"),
+    re.test("https://github.com/evil/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.1"),
     false
   );
   assert.equal(
-    re.test("https://evil.com/https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0"),
+    re.test("https://evil.com/https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.1"),
     false
   );
   assert.equal(
-    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/ci.yml@refs/tags/v1.2.0"),
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/ci.yml@refs/tags/v1.2.1"),
     false
   );
   assert.equal(
@@ -126,7 +126,7 @@ test("COSIGN_CERT_IDENTITY_REGEXP is strictly anchored and pins release version"
     false
   );
   assert.equal(
-    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0-evil"),
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.1-evil"),
     false
   );
 });
@@ -243,7 +243,7 @@ test("downloadFile rejects non-HTTPS URLs and non-HTTPS redirects", async () => 
   const lib = require("./lib.js");
   const dest = path.join(os.tmpdir(), `seccomp-dl-test-${Date.now()}`);
   await assert.rejects(() => lib.downloadFile("http://example.com/file", dest), /HTTPS/i);
-  assert.equal(lib.validateDownloadUrl("https://github.com/alexno10/seccomp-profiler/releases/download/v1.2.0/a").protocol, "https:");
+  assert.equal(lib.validateDownloadUrl("https://github.com/alexno10/seccomp-profiler/releases/download/v1.2.1/a").protocol, "https:");
   assert.throws(() => lib.validateDownloadUrl("http://github.com/foo"), /HTTPS/i);
   assert.throws(() => lib.validateDownloadUrl("file:///etc/passwd"), /HTTPS/i);
 });
@@ -338,14 +338,14 @@ test("installBinaryAtomically creates root cache dir, installs staging file, and
   };
   lib.installBinaryAtomically(
     "/tmp/dl/bin",
-    "/usr/lib/seccomp-profiler/v1.2.0",
-    "/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler",
+    "/usr/lib/seccomp-profiler/v1.2.1",
+    "/usr/lib/seccomp-profiler/v1.2.1/seccomp-profiler",
     fakeExec
   );
   assert.equal(calls.length, 3);
   assert.deepEqual(calls[0].args.slice(0, 2), ["install", "-d"]);
   assert.equal(calls[0].args.includes("/usr/lib/seccomp-profiler"), true);
-  assert.equal(calls[0].args.includes("/usr/lib/seccomp-profiler/v1.2.0"), true);
+  assert.equal(calls[0].args.includes("/usr/lib/seccomp-profiler/v1.2.1"), true);
   assert.equal(calls[1].args[0], "install");
   assert.equal(calls[2].args[0], "mv");
   assert.equal(calls[2].args.includes("-f"), true);
@@ -358,7 +358,7 @@ test("installBinaryAtomically verifies staged binary digest before atomic mv and
     const src = path.join(tmpDir, "src");
     fs.writeFileSync(src, "trusted-binary-bytes");
     const wantDigest = crypto.createHash("sha256").update("trusted-binary-bytes").digest("hex");
-    const destDir = path.join(tmpDir, "opt", "v1.2.0");
+    const destDir = path.join(tmpDir, "opt", "v1.2.1");
     const destPath = path.join(destDir, "seccomp-profiler");
     const ops = [];
 
@@ -527,10 +527,10 @@ test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writab
   });
 
   // Strict root chain passes.
-  lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+  lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.1/seccomp-profiler", "bin", {
     platform: "linux",
     lstatSync: (p) =>
-      p.endsWith("seccomp-profiler") && p.includes("v1.2.0/")
+      p.endsWith("seccomp-profiler") && p.includes("v1.2.1/")
         ? makeStat({ uid: 0, mode: 0o100755 })
         : makeStat({ uid: 0, mode: 0o040755, isFile: false }),
   });
@@ -538,7 +538,7 @@ test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writab
   // Group-writable parent directory rejected.
   assert.throws(
     () =>
-      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.1/seccomp-profiler", "bin", {
         platform: "linux",
         lstatSync: (p) =>
           p === "/usr/lib/seccomp-profiler"
@@ -551,10 +551,10 @@ test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writab
   // Non-root owner rejected.
   assert.throws(
     () =>
-      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.1/seccomp-profiler", "bin", {
         platform: "linux",
         lstatSync: (p) =>
-          p.includes("v1.2.0/") ? makeStat({ uid: 1001, mode: 0o100755 }) : makeStat({ uid: 0, mode: 0o040755 }),
+          p.includes("v1.2.1/") ? makeStat({ uid: 1001, mode: 0o100755 }) : makeStat({ uid: 0, mode: 0o040755 }),
       }),
     /owned by root/
   );
@@ -562,7 +562,7 @@ test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writab
   // Symlink parent rejected.
   assert.throws(
     () =>
-      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.1/seccomp-profiler", "bin", {
         platform: "linux",
         lstatSync: (p) =>
           p === "/usr/lib" ? makeStat({ uid: 0, mode: 0o120777, isSymlink: true, isFile: false }) : makeStat({ uid: 0, mode: 0o100755 }),

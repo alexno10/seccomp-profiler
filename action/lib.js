@@ -18,7 +18,7 @@ const SOCKET_PATH = process.env.SECCOMP_PROFILER_SOCKET || DEFAULT_SOCKET_PATH;
 const STOPPED_MARKER = process.env.SECCOMP_PROFILER_STOPPED_MARKER || DEFAULT_STOPPED_MARKER;
 
 const PINNED_RELEASE_REPO = "alexno10/seccomp-profiler";
-const PINNED_RELEASE_VERSION = "v1.2.0";
+const PINNED_RELEASE_VERSION = "v1.2.1";
 
 // Versioned cache location: a new pinned release automatically uses a new
 // cache path under /usr/lib/seccomp-profiler (0755 root:root), and any file
@@ -34,8 +34,8 @@ const COSIGN_SHA256 = Object.freeze({
 });
 
 const PINNED_BINARY_SHA256 = Object.freeze({
-  amd64: "bab765be0ac7b24b8831e62818f3d4d783e5481aee9527ed54bff052a005d1ce",
-  arm64: "5da3813ecb4374acd02cef045098181c24fe4ab5daf49efa85aab79e4ec79bba",
+  amd64: "7f9a507dcb70b3735aaeec9558e764eed951a503b7ac6fc381ed1fe9da69cc9a",
+  arm64: "0d7d262f2f7c990971c248491c07cbbc2e17f7c86fe5541a2d0a17cc02b03d4b",
 });
 
 function escapeRegex(s) {
