@@ -168,6 +168,21 @@ static __inline struct error_counters *get_error_counters(void) {
 	return bpf_map_lookup_elem(&error_stats, &zero);
 }
 
+// Prevent LLVM InstCombine/SimplifyCFG from folding multiple map_value_or_null
+// pointer null checks into bitwise OR (`rX |= rY`), which the BPF verifier
+// rejects as pointer arithmetic on map_value_or_null.
+#define barrier_var(var) asm volatile("" : "=r"(var) : "0"(var))
+
+static __inline int map_has_elem(void *map, const void *key) {
+	void *v = bpf_map_lookup_elem(map, key);
+	long found = 0;
+	if (v) {
+		found = 1;
+	}
+	barrier_var(found);
+	return (int)found;
+}
+
 static __inline int is_hex_char(unsigned char c) {
 	unsigned int d = (unsigned int)c - '0';
 	unsigned int h = (unsigned int)c - 'a';
@@ -578,30 +593,22 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	__u32 data_loc = ctx->__data_loc_filename;
 	__u16 offset = data_loc & 0xffff;
 
-	__u8 in_cand = 0;
-	__u8 tracked = 0;
-	if (bpf_map_lookup_elem(&candidate_cgroups, &cgroup_id)) {
-		in_cand = 1;
-		tracked = 1;
-	} else if (bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id)) {
-		tracked = 1;
+	int in_cand = map_has_elem(&candidate_cgroups, &cgroup_id);
+	int tracked = in_cand;
+	if (!tracked) {
+		tracked = map_has_elem(&syscalls_per_cgroup, &cgroup_id);
 	}
 
 	if (!tracked) {
 		// Outside tracked/candidate container cgroups: clean up stale runtime_tids
 		// and exec_pending entries on normal host/helper execs (I2/I3).
-		__u8 pending = 0;
-		__u8 has_rt = 0;
-		if (bpf_map_lookup_elem(&exec_pending, &tid)) {
-			pending = 1;
+		int pending = map_has_elem(&exec_pending, &tid);
+		if (!pending && old_tid != 0 && old_tid != tid) {
+			pending = map_has_elem(&exec_pending, &old_tid);
 		}
-		if (old_tid != 0 && old_tid != tid && bpf_map_lookup_elem(&exec_pending, &old_tid)) {
-			pending = 1;
-		}
-		if (bpf_map_lookup_elem(&runtime_tids, &tid)) {
-			has_rt = 1;
-		} else if (old_tid != 0 && old_tid != tid && bpf_map_lookup_elem(&runtime_tids, &old_tid)) {
-			has_rt = 1;
+		int has_rt = map_has_elem(&runtime_tids, &tid);
+		if (!has_rt && old_tid != 0 && old_tid != tid) {
+			has_rt = map_has_elem(&runtime_tids, &old_tid);
 		}
 		if (!pending && !has_rt) {
 			return 0;
@@ -631,14 +638,11 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 		return 0;
 	}
 
-	__u8 pending = 0;
-	if (bpf_map_lookup_elem(&exec_pending, &tid)) {
-		pending = 1;
-	}
+	int pending = map_has_elem(&exec_pending, &tid);
 	bpf_map_delete_elem(&exec_pending, &tid);
 	if (old_tid != 0 && old_tid != tid) {
 		// Propagate pre-exec marker across de_thread() TID swap (non-leader execve).
-		if (bpf_map_lookup_elem(&exec_pending, &old_tid)) {
+		if (map_has_elem(&exec_pending, &old_tid)) {
 			pending = 1;
 		}
 		bpf_map_delete_elem(&exec_pending, &old_tid);
@@ -741,7 +745,7 @@ int handle_sys_enter(struct bpf_raw_tracepoint_args *ctx) {
 	if (!stats) {
 		// If a runtime helper called execve outside any container cgroup and it
 		// failed (-ENOENT/-EACCES), clear stale exec_pending on its next syscall.
-		if (!is_execve && bpf_map_lookup_elem(&exec_pending, &tid)) {
+		if (!is_execve && map_has_elem(&exec_pending, &tid)) {
 			bpf_map_delete_elem(&exec_pending, &tid);
 		}
 		return 0;
@@ -749,8 +753,8 @@ int handle_sys_enter(struct bpf_raw_tracepoint_args *ctx) {
 
 	// Suppression is keyed on tids only. No comm check: a workload renaming
 	// itself to "runc" via prctl(PR_SET_NAME) is still recorded.
-	if (bpf_map_lookup_elem(&runtime_tids, &tid)) {
-		if (!is_execve && bpf_map_lookup_elem(&exec_pending, &tid)) {
+	if (map_has_elem(&runtime_tids, &tid)) {
+		if (!is_execve && map_has_elem(&exec_pending, &tid)) {
 			bpf_map_delete_elem(&exec_pending, &tid);
 		}
 		return 0;
