@@ -27,6 +27,7 @@ function resolvePostConfig(env = process.env, defaults = {}) {
 
   return {
     skip: false,
+    startedReady: env.STATE_STARTED_READY === "true",
     binPath,
     socketPath,
     stoppedMarker,
@@ -70,7 +71,12 @@ function runPost() {
       return;
     }
     if (!fs.existsSync(cfg.socketPath)) {
-      console.log("seccomp-profiler control socket not found; skipping post hook.");
+      if (cfg.startedReady) {
+        throw new Error(
+          `seccomp-profiler daemon exited unexpectedly during job: control socket ${cfg.socketPath} and stopped marker ${cfg.stoppedMarker} are both missing`
+        );
+      }
+      console.log("seccomp-profiler did not finish starting; skipping post hook.");
       return;
     }
     if (!fs.existsSync(cfg.binPath)) {

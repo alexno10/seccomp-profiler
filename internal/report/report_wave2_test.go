@@ -63,3 +63,52 @@ func TestRenderMarkdown_RendersDiffTablesWithoutProfilesAndEscapesCells(t *testi
 		}
 	}
 }
+
+func TestRenderMarkdown_EscapesHTMLTagsBracketsAndShowsPrunedWording(t *testing.T) {
+	md := report.RenderMarkdown(report.SummaryInput{
+		Diffs: []*diff.TargetDiff{
+			{
+				TargetName:           "api",
+				HasCommittedBaseline: true,
+				Added: []diff.AddedSyscall{
+					{
+						Name:           "ptrace",
+						Risk:           diff.RiskHigh,
+						RiskReason:     "debug",
+						Sources:        []string{"observed"},
+						ContainersSeen: 1,
+						ContainerTotal: 1,
+						Approved:       true,
+						ApprovalReason: "ok <!-- hide --> [link](https://evil.example)",
+					},
+				},
+				ArgsChangeDetails: []diff.ArgsChange{
+					{Name: "socket", Risk: diff.RiskMedium, Approved: false},
+				},
+				Removed: []string{"chmod"},
+			},
+		},
+		DriftNotes: []string{"<details>spoof</details>"},
+		Prune:      true,
+		GatePassed: false,
+		GateReason: "<!-- comment -->",
+	})
+
+	for _, forbidden := range []string{"<!--", "<details>", "[link](https://evil.example)", "informational only"} {
+		if strings.Contains(md, forbidden) {
+			t.Fatalf("expected unescaped token %q to be escaped/omitted, got:\n%s", forbidden, md)
+		}
+	}
+	for _, want := range []string{
+		"+1 new syscalls (2 high-risk)",
+		"-1 removed (pruned)",
+		"Removed syscalls (pruned from generated profile):",
+		"&lt;!--",
+		"&lt;details&gt;",
+		`\[link\]`,
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("expected %q in rendered markdown, got:\n%s", want, md)
+		}
+	}
+}

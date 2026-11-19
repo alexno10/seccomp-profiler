@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	cebpf "github.com/cilium/ebpf"
@@ -20,17 +21,18 @@ import (
 var errCollectorClosed = errors.New("eBPF collector closed")
 
 type linuxCollector struct {
-	mu          sync.RWMutex
-	coll        *cebpf.Collection
-	links       []link.Link
-	rbReader    *ringbuf.Reader
-	eventsCh    chan KernelEvent
-	doneCh      chan struct{}
-	readDone    chan struct{}
-	readStarted bool
-	detached    bool
-	closed      bool
-	closeOnce   sync.Once
+	mu           sync.RWMutex
+	coll         *cebpf.Collection
+	links        []link.Link
+	rbReader     *ringbuf.Reader
+	eventsCh     chan KernelEvent
+	doneCh       chan struct{}
+	readDone     chan struct{}
+	readStarted  bool
+	detached     bool
+	closed       bool
+	closeOnce    sync.Once
+	decodeErrors atomic.Uint64
 }
 
 func NewCollector(bpfObjPath string) (Collector, error) {
@@ -170,6 +172,7 @@ func (c *linuxCollector) readLoop() {
 		}
 		ev, err := DecodeKernelEvent(rec.RawSample)
 		if err != nil {
+			c.decodeErrors.Add(1)
 			continue
 		}
 		select {
@@ -181,8 +184,8 @@ func (c *linuxCollector) readLoop() {
 }
 
 func (c *linuxCollector) TrackCgroup(cgroupID uint64) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.closed || c.coll == nil {
 		return errCollectorClosed
 	}
@@ -246,8 +249,8 @@ func (c *linuxCollector) FlushCgroup(cgroupID uint64) (CgroupStats, bool, error)
 }
 
 func (c *linuxCollector) DeleteCgroup(cgroupID uint64) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.closed || c.coll == nil {
 		return errCollectorClosed
 	}
@@ -256,9 +259,22 @@ func (c *linuxCollector) DeleteCgroup(cgroupID uint64) error {
 	if stats == nil || candidates == nil {
 		return fmt.Errorf("BPF maps not found")
 	}
-	_ = stats.Delete(&cgroupID)
-	_ = candidates.Delete(&cgroupID)
+	if err := stats.Delete(&cgroupID); err != nil && !errors.Is(err, cebpf.ErrKeyNotExist) {
+		return fmt.Errorf("delete syscalls_per_cgroup %d: %w", cgroupID, err)
+	}
+	if err := candidates.Delete(&cgroupID); err != nil && !errors.Is(err, cebpf.ErrKeyNotExist) {
+		return fmt.Errorf("delete candidate_cgroups %d: %w", cgroupID, err)
+	}
 	return nil
+}
+
+// kernelErrorCounters mirrors C struct error_counters in bpf/profiler.bpf.c.
+type kernelErrorCounters struct {
+	CgroupMapFull   uint64
+	RingbufDrops    uint64
+	OobSyscalls     uint64
+	PathTruncations uint64
+	ReadErrors      uint64
 }
 
 func (c *linuxCollector) ErrorStats() (ErrorStats, error) {
@@ -272,11 +288,18 @@ func (c *linuxCollector) ErrorStats() (ErrorStats, error) {
 		return ErrorStats{}, fmt.Errorf("error_stats map not found")
 	}
 	var key uint32 = 0
-	var val ErrorStats
-	if err := m.Lookup(&key, &val); err != nil {
+	var kVal kernelErrorCounters
+	if err := m.Lookup(&key, &kVal); err != nil {
 		return ErrorStats{}, fmt.Errorf("lookup error_stats[0]: %w", err)
 	}
-	return val, nil
+	return ErrorStats{
+		CgroupMapFull:   kVal.CgroupMapFull,
+		RingbufDrops:    kVal.RingbufDrops,
+		OobSyscalls:     kVal.OobSyscalls,
+		PathTruncations: kVal.PathTruncations,
+		ReadErrors:      kVal.ReadErrors,
+		DecodeErrors:    c.decodeErrors.Load(),
+	}, nil
 }
 
 func (c *linuxCollector) detachLocked() {
@@ -325,27 +348,56 @@ func (c *linuxCollector) Close() error {
 	return nil
 }
 
-func resolveBPFObjectPath(explicit string) string {
+func resolveBPFObjectPathWith(
+	explicit string,
+	envVal string,
+	exePath string,
+	euid int,
+	existsFn func(string) bool,
+) string {
 	if explicit != "" {
 		return explicit
 	}
-	if env := os.Getenv("SECCOMP_PROFILER_BPF_OBJ"); env != "" {
-		return env
+	if envVal != "" {
+		return envVal
 	}
-	candidates := []string{
-		"bpf/profiler.bpf.o",
-		"/usr/local/share/seccomp-profiler/profiler.bpf.o",
-	}
-	if exe, err := os.Executable(); err == nil {
+	var candidates []string
+	if exePath != "" {
+		exeDir := filepath.Dir(exePath)
 		candidates = append(candidates,
-			filepath.Join(filepath.Dir(exe), "profiler.bpf.o"),
-			filepath.Join(filepath.Dir(exe), "bpf", "profiler.bpf.o"),
+			filepath.Join(exeDir, "profiler.bpf.o"),
+			filepath.Join(exeDir, "bpf", "profiler.bpf.o"),
 		)
 	}
+	candidates = append(candidates,
+		"/usr/lib/seccomp-profiler/profiler.bpf.o",
+		"/usr/local/share/seccomp-profiler/profiler.bpf.o",
+	)
+	if euid != 0 {
+		// Never fall back to an untrusted CWD relative path when running as root.
+		candidates = append(candidates, "bpf/profiler.bpf.o")
+	}
 	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
+		if existsFn != nil && existsFn(p) {
 			return p
 		}
 	}
+	if euid == 0 {
+		return "/usr/local/share/seccomp-profiler/profiler.bpf.o"
+	}
 	return "bpf/profiler.bpf.o"
+}
+
+func resolveBPFObjectPath(explicit string) string {
+	exe, _ := os.Executable()
+	return resolveBPFObjectPathWith(
+		explicit,
+		os.Getenv("SECCOMP_PROFILER_BPF_OBJ"),
+		exe,
+		os.Geteuid(),
+		func(p string) bool {
+			_, err := os.Stat(p)
+			return err == nil
+		},
+	)
 }

@@ -12,29 +12,46 @@ const (
 )
 
 type CgroupStats struct {
-	Counts      [512]uint32
-	CompatCount uint32
-	Pad         uint32
+	Counts      [512]uint64
+	CompatCount uint64
 }
 
-// ErrorStats mirrors the kernel-side error counters map. Any non-zero value
-// means the profiler silently lost visibility (full map, dropped ring buffer
-// event, out-of-range syscall id, or truncated/unreadable cgroup path) and the
-// resulting profile may be incomplete.
+// ErrorStats mirrors the kernel-side error counters and userspace ringbuf
+// decode counters. Any non-zero value means the profiler lost visibility
+// (full map, dropped ring buffer event, out-of-range syscall id, truncated
+// path, kernel read failure, or corrupt ringbuf record) and must fail closed.
 type ErrorStats struct {
 	CgroupMapFull   uint64 `json:"cgroupMapFull"`
 	RingbufDrops    uint64 `json:"ringbufDrops"`
 	OobSyscalls     uint64 `json:"oobSyscalls"`
 	PathTruncations uint64 `json:"pathTruncations"`
+	ReadErrors      uint64 `json:"readErrors,omitempty"`
+	DecodeErrors    uint64 `json:"decodeErrors,omitempty"`
 }
 
 func (e ErrorStats) Any() bool {
-	return e.CgroupMapFull > 0 || e.RingbufDrops > 0 || e.OobSyscalls > 0 || e.PathTruncations > 0
+	return e.CgroupMapFull > 0 ||
+		e.RingbufDrops > 0 ||
+		e.OobSyscalls > 0 ||
+		e.PathTruncations > 0 ||
+		e.ReadErrors > 0 ||
+		e.DecodeErrors > 0
+}
+
+func (e ErrorStats) Add(other ErrorStats) ErrorStats {
+	return ErrorStats{
+		CgroupMapFull:   e.CgroupMapFull + other.CgroupMapFull,
+		RingbufDrops:    e.RingbufDrops + other.RingbufDrops,
+		OobSyscalls:     e.OobSyscalls + other.OobSyscalls,
+		PathTruncations: e.PathTruncations + other.PathTruncations,
+		ReadErrors:      e.ReadErrors + other.ReadErrors,
+		DecodeErrors:    e.DecodeErrors + other.DecodeErrors,
+	}
 }
 
 func (e ErrorStats) String() string {
-	return fmt.Sprintf("cgroupMapFull=%d ringbufDrops=%d oobSyscalls=%d pathTruncations=%d",
-		e.CgroupMapFull, e.RingbufDrops, e.OobSyscalls, e.PathTruncations)
+	return fmt.Sprintf("cgroupMapFull=%d ringbufDrops=%d oobSyscalls=%d pathTruncations=%d readErrors=%d decodeErrors=%d",
+		e.CgroupMapFull, e.RingbufDrops, e.OobSyscalls, e.PathTruncations, e.ReadErrors, e.DecodeErrors)
 }
 
 type KernelEvent struct {

@@ -25,10 +25,14 @@ type SummaryInput struct {
 }
 
 // mdCell escapes content that comes from container labels, image names, or
-// approval reasons so it cannot break the markdown table layout of the job
-// summary (|, backticks, newlines).
+// approval reasons so it cannot break the markdown table layout or inject HTML
+// tags/comments/links into the GitHub job summary.
 func mdCell(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "[", "\\[")
+	s = strings.ReplaceAll(s, "]", "\\]")
 	s = strings.ReplaceAll(s, "|", "\\|")
 	s = strings.ReplaceAll(s, "`", "'")
 	s = strings.ReplaceAll(s, "\r", " ")
@@ -60,17 +64,13 @@ func RenderMarkdown(in SummaryInput) string {
 			}
 		}
 		for _, e := range d.Escalated {
-			if e.Risk == diff.RiskHigh {
-				totalHighRisk++
-			}
+			totalHighRisk++
 			if !e.Approved {
 				unapprovedCount++
 			}
 		}
 		for _, ac := range d.ArgsChangeDetails {
-			if ac.Risk == diff.RiskHigh {
-				totalHighRisk++
-			}
+			totalHighRisk++
 			if !ac.Approved {
 				unapprovedCount++
 			}
@@ -87,12 +87,17 @@ func RenderMarkdown(in SummaryInput) string {
 		gateBadge = "FAILED"
 	}
 
+	removedLabel := "informational"
+	if in.Prune {
+		removedLabel = "pruned"
+	}
+
 	fmt.Fprintf(&b, "## eBPF Seccomp Profiler Summary (%s)\n\n", gateBadge)
 	fmt.Fprintf(&b, "**+%d new syscalls (%d high-risk)", totalAdded, totalHighRisk)
 	if totalEscalated > 0 {
 		fmt.Fprintf(&b, ", %d constraint escalations", totalEscalated)
 	}
-	fmt.Fprintf(&b, "  -%d removed (informational)**\n\n", totalRemoved)
+	fmt.Fprintf(&b, "  -%d removed (%s)**\n\n", totalRemoved, removedLabel)
 	if in.GateReason != "" {
 		fmt.Fprintf(&b, "- **Security Gate:** `%s` — %s\n\n", gateBadge, mdCell(in.GateReason))
 	}
@@ -179,7 +184,7 @@ func RenderMarkdown(in SummaryInput) string {
 
 		if td, ok := diffByTarget[tName]; ok {
 			renderedDiffs[tName] = true
-			renderTargetDiff(&b, tName, td)
+			renderTargetDiff(&b, tName, td, in.Prune)
 		}
 	}
 
@@ -189,7 +194,7 @@ func RenderMarkdown(in SummaryInput) string {
 		}
 		renderedDiffs[td.TargetName] = true
 		fmt.Fprintf(&b, "### Target: `%s`\n\n", mdCell(td.TargetName))
-		renderTargetDiff(&b, td.TargetName, td)
+		renderTargetDiff(&b, td.TargetName, td, in.Prune)
 	}
 
 	if len(in.Skipped) > 0 {
@@ -225,7 +230,7 @@ func joinMDCode(items []string) string {
 	return strings.Join(escaped, "`, `")
 }
 
-func renderTargetDiff(b *strings.Builder, tName string, td *diff.TargetDiff) {
+func renderTargetDiff(b *strings.Builder, tName string, td *diff.TargetDiff, prune bool) {
 	if len(td.Added) > 0 {
 		fmt.Fprintf(b, "#### Newly Added Syscalls\n\n")
 		fmt.Fprintf(b, "| Syscall | Risk | Sources | Containers Seen | Approval Status | Security Rationale |\n|---|---|---|---|---|---|\n")
@@ -282,6 +287,10 @@ func renderTargetDiff(b *strings.Builder, tName string, td *diff.TargetDiff) {
 		fmt.Fprintf(b, "> [!WARNING]\n> Target `%s` added unprofiled architecture(s): `%s`.\n\n", mdCell(tName), joinMDCode(td.AddedArchitectures))
 	}
 	if len(td.Removed) > 0 {
-		fmt.Fprintf(b, "- **Removed syscalls (informational only — not auto-removed):** `%s`\n\n", joinMDCode(td.Removed))
+		if prune {
+			fmt.Fprintf(b, "- **Removed syscalls (pruned from generated profile):** `%s`\n\n", joinMDCode(td.Removed))
+		} else {
+			fmt.Fprintf(b, "- **Removed syscalls (informational only — not auto-removed):** `%s`\n\n", joinMDCode(td.Removed))
+		}
 	}
 }

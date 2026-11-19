@@ -21,7 +21,7 @@ func TestBuildProfileAndRawV1(t *testing.T) {
 			{ID: "c1", Image: "myorg/api:v1", Labels: map[string]string{"com.docker.compose.service": "api"}, DurationMs: 1200},
 			{ID: "c2", Image: "myorg/api:v1", Labels: map[string]string{"com.docker.compose.service": "api"}, DurationMs: 800},
 		},
-		MergedHits:           map[int]uint32{0: 150, 41: 4}, // 0=read, 41=socket on amd64
+		MergedHits:           map[int]uint64{0: 150, 41: 4}, // 0=read, 41=socket on amd64
 		ContainersPerSyscall: map[int]int{0: 2, 41: 1},
 		CompatHits:           0,
 		ExecutedBins:         []string{"/usr/local/bin/go"},
@@ -69,7 +69,7 @@ func TestWriteTargetFilesLockProtection(t *testing.T) {
 		Name:                 "api",
 		GroupBy:              "image",
 		Containers:           []selector.ContainerRecord{{ID: "c1", Image: "myorg/api:v1"}},
-		MergedHits:           map[int]uint32{0: 10},
+		MergedHits:           map[int]uint64{0: 10},
 		ContainersPerSyscall: map[int]int{0: 1},
 	}
 	built, err := profile.Build(target, profile.BuildOptions{

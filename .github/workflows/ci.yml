@@ -110,12 +110,17 @@ jobs:
           SECCOMP_PROFILER_BIN: /tmp/poisoned-github-env-bin
 
       - name: Verify Action outputs, eBPF profile accuracy, enforcement, diff, and merge
+        env:
+          GATE_PASSED: ${{ steps.stop_profiler.outputs.gate-passed }}
+          HIGH_RISK_COUNT: ${{ steps.stop_profiler.outputs.high-risk-count }}
+          PROFILES_DIR: ${{ steps.stop_profiler.outputs.profiles-dir }}
+          NEW_SYSCALLS_COUNT: ${{ steps.stop_profiler.outputs.new-syscalls-count }}
         run: |
-          test "${{ steps.stop_profiler.outputs.gate-passed }}" = "true"
+          test "$GATE_PASSED" = "true"
           # Positive e2e gate: the keyctl probe must be counted as unapproved high-risk.
-          test "${{ steps.stop_profiler.outputs.high-risk-count }}" -ge 1
-          test "${{ steps.stop_profiler.outputs.profiles-dir }}" = ".seccomp-profiler/profiles"
-          test "${{ steps.stop_profiler.outputs.new-syscalls-count }}" -gt 0
+          test "$HIGH_RISK_COUNT" -ge 1
+          test "$PROFILES_DIR" = ".seccomp-profiler/profiles"
+          test "$NEW_SYSCALLS_COUNT" -gt 0
 
           test -f .seccomp-profiler/profiles/alpine.json
           test -f .seccomp-profiler/raw/alpine.profile.v1.json

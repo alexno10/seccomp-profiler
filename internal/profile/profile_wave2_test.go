@@ -6,6 +6,11 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/alexno10/seccomp-profiler/internal/baseline"
+	"github.com/alexno10/seccomp-profiler/internal/ebpf"
+	"github.com/alexno10/seccomp-profiler/internal/selector"
+	"github.com/alexno10/seccomp-profiler/internal/syscalls"
 )
 
 func TestMergeCommittedIntoOCI_DedupsExtraRulesAndResolvesAllowDenyConflict(t *testing.T) {
@@ -238,5 +243,102 @@ func TestMergeCommittedIntoOCI_PreservesCommittedConstraintsHardDenyAndDedupsErr
 	}
 	if len(clone3Rules) != 1 || clone3Rules[0].Action != "SCMP_ACT_ERRNO" || clone3Rules[0].ErrnoRet == nil || *clone3Rules[0].ErrnoRet != 38 {
 		t.Fatalf("expected conflicting clone3 SCMP_ACT_ERRNO rules to deduplicate to single rule with errnoRet=38, got %+v", clone3Rules)
+	}
+}
+
+func TestClone3OnlyAutoAddsConstrainedCloneAndMultiContainerRuntimeAndLockKeyedByPath(t *testing.T) {
+	// I15 + M6: clone3-only observed on container[1]=python3 with arch-filtered ExtraAllow on arm64.
+	nrClone3, ok := syscalls.NumberByName(syscalls.ArchARM64, "clone3")
+	if !ok {
+		t.Fatal("expected clone3 on arm64")
+	}
+	built, err := Build(selector.MatchedTarget{
+		Name:    "app",
+		GroupBy: "image",
+		Containers: []selector.ContainerRecord{
+			{ID: "c1", Image: "alpine:3.20"},
+			{ID: "c2", Image: "python:3.12-slim"},
+		},
+		MergedHits:           map[int]uint64{nrClone3: 5},
+		ContainersPerSyscall: map[int]int{nrClone3: 1},
+	}, BuildOptions{
+		Arch:         syscalls.ArchARM64,
+		BaselineMode: baseline.ModeNone,
+		RuntimeMode:  "auto",
+		ExtraAllow:   []string{"arch_prctl", "membarrier"},
+		KernelErrors: ebpf.ErrorStats{ReadErrors: 1},
+	})
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Must have ENOSYS on clone3 AND masked ALLOW on clone, plus arch_prctl excluded on arm64.
+	var foundCloneMasked, foundClone3Errno, foundArchPrctl bool
+	for _, r := range built.OCI.Syscalls {
+		for _, n := range r.Names {
+			switch n {
+			case "clone":
+				if r.Action == "SCMP_ACT_ALLOW" && len(r.Args) == 1 && r.Args[0].Value == cloneNewNamespaceMask {
+					foundCloneMasked = true
+				}
+			case "clone3":
+				if r.Action == "SCMP_ACT_ERRNO" && r.ErrnoRet != nil && *r.ErrnoRet == 38 {
+					foundClone3Errno = true
+				}
+			case "arch_prctl":
+				foundArchPrctl = true
+			}
+		}
+	}
+	if !foundCloneMasked || !foundClone3Errno {
+		t.Fatalf("expected clone3 ENOSYS + constrained clone fallback, got %+v", built.OCI.Syscalls)
+	}
+	if foundArchPrctl {
+		t.Fatal("expected amd64-only ExtraAllow arch_prctl to be filtered on arm64")
+	}
+	if len(built.Raw.Target.DetectedRuntimes) != 1 || built.Raw.Target.DetectedRuntimes[0] != "python" {
+		t.Fatalf("expected python runtime detected from second container image, got %v", built.Raw.Target.DetectedRuntimes)
+	}
+	if built.Raw.KernelErrors.ReadErrors != 1 {
+		t.Fatalf("expected KernelErrors preserved in RawProfileV1, got %+v", built.Raw.KernelErrors)
+	}
+
+	// MergeRawProfiles aggregates KernelErrors and preserves clone3->clone fallback.
+	shard2 := &RawProfileV1{
+		SchemaVersion: "v1",
+		Host:          RawHostInfo{Arch: "arm64"},
+		Target:        RawTargetInfo{Name: "app", ContainerCount: 1, Containers: []RawContainerInfo{{ID: "c3", Image: "alpine"}}},
+		KernelErrors:  ebpf.ErrorStats{DecodeErrors: 2},
+		Syscalls: map[string]RawSyscallEntry{
+			"clone3": {Sources: []string{"observed"}, TotalCalls: 2, ContainersSeen: 1},
+		},
+	}
+	merged, err := MergeRawProfiles([]*RawProfileV1{&built.Raw, shard2}, time.Now().UTC(), "test")
+	if err != nil {
+		t.Fatalf("MergeRawProfiles failed: %v", err)
+	}
+	if merged[0].Raw.KernelErrors.ReadErrors != 1 || merged[0].Raw.KernelErrors.DecodeErrors != 2 {
+		t.Fatalf("expected aggregated KernelErrors {Read:1, Decode:2}, got %+v", merged[0].Raw.KernelErrors)
+	}
+
+	// I19: lock.json keys by distinct file paths so outDir and committedDir do not collide.
+	tmp := t.TempDir()
+	outDir := filepath.Join(tmp, "out")
+	rawDir := filepath.Join(tmp, "raw")
+	commDir := filepath.Join(tmp, "committed")
+	lockFile := filepath.Join(tmp, "lock.json")
+	writeRes, err := WriteTargetFiles(outDir, rawDir, lockFile, []*BuiltProfile{built})
+	if err != nil {
+		t.Fatalf("WriteTargetFiles: %v", err)
+	}
+	preLock, _ := LoadLockHashes(lockFile)
+	if _, err := SyncCommittedProfiles(filepath.Join(commDir, "{name}.json"), outDir, lockFile, writeRes, preLock, []*BuiltProfile{built}); err != nil {
+		t.Fatalf("SyncCommittedProfiles: %v", err)
+	}
+	finalLock, _ := LoadLockHashes(lockFile)
+	outKey := lockKey(filepath.Join(outDir, "app.json"))
+	commKey := lockKey(filepath.Join(commDir, "app.json"))
+	if outKey == commKey || finalLock[outKey] == "" || finalLock[commKey] == "" {
+		t.Fatalf("expected two distinct path keys in lock.json (%q, %q), got %+v", outKey, commKey, finalLock)
 	}
 }

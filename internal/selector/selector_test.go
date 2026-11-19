@@ -21,30 +21,30 @@ func TestBuiltInExclusionsAndZeroConfigGrouping(t *testing.T) {
 		{
 			ID:          "111",
 			Image:       "testcontainers/ryuk:0.5.1",
-			SyscallHits: map[int]uint32{0: 10},
+			SyscallHits: map[int]uint64{0: 10},
 		},
 		{
 			ID:          "222",
 			Image:       "moby/buildkit:latest",
-			SyscallHits: map[int]uint32{1: 5},
+			SyscallHits: map[int]uint64{1: 5},
 		},
 		{
 			ID:           "333",
 			Image:        "myorg/app:test1",
 			ExecutedBins: []string{"/app/server"},
-			SyscallHits:  map[int]uint32{0: 100, 1: 50},
+			SyscallHits:  map[int]uint64{0: 100, 1: 50},
 		},
 		{
 			ID:           "444",
 			Image:        "myorg/app:test2",
 			ExecutedBins: []string{"/bin/sh"},
-			SyscallHits:  map[int]uint32{0: 200, 39: 1},
+			SyscallHits:  map[int]uint64{0: 200, 39: 1},
 		},
 		{
 			ID:          "555",
 			Image:       "postgres:16",
 			Labels:      map[string]string{"com.docker.compose.service": "db"},
-			SyscallHits: map[int]uint32{0: 10},
+			SyscallHits: map[int]uint64{0: 10},
 		},
 	}
 
@@ -90,17 +90,17 @@ func TestExplicitSelectorsMergeAndUnmatched(t *testing.T) {
 			ID:          "c1",
 			Image:       "myorg/api:v1",
 			Labels:      map[string]string{"tier": "backend", "env": "ci"},
-			SyscallHits: map[int]uint32{0: 10},
+			SyscallHits: map[int]uint64{0: 10},
 		},
 		{
 			ID:          "c2",
 			Image:       "myorg/worker:v1",
-			SyscallHits: map[int]uint32{1: 20},
+			SyscallHits: map[int]uint64{1: 20},
 		},
 		{
 			ID:          "c3",
 			Image:       "redis:7",
-			SyscallHits: map[int]uint32{0: 5},
+			SyscallHits: map[int]uint64{0: 5},
 		},
 	}
 

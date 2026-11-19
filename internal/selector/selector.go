@@ -15,8 +15,8 @@ type ContainerRecord struct {
 	DurationMs   int64
 	Preexisting  bool
 	ExecutedBins []string
-	SyscallHits  map[int]uint32
-	CompatHits   uint32
+	SyscallHits  map[int]uint64
+	CompatHits   uint64
 }
 
 type TargetRule struct {
@@ -36,9 +36,9 @@ type MatchedTarget struct {
 	Name                 string
 	GroupBy              string
 	Containers           []ContainerRecord
-	MergedHits           map[int]uint32
+	MergedHits           map[int]uint64
 	ContainersPerSyscall map[int]int
-	CompatHits           uint32
+	CompatHits           uint64
 	ExecutedBins         []string
 }
 
@@ -119,14 +119,16 @@ func Evaluate(cfg Config, containers []ContainerRecord) ([]MatchedTarget, []Skip
 			skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "compose-project-mismatch"})
 			continue
 		}
+		if matchesAnyGlob(cfg.ExtraExcludes, c.Image) {
+			skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "excluded-user"})
+			continue
+		}
 
 		if len(cfg.Rules) > 0 {
 			rule, ok := matchRules(cfg.Rules, c)
 			if !ok {
 				if isDefaultExcluded(c) {
 					skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "excluded-default"})
-				} else if matchesAnyGlob(cfg.ExtraExcludes, c.Image) {
-					skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "excluded-user"})
 				} else {
 					skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "unmatched-selector"})
 				}
@@ -146,10 +148,6 @@ func Evaluate(cfg Config, containers []ContainerRecord) ([]MatchedTarget, []Skip
 
 		if isDefaultExcluded(c) {
 			skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "excluded-default"})
-			continue
-		}
-		if matchesAnyGlob(cfg.ExtraExcludes, c.Image) {
-			skipped = append(skipped, SkippedContainer{ID: c.ID, Image: c.Image, Labels: c.Labels, Reason: "excluded-user"})
 			continue
 		}
 
@@ -177,7 +175,7 @@ func mergeIntoTarget(byName map[string]*MatchedTarget, name, groupBy string, c C
 		t = &MatchedTarget{
 			Name:                 name,
 			GroupBy:              groupBy,
-			MergedHits:           make(map[int]uint32),
+			MergedHits:           make(map[int]uint64),
 			ContainersPerSyscall: make(map[int]int),
 		}
 		byName[name] = t
@@ -199,6 +197,7 @@ func resolveGroupKey(groupBy string, c ContainerRecord) (string, string) {
 	if gb == "" {
 		gb = "auto"
 	}
+	gbLower := strings.ToLower(gb)
 	fallback := func() string {
 		if len(c.ID) >= 12 {
 			return c.ID[:12]
@@ -206,26 +205,30 @@ func resolveGroupKey(groupBy string, c ContainerRecord) (string, string) {
 		return c.ID
 	}
 	imageName := func() string {
-		name := NormalizeImageName(c.Image)
-		// Image-ID-only references all collapse to "sha256"; fall back to the
-		// container ID so unrelated containers never merge into one profile.
-		if name == "sha256" || name == "container" {
+		rawImg := strings.TrimSpace(c.Image)
+		if rawImg == "" || strings.HasPrefix(strings.ToLower(rawImg), "sha256:") {
+			return fallback()
+		}
+		name := NormalizeImageName(rawImg)
+		// Image references that normalize to "sha256" fall back to container ID
+		// so unrelated containers never merge into one profile.
+		if name == "sha256" {
 			return fallback()
 		}
 		return name
 	}
 	switch {
-	case gb == "compose-service":
+	case gbLower == "compose-service":
 		if svc := strings.TrimSpace(c.Labels["com.docker.compose.service"]); svc != "" {
 			return svc, "compose-service"
 		}
 		return imageName(), "image"
-	case gb == "image":
+	case gbLower == "image":
 		return imageName(), "image"
-	case strings.HasPrefix(gb, "label:"):
-		key := strings.TrimPrefix(gb, "label:")
+	case strings.HasPrefix(gbLower, "label:"):
+		key := strings.TrimSpace(gb[len("label:"):])
 		if val := strings.TrimSpace(c.Labels[key]); val != "" {
-			return val, gb
+			return val, "label:" + key
 		}
 		return imageName(), "image"
 	default: // "auto"
@@ -471,7 +474,7 @@ func ParseTargetsInputWithErr(raw string) ([]TargetRule, error) {
 				if k, v, ok := splitTargetKV(rest); ok && isYAMLTargetItemStart(k, v) {
 					cur = &TargetRule{}
 					curIndent = indent
-					if err := applyYAMLField(lineNum, cur, k, v, indent+2); err != nil {
+					if err := applyYAMLField(lineNum, cur, k, v, indentAfterDash(cleaned)); err != nil {
 						return nil, err
 					}
 					continue
@@ -533,7 +536,10 @@ func parseTargetShorthand(lineNum int, line string) (TargetRule, error) {
 	}
 
 	rule := TargetRule{Name: name}
-	tokens := strings.Fields(expr)
+	tokens, err := splitShorthandFields(expr)
+	if err != nil {
+		return TargetRule{}, fmt.Errorf("targets line %d: %w", lineNum, err)
+	}
 	for i := 0; i < len(tokens); {
 		tok := tokens[i]
 		switch {
@@ -619,7 +625,7 @@ func parseTargetShorthand(lineNum int, line string) (TargetRule, error) {
 
 func parseInlineLabels(lineNum int, raw string) (map[string]string, error) {
 	out := make(map[string]string)
-	for _, seg := range strings.Split(raw, ",") {
+	for _, seg := range splitCommaOutsideQuotes(raw) {
 		seg = strings.TrimSpace(seg)
 		if seg == "" {
 			return nil, fmt.Errorf("targets line %d: empty label pair in %q", lineNum, raw)
@@ -650,16 +656,153 @@ func parseInlineLabels(lineNum int, raw string) (map[string]string, error) {
 	return out, nil
 }
 
+func splitCommaOutsideQuotes(raw string) []string {
+	var parts []string
+	var inSingle, inDouble bool
+	runes := []rune(raw)
+	start := 0
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case inDouble:
+			if r == '\\' && i+1 < len(runes) {
+				i++
+				continue
+			}
+			if r == '"' {
+				inDouble = false
+			}
+		case inSingle:
+			if r == '\'' {
+				if i+1 < len(runes) && runes[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+		default:
+			if r == '"' {
+				inDouble = true
+			} else if r == '\'' {
+				inSingle = true
+			} else if r == ',' {
+				parts = append(parts, string(runes[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, string(runes[start:]))
+	return parts
+}
+
+func splitShorthandFields(expr string) ([]string, error) {
+	var tokens []string
+	var cur strings.Builder
+	var inSingle, inDouble bool
+	hasToken := false
+	runes := []rune(expr)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case inDouble:
+			hasToken = true
+			cur.WriteRune(r)
+			if r == '\\' && i+1 < len(runes) {
+				i++
+				cur.WriteRune(runes[i])
+				continue
+			}
+			if r == '"' {
+				inDouble = false
+			}
+		case inSingle:
+			hasToken = true
+			cur.WriteRune(r)
+			if r == '\'' {
+				if i+1 < len(runes) && runes[i+1] == '\'' {
+					i++
+					cur.WriteRune(runes[i])
+					continue
+				}
+				inSingle = false
+			}
+		default:
+			if unicode.IsSpace(r) {
+				if hasToken {
+					tokens = append(tokens, cur.String())
+					cur.Reset()
+					hasToken = false
+				}
+				continue
+			}
+			hasToken = true
+			cur.WriteRune(r)
+			if r == '"' {
+				inDouble = true
+			} else if r == '\'' {
+				inSingle = true
+			}
+		}
+	}
+	if inDouble || inSingle {
+		return nil, fmt.Errorf("unclosed quote in %q", expr)
+	}
+	if hasToken {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens, nil
+}
+
 func splitTargetKV(line string) (string, string, bool) {
-	idx := strings.IndexByte(line, ':')
-	if idx == -1 {
+	var inSingle, inDouble bool
+	runes := []rune(line)
+	colonIdx := -1
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case inDouble:
+			if r == '\\' && i+1 < len(runes) {
+				i++
+				continue
+			}
+			if r == '"' {
+				inDouble = false
+			}
+		case inSingle:
+			if r == '\'' {
+				if i+1 < len(runes) && runes[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+		default:
+			if r == '"' {
+				inDouble = true
+			} else if r == '\'' {
+				inSingle = true
+			} else if r == ':' {
+				colonIdx = i
+			}
+		}
+		if colonIdx != -1 {
+			break
+		}
+	}
+	if colonIdx == -1 {
 		return "", "", false
 	}
-	k := strings.TrimSpace(line[:idx])
-	if k == "" || strings.ContainsAny(k, " \t\"'") {
+	k := strings.TrimSpace(string(runes[:colonIdx]))
+	if k == "" {
 		return "", "", false
 	}
-	return k, strings.TrimSpace(line[idx+1:]), true
+	if (k[0] == '"' || k[0] == '\'') && len(k) >= 2 && k[len(k)-1] == k[0] {
+		return k, strings.TrimSpace(string(runes[colonIdx+1:])), true
+	}
+	if strings.ContainsAny(k, " \t\"'") {
+		return "", "", false
+	}
+	return k, strings.TrimSpace(string(runes[colonIdx+1:])), true
 }
 
 func unquoteTargetScalar(s string) (string, error) {
@@ -673,39 +816,68 @@ func unquoteTargetScalar(s string) (string, error) {
 	if len(s) < 2 || s[len(s)-1] != s[0] {
 		return "", fmt.Errorf("unclosed quote in %q", s)
 	}
+	if s[0] == '\'' {
+		return strings.ReplaceAll(s[1:len(s)-1], "''", "'"), nil
+	}
 	return s[1 : len(s)-1], nil
 }
 
 func stripTargetComment(line string) string {
 	var inSingle, inDouble bool
 	var prev rune
-	for i, r := range line {
+	runes := []rune(line)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
 		switch {
 		case inDouble:
-			if r == '\\' && i+1 < len(line) {
-				prev = r
+			if r == '\\' && i+1 < len(runes) {
+				i++
+				prev = runes[i]
 				continue
 			}
-			if r == '"' && prev != '\\' {
+			if r == '"' {
 				inDouble = false
 			}
 		case inSingle:
 			if r == '\'' {
+				if i+1 < len(runes) && runes[i+1] == '\'' {
+					i++
+					prev = '\''
+					continue
+				}
 				inSingle = false
 			}
 		default:
 			if r == '#' && (i == 0 || unicode.IsSpace(prev)) {
-				return line[:i]
+				return string(runes[:i])
 			}
-			if r == '"' && (i == 0 || unicode.IsSpace(prev) || prev == ':' || prev == '-') {
+			if r == '"' && (i == 0 || unicode.IsSpace(prev) || prev == ':' || prev == '-' || prev == '=' || prev == ',') {
 				inDouble = true
-			} else if r == '\'' && (i == 0 || unicode.IsSpace(prev) || prev == ':' || prev == '-') {
+			} else if r == '\'' && (i == 0 || unicode.IsSpace(prev) || prev == ':' || prev == '-' || prev == '=' || prev == ',') {
 				inSingle = true
 			}
 		}
 		prev = r
 	}
 	return line
+}
+
+func indentAfterDash(line string) int {
+	n := 0
+	sawDash := false
+	for _, r := range line {
+		if r == ' ' {
+			n++
+		} else if r == '\t' {
+			n += 2
+		} else if r == '-' && !sawDash {
+			n++
+			sawDash = true
+		} else {
+			break
+		}
+	}
+	return n
 }
 
 func countIndent(line string) int {

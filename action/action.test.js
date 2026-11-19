@@ -8,7 +8,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const {
   getInput,
-  resolveBpfObjPath,
+  buildCosignEnv,
   verifySha256,
   verifyPinnedSha256,
   verifyCosignSignature,
@@ -24,22 +24,36 @@ const {
   COSIGN_OIDC_ISSUER,
 } = require("./main.js");
 
-test("getInput reads hyphenated INPUT_<NAME> env vars set by GitHub Actions runner", () => {
+test("getInput reads hyphenated INPUT_<NAME> env vars and trims whitespace-only inputs to fallback", () => {
   process.env["INPUT_FAIL-ON"] = "any-new";
   process.env["INPUT_OUTPUT-DIR"] = "custom/profiles";
+  process.env["INPUT_GROUP-BY"] = "   \t  ";
   try {
     assert.equal(getInput("fail-on", "high-risk"), "any-new");
     assert.equal(getInput("output-dir", ".seccomp-profiler/profiles"), "custom/profiles");
+    assert.equal(getInput("group-by", "auto"), "auto");
   } finally {
     delete process.env["INPUT_FAIL-ON"];
     delete process.env["INPUT_OUTPUT-DIR"];
+    delete process.env["INPUT_GROUP-BY"];
   }
 });
 
-test("resolveBpfObjPath defaults to action repository bpf/profiler.bpf.o", () => {
-  delete process.env.SECCOMP_PROFILER_BPF_OBJ;
-  const p = resolveBpfObjPath();
-  assert.equal(p, path.resolve(__dirname, "..", "bpf", "profiler.bpf.o"));
+test("buildCosignEnv strips GitHub tokens and sanitizes PATH", () => {
+  const env = buildCosignEnv({
+    PATH: ".:/tmp/evil:/usr/local/bin:/usr/bin:/bin",
+    HOME: "/home/runner",
+    TMPDIR: "/tmp",
+    HTTPS_PROXY: "http://proxy:8080",
+    GITHUB_TOKEN: "ghs_secret",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "eyJ_secret",
+    LD_PRELOAD: "/tmp/evil.so",
+  });
+  assert.equal(env.PATH, "/usr/local/bin:/usr/bin:/bin");
+  assert.equal(env.HTTPS_PROXY, "http://proxy:8080");
+  assert.equal("GITHUB_TOKEN" in env, false);
+  assert.equal("ACTIONS_ID_TOKEN_REQUEST_TOKEN" in env, false);
+  assert.equal("LD_PRELOAD" in env, false);
 });
 
 test("buildDaemonEnv strips RUNNER_TRACKING_ID and all GitHub/secret tokens from sudo daemon environment", () => {
@@ -78,29 +92,33 @@ test("release version, repo, and binary/cosign SHA-256 digests are immutably pin
   assert.equal(PINNED_BINARY_SHA256.arm64, "5da3813ecb4374acd02cef045098181c24fe4ab5daf49efa85aab79e4ec79bba");
 });
 
-test("COSIGN_CERT_IDENTITY_REGEXP is strictly anchored and rejects other workflows, repos, or refs", () => {
+test("COSIGN_CERT_IDENTITY_REGEXP is strictly anchored and pins release version", () => {
   assert.equal(
     COSIGN_CERT_IDENTITY_REGEXP,
-    "^https://github\\.com/alexno10/seccomp-profiler/\\.github/workflows/release\\.yml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    "^https://github\\.com/alexno10/seccomp-profiler/\\.github/workflows/release\\.yml@refs/tags/v1\\.2\\.0$"
   );
   assert.equal(COSIGN_OIDC_ISSUER, "https://token.actions.githubusercontent.com");
 
   const re = new RegExp(COSIGN_CERT_IDENTITY_REGEXP);
   assert.equal(
-    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v0.2.0"),
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0"),
     true
   );
-  // Negative cases: different repo, prefix/suffix injection, different workflow, branch ref
+  // Negative cases: older pinned version, different repo, prefix/suffix injection, different workflow, branch ref
   assert.equal(
-    re.test("https://github.com/evil/seccomp-profiler/.github/workflows/release.yml@refs/tags/v0.2.0"),
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.1.1"),
     false
   );
   assert.equal(
-    re.test("https://evil.com/https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v0.2.0"),
+    re.test("https://github.com/evil/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0"),
     false
   );
   assert.equal(
-    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/ci.yml@refs/tags/v0.2.0"),
+    re.test("https://evil.com/https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0"),
+    false
+  );
+  assert.equal(
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/ci.yml@refs/tags/v1.2.0"),
     false
   );
   assert.equal(
@@ -108,7 +126,7 @@ test("COSIGN_CERT_IDENTITY_REGEXP is strictly anchored and rejects other workflo
     false
   );
   assert.equal(
-    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v0.2.0-evil"),
+    re.test("https://github.com/alexno10/seccomp-profiler/.github/workflows/release.yml@refs/tags/v1.2.0-evil"),
     false
   );
 });
@@ -236,9 +254,44 @@ test("validateBaselineRef rejects option injection and resolves pull_request_tar
   assert.throws(() => lib.validateGitRef("main..evil"), /invalid.*ref/i);
   assert.equal(lib.validateGitRef("main"), "main");
 
+  // I20: baseline-ref: none must explicitly disable baseline even during pull_request events.
+  assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main" }, "none"), "");
+  assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main" }, " NONE "), "");
+
   assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "pull_request_target", GITHUB_BASE_REF: "main" }, ""), "main");
   assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "merge_group", GITHUB_BASE_REF: "main" }, ""), "main");
   assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "main" }, ""), "");
+
+  // I20: Real GitHub merge_group events have empty GITHUB_BASE_REF and pass merge_group.base_ref in GITHUB_EVENT_PATH.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-mg-test-"));
+  try {
+    const evPath = path.join(tmpDir, "event.json");
+    fs.writeFileSync(
+      evPath,
+      JSON.stringify({ merge_group: { base_ref: "refs/heads/release-1.2", base_sha: "abc123" } })
+    );
+    assert.equal(lib.resolveBaselineRef({ GITHUB_EVENT_NAME: "merge_group", GITHUB_EVENT_PATH: evPath }, ""), "release-1.2");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("post hook fails closed when STARTED_READY=true and socket vanished without stopped marker", () => {
+  const post = require("./post.js");
+  const prevEnv = { ...process.env };
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-post-crash-"));
+  const binPath = path.join(tmpDir, "seccomp-profiler");
+  fs.writeFileSync(binPath, "bin");
+  try {
+    process.env.STATE_STARTED_BIN = binPath;
+    process.env.STATE_STARTED_READY = "true";
+    process.env.STATE_STARTED_SOCKET = path.join(tmpDir, "missing.sock");
+    process.env.STATE_STARTED_STOPPED_MARKER = path.join(tmpDir, "missing.stopped");
+    assert.throws(() => post.runPost(), /exited unexpectedly/i);
+  } finally {
+    process.env = prevEnv;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("post hook prefers GITHUB_STATE over poisoned GITHUB_ENV and verifies cached binary SHA-256", () => {

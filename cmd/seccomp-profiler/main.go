@@ -6,10 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -135,54 +133,6 @@ func runDaemon(args []string) error {
 		return err
 	}
 
-	if runtime.GOOS == "linux" {
-		out, err := exec.Command("uname", "-r").Output()
-		if err != nil {
-			return fmt.Errorf("read kernel release (uname -r): %w", err)
-		}
-		release := strings.TrimSpace(string(out))
-		if !kernelAtLeast(release, 5, 19) {
-			return fmt.Errorf("kernel %s is not supported: the cgroup_mkdir tracepoint exposes a 64-bit cgroup id only from v5.19; upgrade the host or use a ubuntu-24.04 runner", release)
-		}
-	}
-
-	collector, err := ebpf.NewCollector(*bpfObj)
-	if err != nil {
-		return err
-	}
-	defer collector.Close()
-
-	corr := docker.NewCorrelator(nil)
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	var dockerWg sync.WaitGroup
-	defer func() {
-		cancel()
-		dockerWg.Wait()
-	}()
-
-	if *includePreexist {
-		// Pre-scan already-running containers before signaling readiness.
-		// Their early syscalls were never observed, so profiles flag them
-		// as partial (preexisting: true).
-		if runningEvents, inodes, err := docker.ScanRunningContainers(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: scan running containers failed: %v\n", err)
-		} else {
-			for cid, ino := range inodes {
-				corr.BindCgroup(ino, cid)
-				_ = collector.TrackCgroup(ino)
-			}
-			for _, ev := range runningEvents {
-				corr.RecordDockerEvent(ev)
-			}
-		}
-	}
-
-	handleDockerEvent := func(ev docker.DockerEvent) {
-		handleDockerContainerEvent(ev, corr, collector)
-	}
-
-	startDockerEventWatcher(ctx, &dockerWg, docker.NewDockerEventStreamer(), handleDockerEvent)
-
 	cfg := daemon.Config{
 		ControlAddr:       *sock,
 		StoppedMarkerPath: *marker,
@@ -204,37 +154,69 @@ func runDaemon(args []string) error {
 		ExtraAllow:        splitLines(*extraAllow),
 		OnChange:          *onChange,
 		FailOn:            *failOn,
-		Kernel:            daemonKernel(),
 		GeneratorVersion:  version,
 	}
+	if err := daemon.ValidateConfig(cfg); err != nil {
+		return err
+	}
 
+	release, err := kernelRelease()
+	if err != nil {
+		return fmt.Errorf("read kernel release: %w", err)
+	}
+	if release != "" && !kernelAtLeast(release, 5, 19) {
+		return fmt.Errorf("kernel %s is not supported: the cgroup_mkdir tracepoint exposes a 64-bit cgroup id only from v5.19; upgrade the host or use a ubuntu-24.04 runner", release)
+	}
+	cfg.Kernel = release
+
+	collector, err := ebpf.NewCollector(*bpfObj)
+	if err != nil {
+		return err
+	}
+	defer collector.Close()
+
+	corr := docker.NewCorrelator(nil)
 	srv, err := daemon.NewServer(cfg, collector, corr)
 	if err != nil {
 		return err
 	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	var dockerWg sync.WaitGroup
+	defer func() {
+		watchCancel()
+		cancel()
+		dockerWg.Wait()
+	}()
+	srv.SetBeforeCollectorClose(func() {
+		watchCancel()
+		dockerWg.Wait()
+	})
+
+	if *includePreexist {
+		// Pre-scan already-running containers before signaling readiness.
+		// Their early syscalls were never observed, so profiles flag them
+		// as partial (preexisting: true).
+		if runningEvents, inodes, err := docker.ScanRunningContainers(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: scan running containers failed: %v\n", err)
+		} else {
+			for cid, ino := range inodes {
+				corr.BindCgroup(ino, cid)
+				_ = collector.TrackCgroup(ino)
+			}
+			for _, ev := range runningEvents {
+				corr.RecordDockerEvent(ev)
+			}
+		}
+	}
+
+	startDockerEventWatcher(watchCtx, &dockerWg, docker.NewDockerEventStreamer(), srv.HandleDockerEvent)
+
 	if err := srv.Start(ctx); err != nil {
 		return err
 	}
 	return srv.Wait()
-}
-
-func handleDockerContainerEvent(ev docker.DockerEvent, corr *docker.Correlator, collector ebpf.Collector) {
-	corr.RecordDockerEvent(ev)
-	// Reclaim kernel map entries when a container dies so the maps stay
-	// bounded across large test suites. The final stats snapshot is kept
-	// by the correlator and merged at Stop.
-	if ev.Action == "die" || ev.Action == "destroy" {
-		for _, cgID := range corr.CgroupsForContainer(ev.ID) {
-			docker.ReclaimCgroup(corr, collector, cgID)
-		}
-	}
-}
-
-func handleKernelCollectorEvent(ev ebpf.KernelEvent, corr *docker.Correlator, collector ebpf.Collector) {
-	corr.RecordKernelEvent(ev)
-	if ev.Type == ebpf.EventCgroupMkdir && corr.IsCgroupContainerDead(ev.CgroupID) {
-		docker.ReclaimCgroup(corr, collector, ev.CgroupID)
-	}
 }
 
 func startDockerEventWatcher(
@@ -259,17 +241,6 @@ func startDockerEventWatcher(
 			}
 		}
 	}()
-}
-
-func daemonKernel() string {
-	if runtime.GOOS != "linux" {
-		return ""
-	}
-	out, err := exec.Command("uname", "-r").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 func runPing(args []string) error {
@@ -373,6 +344,7 @@ func runMerge(args []string) error {
 	committedPattern := fs.String("committed-profile", ".seccomp-profiler/profiles/{name}.json", "Committed profile path/template")
 	workingCommitted := fs.String("working-committed-profile", "", "Working-tree committed profile path/template (for update-pr/drift reporting)")
 	allowFile := fs.String("allow-file", ".seccomp-profiler/accepted.yml", "Approvals file path")
+	workingAllow := fs.String("working-allow-file", "", "Working-tree approvals file path (for drift reporting)")
 	onChange := fs.String("on-change", "report", "on-change policy (report|fail|update-pr)")
 	failOn := fs.String("fail-on", "high-risk", "fail-on policy (none|high-risk|any-new)")
 	prune := fs.Bool("prune", false, "Allow removing syscalls not observed in this run from committed profile")
@@ -477,6 +449,27 @@ func runMerge(args []string) error {
 		diffs = append(diffs, td)
 	}
 
+	var mergedKernelErrs ebpf.ErrorStats
+	for _, r := range raws {
+		if r != nil {
+			mergedKernelErrs = mergedKernelErrs.Add(r.KernelErrors)
+		}
+	}
+
+	var driftNotes []string
+	if *workingCommitted != "" && *workingCommitted != *committedPattern {
+		for _, b := range built {
+			base := diff.ResolveCommittedProfilePath(*committedPattern, b.TargetName, len(built))
+			work := diff.ResolveCommittedProfilePath(*workingCommitted, b.TargetName, len(built))
+			if base != "" && work != "" && diff.FileChanged(base, work) {
+				driftNotes = append(driftNotes, fmt.Sprintf("committed profile `%s` differs from `%s` in this PR — review carefully (CODEOWNERS + branch protection recommended)", work, base))
+			}
+		}
+	}
+	if *workingAllow != "" && *workingAllow != *allowFile && diff.FileChanged(*allowFile, *workingAllow) {
+		driftNotes = append(driftNotes, fmt.Sprintf("syscall approvals file `%s` differs from `%s` in this PR — review carefully", *workingAllow, *allowFile))
+	}
+
 	preLock, err := profile.LoadLockHashes(*lockFile)
 	if err != nil {
 		return err
@@ -484,6 +477,14 @@ func runMerge(args []string) error {
 	passed, reason, err := diff.EvaluateGate(diffs, *onChange, *failOn)
 	if err != nil {
 		return err
+	}
+	if mergedKernelErrs.Any() {
+		summary := fmt.Sprintf("kernel error counters non-zero (%s): some containers or syscalls were not recorded, the generated profile may be incomplete", mergedKernelErrs.String())
+		if !strings.EqualFold(strings.TrimSpace(*failOn), "none") {
+			passed = false
+			reason = summary
+		}
+		driftNotes = append(driftNotes, summary)
 	}
 	writeRes, err := profile.WriteTargetFiles(*outDir, *rawDir, *lockFile, built)
 	if err != nil {
@@ -506,7 +507,9 @@ func runMerge(args []string) error {
 		Profiles:     built,
 		WriteResults: writeRes,
 		Diffs:        diffs,
+		DriftNotes:   driftNotes,
 		UpdatedPaths: updatedPaths,
+		KernelErrors: mergedKernelErrs,
 		Prune:        *prune,
 		GatePassed:   passed,
 		GateReason:   reason,

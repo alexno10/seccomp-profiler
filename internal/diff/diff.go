@@ -74,7 +74,7 @@ type TargetDiff struct {
 	DefaultErrnoRetChanged  bool
 	PreservedArgRules       int
 	CompatObserved          bool
-	CompatHits              uint32
+	CompatHits              uint64
 }
 
 func ResolveCommittedProfilePath(pattern string, targetName string, totalTargets int) string {
@@ -407,7 +407,7 @@ func Compare(
 			}
 		}
 		applyApproval(&item.Approved, &item.ApprovalReason, &item.ApprovalExpires,
-			&item.ApprovalExpired, approvals, targetName, cand.name, now)
+			&item.ApprovalExpired, approvals, targetName, cand.name, "add", now)
 		td.Added = append(td.Added, item)
 	}
 
@@ -422,7 +422,7 @@ func Compare(
 		approved := false
 		var aReason, aExpires string
 		var aExpired bool
-		applyApproval(&approved, &aReason, &aExpires, &aExpired, approvals, targetName, name, now)
+		applyApproval(&approved, &aReason, &aExpires, &aExpired, approvals, targetName, name, "escalate", now)
 		item.Approved = approved
 		item.ApprovalReason = aReason
 		item.ApprovalExpires = aExpires
@@ -440,7 +440,7 @@ func Compare(
 			CurrentArgs:   joinedCondKey(currentCond[name]),
 		}
 		applyApproval(&ac.Approved, &ac.ApprovalReason, &ac.ApprovalExpires, &ac.ApprovalExpired,
-			approvals, targetName, name, now)
+			approvals, targetName, name, "args-change", now)
 		td.ArgsChangeDetails = append(td.ArgsChangeDetails, ac)
 	}
 
@@ -465,8 +465,8 @@ func dedup(in []string) []string {
 }
 
 func applyApproval(approved *bool, reason, expires *string, expired *bool,
-	approvals []ApprovalEntry, target, syscall string, now time.Time) {
-	if app, ok := findApproval(approvals, target, syscall); ok {
+	approvals []ApprovalEntry, target, syscall, kind string, now time.Time) {
+	if app, ok := findApproval(approvals, target, syscall, kind); ok {
 		*reason = app.Reason
 		*expires = app.Expires
 		if isExpired(app.Expires, now) {
@@ -569,16 +569,27 @@ func EvaluateGate(diffs []*TargetDiff, onChange string, failOn string) (bool, st
 	return true, "all security gate checks passed", nil
 }
 
-func findApproval(approvals []ApprovalEntry, target, syscall string) (ApprovalEntry, bool) {
+func approvalScopeMatches(scope, kind string) bool {
+	s := strings.ToLower(strings.TrimSpace(scope))
+	if s == "" {
+		s = "add"
+	}
+	if s == "all" {
+		return true
+	}
+	return s == kind
+}
+
+func findApproval(approvals []ApprovalEntry, target, syscall, kind string) (ApprovalEntry, bool) {
 	// Exact target entries always take precedence over wildcard ("*") entries,
 	// regardless of ordering inside accepted.yml.
 	for _, a := range approvals {
-		if a.Target == target && a.Syscall == syscall {
+		if a.Target == target && a.Syscall == syscall && approvalScopeMatches(a.Scope, kind) {
 			return a, true
 		}
 	}
 	for _, a := range approvals {
-		if a.Target == "*" && a.Syscall == syscall {
+		if a.Target == "*" && a.Syscall == syscall && approvalScopeMatches(a.Scope, kind) {
 			return a, true
 		}
 	}

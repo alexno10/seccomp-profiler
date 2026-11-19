@@ -5,8 +5,8 @@
 | Version | Supported |
 |---|---|
 | 1.2.x | ✅ |
-| 1.1.x | ✅ |
-| 1.0.x | ✅ |
+| 1.1.x | ❌ |
+| 1.0.x | ❌ |
 | < 1.0 | ❌ |
 
 ## Reporting a Vulnerability
@@ -19,7 +19,7 @@ Please open a [private security advisory](https://github.com/alexno10/seccomp-pr
 
 1. **The gate cannot be widened from inside a PR.** The committed reference profile and `accepted.yml` are read from the PR **base ref** (`baseline-ref`), not the working tree; PR-side edits are reported as drift and require review. Defense in depth: protect `.seccomp-profiler/` in `CODEOWNERS` and enable *Require review from Code Owners*.
 2. **Comm spoofing is dead.** Kernel-side suppression is keyed on per-TID markers derived from the *pre-exec* comm only; `prctl(PR_SET_NAME, "runc")` no longer hides syscalls from `raw_tracepoint/sys_enter`.
-3. **Fail-closed observation.** Kernel error counters (`cgroup_map_full`, `ringbuf_drops`, `oob_syscalls`) make any lost visibility fail the gate instead of passing silently.
+3. **Fail-closed observation.** Kernel error counters (`cgroup_map_full`, `ringbuf_drops`, `oob_syscalls`, `path_truncations`, `read_errors`) and userspace decode errors (`decode_errors`) make any lost visibility fail the gate instead of passing silently.
 4. **Conditional allows never widen silently.** Dropping argument constraints (`clone` without `CLONE_NEW*` mask) is reported as high-risk escalation drift.
 5. **Target names are sanitized** (`^[A-Za-z0-9._-]{1,100}$`) — container labels can never make the root daemon write outside the output directory.
 6. **Supply chain:** release binaries are commit-locked (`PINNED_RELEASE_VERSION` + `PINNED_BINARY_SHA256`), signed with Sigstore keyless OIDC (fully-anchored identity regex), re-verified on every cache hit, and built by pinned `clang-18` from tag pushes only. The cosign bootstrap itself is digest-pinned.
@@ -30,6 +30,7 @@ Please open a [private security advisory](https://github.com/alexno10/seccomp-pr
 - 32-bit compat workloads: detected and failed, not profiled.
 - The `tcp://` control endpoint (testing only, restricted to loopback addresses) has no authentication.
 - Branch protection is still required for the CODEOWNERS mechanism to be enforceable.
+- GitHub-hosted runners grant passwordless `sudo` to any workflow step running PR code, so hardening measures (`baseline-ref` snapshot, root-owned `session.json` and binary cache) primarily protect against non-root/unprivileged tampering and restricted self-hosted runner topologies rather than a full root-compromised job step.
 
 ## Hardening Recommendations for Users
 

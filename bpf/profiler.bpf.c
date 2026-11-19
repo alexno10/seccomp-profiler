@@ -31,7 +31,6 @@ typedef unsigned long long __u64;
 
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_ARRAY 2
-#define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_MAP_TYPE_LRU_HASH 9
 #define BPF_MAP_TYPE_RINGBUF 27
 
@@ -39,7 +38,6 @@ typedef unsigned long long __u64;
 #define BPF_NOEXIST 1
 
 #define STATE_PENDING_EXEC 1
-#define STATE_ACTIVE 2
 
 #define EVENT_CGROUP_MKDIR 1
 #define EVENT_EXEC 2
@@ -51,9 +49,8 @@ typedef unsigned long long __u64;
 #define TIF_32BIT (1ULL << 22)
 
 struct syscall_stats {
-	__u32 counts[MAX_SYSCALLS];
-	__u32 compat_count;
-	__u32 pad;
+	__u64 counts[MAX_SYSCALLS];
+	__u64 compat_count;
 };
 
 struct error_counters {
@@ -61,6 +58,7 @@ struct error_counters {
 	__u64 ringbuf_drops;
 	__u64 oob_syscalls;
 	__u64 path_truncations;
+	__u64 read_errors;
 };
 
 struct kernel_event {
@@ -70,13 +68,7 @@ struct kernel_event {
 	char path[MAX_PATH_LEN];
 };
 
-struct thread_info_prefix {
-	unsigned long flags;
-	unsigned long syscall_work;
-	__u32 status;
-};
-
-// Keep the 2KB zeroed initializer in .rodata so it never touches the 512B BPF stack.
+// Keep the zeroed initializer in .rodata so it never touches the 512B BPF stack.
 static const struct syscall_stats empty_stats = {};
 
 struct {
@@ -119,13 +111,6 @@ struct {
 } error_stats SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct kernel_event);
-} scratch_events SEC(".maps");
-
-struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 20);
 } events SEC(".maps");
@@ -139,7 +124,9 @@ static void *(*bpf_get_current_task)(void) = (void *)35;
 static __u64 (*bpf_get_current_cgroup_id)(void) = (void *)80;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *unsafe_ptr) = (void *)113;
 static long (*bpf_probe_read_kernel_str)(void *dst, __u32 size, const void *unsafe_ptr) = (void *)115;
-static long (*bpf_ringbuf_output)(void *ringbuf, void *data, __u64 size, __u64 flags) = (void *)130;
+static void *(*bpf_ringbuf_reserve)(void *ringbuf, __u64 size, __u64 flags) = (void *)131;
+static void (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *)132;
+static void (*bpf_ringbuf_discard)(void *data, __u64 flags) = (void *)133;
 
 struct trace_event_raw_sched_process_exec {
 	__u64 unused;
@@ -268,10 +255,18 @@ static __inline int is_runtime_family_comm(const char *comm) {
 	return 0;
 }
 
-// Minimal CO-RE-annotated task_struct: the pid member is resolved BY NAME
-// against the kernel's BTF, so the real struct offset never has to be
-// hardcoded here.
+// Minimal CO-RE-annotated task_struct/thread_info: member offsets are resolved
+// BY NAME against the kernel's BTF instead of hardcoded offsets.
+struct thread_info {
+#if defined(__TARGET_ARCH_arm64)
+	unsigned long flags;
+#elif defined(__TARGET_ARCH_x86)
+	__u32 status;
+#endif
+} __attribute__((preserve_access_index));
+
 struct task_struct {
+	struct thread_info thread_info;
 	int pid;
 } __attribute__((preserve_access_index));
 
@@ -321,30 +316,50 @@ static __inline int is_runtime_selfref(const char *filename) {
 static __inline int is_compat_syscall(long id) {
 #if defined(__TARGET_ARCH_arm64)
 	(void)id;
-	void *task = bpf_get_current_task();
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	if (!task) {
+		struct error_counters *e = get_error_counters();
+		if (e) {
+			__sync_fetch_and_add(&e->read_errors, 1);
+		}
 		return 0;
 	}
 	unsigned long flags = 0;
-	if (bpf_probe_read_kernel(&flags, sizeof(flags), task) == 0) {
-		if (flags & TIF_32BIT) {
-			return 1;
+	if (bpf_probe_read_kernel(&flags, sizeof(flags),
+	    __builtin_preserve_access_index(&task->thread_info.flags)) != 0) {
+		struct error_counters *e = get_error_counters();
+		if (e) {
+			__sync_fetch_and_add(&e->read_errors, 1);
 		}
+		return 0;
+	}
+	if (flags & TIF_32BIT) {
+		return 1;
 	}
 	return 0;
 #elif defined(__TARGET_ARCH_x86)
 	if (id >= 0 && (id & 0x40000000L)) {
 		return 1;
 	}
-	void *task = bpf_get_current_task();
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	if (!task) {
+		struct error_counters *e = get_error_counters();
+		if (e) {
+			__sync_fetch_and_add(&e->read_errors, 1);
+		}
 		return 0;
 	}
-	struct thread_info_prefix ti = {};
-	if (bpf_probe_read_kernel(&ti, sizeof(ti), task) == 0) {
-		if (ti.status & TS_COMPAT) {
-			return 1;
+	__u32 status = 0;
+	if (bpf_probe_read_kernel(&status, sizeof(status),
+	    __builtin_preserve_access_index(&task->thread_info.status)) != 0) {
+		struct error_counters *e = get_error_counters();
+		if (e) {
+			__sync_fetch_and_add(&e->read_errors, 1);
 		}
+		return 0;
+	}
+	if (status & TS_COMPAT) {
+		return 1;
 	}
 	return 0;
 #else
@@ -432,9 +447,22 @@ int handle_cgroup_mkdir(struct bpf_raw_tracepoint_args *ctx) {
 		cur = pcgrp;
 	}
 
-	__u32 zero = 0;
-	struct kernel_event *ev = bpf_map_lookup_elem(&scratch_events, &zero);
+	if (parent_active) {
+		long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
+		if (ret != 0 && ret != -17) {
+			struct error_counters *e = get_error_counters();
+			if (e) {
+				__sync_fetch_and_add(&e->cgroup_map_full, 1);
+			}
+		}
+	}
+
+	struct kernel_event *ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
 	if (!ev) {
+		struct error_counters *e = get_error_counters();
+		if (e) {
+			__sync_fetch_and_add(&e->ringbuf_drops, 1);
+		}
 		return 0;
 	}
 
@@ -446,30 +474,16 @@ int handle_cgroup_mkdir(struct bpf_raw_tracepoint_args *ctx) {
 		if (e) {
 			__sync_fetch_and_add(&e->path_truncations, 1);
 		}
-		if (parent_active) {
-			long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
-			if (ret != 0 && ret != -17) {
-				if (e) {
-					__sync_fetch_and_add(&e->cgroup_map_full, 1);
-				}
-			}
-		}
+		bpf_ringbuf_discard(ev, 0);
 		return 0;
 	}
 
 	if (!parent_active && !has_64_hex_id(ev->path)) {
+		bpf_ringbuf_discard(ev, 0);
 		return 0;
 	}
 
-	if (parent_active) {
-		long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
-		if (ret != 0 && ret != -17) {
-			struct error_counters *e = get_error_counters();
-			if (e) {
-				__sync_fetch_and_add(&e->cgroup_map_full, 1);
-			}
-		}
-	} else {
+	if (!parent_active) {
 		__u8 state = STATE_PENDING_EXEC;
 		long ret = bpf_map_update_elem(&candidate_cgroups, &cgroup_id, &state, BPF_ANY);
 		if (ret != 0) {
@@ -483,12 +497,7 @@ int handle_cgroup_mkdir(struct bpf_raw_tracepoint_args *ctx) {
 	ev->type = EVENT_CGROUP_MKDIR;
 	ev->pad = 0;
 	ev->cgroup_id = cgroup_id;
-	if (bpf_ringbuf_output(&events, ev, sizeof(*ev), 0) != 0) {
-		struct error_counters *e = get_error_counters();
-		if (e) {
-			__sync_fetch_and_add(&e->ringbuf_drops, 1);
-		}
-	}
+	bpf_ringbuf_submit(ev, 0);
 	return 0;
 }
 
@@ -562,27 +571,98 @@ static __inline int handle_exec_enter(__u64 cgroup_id) {
 SEC("tracepoint/sched/sched_process_exec")
 int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	__u64 cgroup_id = bpf_get_current_cgroup_id();
-	__u8 cand_state = 0;
-	__u8 *cand = bpf_map_lookup_elem(&candidate_cgroups, &cgroup_id);
-	if (cand) {
-		cand_state = *cand;
-	} else {
-		struct syscall_stats *existing = bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id);
-		if (!existing) {
-			return 0;
-		}
-	}
-
-	__u32 zero = 0;
-	struct kernel_event *ev = bpf_map_lookup_elem(&scratch_events, &zero);
-	if (!ev) {
-		return 0;
-	}
-
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	int old_pid_raw = ctx->old_pid;
+	__u32 old_tid = old_pid_raw > 0 ? (__u32)old_pid_raw : 0;
 
 	__u32 data_loc = ctx->__data_loc_filename;
 	__u16 offset = data_loc & 0xffff;
+
+	__u8 *cand = bpf_map_lookup_elem(&candidate_cgroups, &cgroup_id);
+	struct syscall_stats *existing = 0;
+	if (!cand) {
+		existing = bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id);
+	}
+
+	if (!cand && !existing) {
+		// Outside tracked/candidate container cgroups: clean up stale runtime_tids
+		// and exec_pending entries on normal host/helper execs (I2/I3).
+		__u8 pending = 0;
+		__u8 has_rt = 0;
+		if (bpf_map_lookup_elem(&exec_pending, &tid)) {
+			pending = 1;
+		}
+		if (old_tid != 0 && old_tid != tid && bpf_map_lookup_elem(&exec_pending, &old_tid)) {
+			pending = 1;
+		}
+		if (bpf_map_lookup_elem(&runtime_tids, &tid)) {
+			has_rt = 1;
+		} else if (old_tid != 0 && old_tid != tid && bpf_map_lookup_elem(&runtime_tids, &old_tid)) {
+			has_rt = 1;
+		}
+		if (!pending && !has_rt) {
+			return 0;
+		}
+		bpf_map_delete_elem(&exec_pending, &tid);
+		if (old_tid != 0 && old_tid != tid) {
+			bpf_map_delete_elem(&exec_pending, &old_tid);
+		}
+		char short_fname[32] = {};
+		long read_ok = -1;
+		if (offset >= 12U && offset < 4096U) {
+			const char *fname_ptr = (const char *)ctx + offset;
+			read_ok = bpf_probe_read_kernel_str(short_fname, sizeof(short_fname), fname_ptr);
+		}
+		if (pending && read_ok > 0 && is_runtime_selfref(short_fname)) {
+			__u8 one = 1;
+			bpf_map_update_elem(&runtime_tids, &tid, &one, BPF_ANY);
+			if (old_tid != 0 && old_tid != tid) {
+				bpf_map_delete_elem(&runtime_tids, &old_tid);
+			}
+			return 0;
+		}
+		bpf_map_delete_elem(&runtime_tids, &tid);
+		if (old_tid != 0 && old_tid != tid) {
+			bpf_map_delete_elem(&runtime_tids, &old_tid);
+		}
+		return 0;
+	}
+
+	__u8 pending = 0;
+	if (bpf_map_lookup_elem(&exec_pending, &tid)) {
+		pending = 1;
+	}
+	bpf_map_delete_elem(&exec_pending, &tid);
+	if (old_tid != 0 && old_tid != tid) {
+		// Propagate pre-exec marker across de_thread() TID swap (non-leader execve).
+		if (bpf_map_lookup_elem(&exec_pending, &old_tid)) {
+			pending = 1;
+		}
+		bpf_map_delete_elem(&exec_pending, &old_tid);
+	}
+
+	struct kernel_event *ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
+	if (!ev) {
+		struct error_counters *e = get_error_counters();
+		if (e) {
+			__sync_fetch_and_add(&e->ringbuf_drops, 1);
+		}
+		// Still unmark runtime_tids and activate the cgroup so syscalls are not lost.
+		bpf_map_delete_elem(&runtime_tids, &tid);
+		if (old_tid != 0 && old_tid != tid) {
+			bpf_map_delete_elem(&runtime_tids, &old_tid);
+		}
+		if (cand) {
+			bpf_map_delete_elem(&candidate_cgroups, &cgroup_id);
+		}
+		long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
+		if (ret != 0 && ret != -17) {
+			if (e) {
+				__sync_fetch_and_add(&e->cgroup_map_full, 1);
+			}
+		}
+		return 0;
+	}
 
 	__builtin_memset(ev->path, 0, 256);
 	__builtin_memset(ev->path + 256, 0, 256);
@@ -591,59 +671,30 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 		const char *fname_ptr = (const char *)ctx + offset;
 		read_ok = bpf_probe_read_kernel_str(ev->path, sizeof(ev->path), fname_ptr);
 	}
-	if (read_ok <= 0) {
-		// An unreadable filename would look like a self-ref exec and keep
-		// runtime marked; treat it as a workload exec instead (fail open to
-		// recording, never to suppression).
-		bpf_map_delete_elem(&runtime_tids, &tid);
-		bpf_map_delete_elem(&exec_pending, &tid);
-		if (cand_state == STATE_PENDING_EXEC) {
-			__u8 active = STATE_ACTIVE;
-			bpf_map_update_elem(&candidate_cgroups, &cgroup_id, &active, BPF_ANY);
-		}
-		long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
-		if (ret != 0 && ret != -17 /* -EEXIST: secondary execs, expected */) {
-			struct error_counters *e = get_error_counters();
-			if (e) {
-				__sync_fetch_and_add(&e->cgroup_map_full, 1);
-			}
-		}
-		ev->type = EVENT_EXEC;
-		ev->pad = 0;
-		ev->cgroup_id = cgroup_id;
-		if (bpf_ringbuf_output(&events, ev, sizeof(*ev), 0) != 0) {
-			struct error_counters *e = get_error_counters();
-			if (e) {
-				__sync_fetch_and_add(&e->ringbuf_drops, 1);
-			}
-		}
-		return 0;
-	}
 
-	__u8 pending = 0;
-	__u8 *p = bpf_map_lookup_elem(&exec_pending, &tid);
-	if (p) {
-		pending = *p;
-	}
-	bpf_map_delete_elem(&exec_pending, &tid);
-
-	if (pending && is_runtime_selfref(ev->path)) {
+	if (read_ok > 0 && pending && is_runtime_selfref(ev->path)) {
 		// runc bootstrap re-exec: keep the tid suppressed until it
 		// execs the real container workload. Do not match on comm so
 		// container entrypoints named "runc"/"crun" are never suppressed.
 		__u8 one = 1;
 		bpf_map_update_elem(&runtime_tids, &tid, &one, BPF_ANY);
+		if (old_tid != 0 && old_tid != tid) {
+			bpf_map_delete_elem(&runtime_tids, &old_tid);
+		}
+		bpf_ringbuf_discard(ev, 0);
 		return 0;
 	}
 
-	// Any other exec - the container entrypoint itself, secondary
-	// "docker exec" workloads, application /proc/self/exe re-execs - is a
+	// Any other exec (including unreadable filename fallback, container entrypoint,
+	// secondary "docker exec", or application /proc/self/exe re-exec) is a
 	// workload thread: unmark and record.
 	bpf_map_delete_elem(&runtime_tids, &tid);
+	if (old_tid != 0 && old_tid != tid) {
+		bpf_map_delete_elem(&runtime_tids, &old_tid);
+	}
 
-	if (cand_state == STATE_PENDING_EXEC) {
-		__u8 active = STATE_ACTIVE;
-		bpf_map_update_elem(&candidate_cgroups, &cgroup_id, &active, BPF_ANY);
+	if (cand) {
+		bpf_map_delete_elem(&candidate_cgroups, &cgroup_id);
 	}
 	long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
 	if (ret != 0 && ret != -17 /* -EEXIST: secondary execs, expected */) {
@@ -658,12 +709,7 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	ev->type = EVENT_EXEC;
 	ev->pad = 0;
 	ev->cgroup_id = cgroup_id;
-	if (bpf_ringbuf_output(&events, ev, sizeof(*ev), 0) != 0) {
-		struct error_counters *e = get_error_counters();
-		if (e) {
-			__sync_fetch_and_add(&e->ringbuf_drops, 1);
-		}
-	}
+	bpf_ringbuf_submit(ev, 0);
 	return 0;
 }
 
@@ -680,20 +726,29 @@ SEC("raw_tracepoint/sys_enter")
 int handle_sys_enter(struct bpf_raw_tracepoint_args *ctx) {
 	__u64 cgroup_id = bpf_get_current_cgroup_id();
 	long id = (long)ctx->args[1];
+	int is_execve = is_execve_syscall(id);
 
-	if (is_execve_syscall(id)) {
+	if (is_execve) {
 		handle_exec_enter(cgroup_id);
 	}
 
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	struct syscall_stats *stats = bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id);
 	if (!stats) {
+		// If a runtime helper called execve outside any container cgroup and it
+		// failed (-ENOENT/-EACCES), clear stale exec_pending on its next syscall.
+		if (!is_execve && bpf_map_lookup_elem(&exec_pending, &tid)) {
+			bpf_map_delete_elem(&exec_pending, &tid);
+		}
 		return 0;
 	}
 
 	// Suppression is keyed on tids only. No comm check: a workload renaming
 	// itself to "runc" via prctl(PR_SET_NAME) is still recorded.
-	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	if (bpf_map_lookup_elem(&runtime_tids, &tid)) {
+		if (!is_execve && bpf_map_lookup_elem(&exec_pending, &tid)) {
+			bpf_map_delete_elem(&exec_pending, &tid);
+		}
 		return 0;
 	}
 

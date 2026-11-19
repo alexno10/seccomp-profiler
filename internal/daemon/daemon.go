@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -158,16 +158,25 @@ type Server struct {
 	listener   net.Listener
 	listenAddr string
 
-	mu           sync.Mutex
-	stopMu       sync.Mutex
-	stopping     atomic.Bool
-	stopped      bool
-	shuttingDown bool
-	cachedResp   *StopResponse
-	doneCh       chan struct{}
-	doneOnce     sync.Once
-	shutdownOnce sync.Once
-	wg           sync.WaitGroup
+	mu            sync.Mutex
+	stopMu        sync.Mutex
+	stopping      atomic.Bool
+	stopped       bool
+	shuttingDown  bool
+	cachedResp    *StopResponse
+	doneCh        chan struct{}
+	doneOnce      sync.Once
+	shutdownOnce  sync.Once
+	wg            sync.WaitGroup
+	onBeforeClose func()
+}
+
+// SetBeforeCollectorClose registers a hook invoked during shutdown before closing
+// the eBPF collector (e.g., to cancel and drain the Docker event watcher first).
+func (s *Server) SetBeforeCollectorClose(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onBeforeClose = fn
 }
 
 func NewServer(cfg Config, collector ebpf.Collector, correlator *docker.Correlator) (*Server, error) {
@@ -195,15 +204,19 @@ func NewServer(cfg Config, collector ebpf.Collector, correlator *docker.Correlat
 	if cfg.AllowFile == "" {
 		cfg.AllowFile = ".seccomp-profiler/accepted.yml"
 	}
+	cfg.BaselineMode = baseline.Mode(strings.ToLower(strings.TrimSpace(string(cfg.BaselineMode))))
 	if cfg.BaselineMode == "" {
 		cfg.BaselineMode = baseline.ModeStandard
 	}
+	cfg.RuntimeMode = strings.ToLower(strings.TrimSpace(cfg.RuntimeMode))
 	if cfg.RuntimeMode == "" {
 		cfg.RuntimeMode = "auto"
 	}
+	cfg.OnChange = strings.ToLower(strings.TrimSpace(cfg.OnChange))
 	if cfg.OnChange == "" {
 		cfg.OnChange = "report"
 	}
+	cfg.FailOn = strings.ToLower(strings.TrimSpace(cfg.FailOn))
 	if cfg.FailOn == "" {
 		cfg.FailOn = "high-risk"
 	}
@@ -220,12 +233,10 @@ func NewServer(cfg Config, collector ebpf.Collector, correlator *docker.Correlat
 
 func (s *Server) Start(ctx context.Context) error {
 	network, address := parseControlAddr(s.cfg.ControlAddr)
-	if network == "unix" {
-		_ = os.MkdirAll(filepath.Dir(address), 0o755)
-		_ = os.Remove(address)
-	}
 	if s.cfg.StoppedMarkerPath != "" {
-		_ = os.Remove(s.cfg.StoppedMarkerPath)
+		if err := profile.RemoveRegularFileNoSymlink(s.cfg.StoppedMarkerPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale stopped marker %q: %w", s.cfg.StoppedMarkerPath, err)
+		}
 	}
 	ln, err := listenControl(network, address)
 	if err != nil {
@@ -283,12 +294,33 @@ func (s *Server) closeDone() {
 	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
+// HandleDockerEvent records a container lifecycle event and, when not
+// stopping/shutting down, reclaims BPF maps if the container is already dead.
+func (s *Server) HandleDockerEvent(ev docker.DockerEvent) {
+	s.correlator.RecordDockerEvent(ev)
+	if !s.stopping.Load() && (ev.Action == "die" || ev.Action == "destroy") && s.correlator.IsContainerDead(ev.ID) {
+		s.mu.Lock()
+		if !s.stopping.Load() && !s.shuttingDown {
+			for _, cgID := range s.correlator.CgroupsForContainer(ev.ID) {
+				docker.ReclaimCgroup(s.correlator, s.collector, cgID)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
 // shutdown coordinates teardown across STOP and context cancellation so
 // listener/collector shutdown runs once and never overlaps an active executeStop.
 func (s *Server) shutdown() {
 	s.shutdownOnce.Do(func() {
 		if s.listener != nil {
 			_ = s.listener.Close()
+		}
+		s.mu.Lock()
+		beforeClose := s.onBeforeClose
+		s.mu.Unlock()
+		if beforeClose != nil {
+			beforeClose()
 		}
 		s.stopMu.Lock()
 		s.mu.Lock()
@@ -317,13 +349,39 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		}
 	}()
 
+	connSem := make(chan struct{}, 32)
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			return
+			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+				return
+			}
+			s.mu.Lock()
+			closing := s.shuttingDown
+			s.mu.Unlock()
+			if closing {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: control socket accept error: %v\n", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.doneCh:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			continue
 		}
-		s.wg.Add(1)
-		go s.handleConn(conn)
+		select {
+		case connSem <- struct{}{}:
+			s.wg.Add(1)
+			go func(c net.Conn) {
+				defer func() { <-connSem }()
+				s.handleConn(c)
+			}(conn)
+		default:
+			_ = conn.Close()
+		}
 	}
 }
 
@@ -356,12 +414,15 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-func (s *Server) cacheStopResponse(resp *StopResponse, stopped bool) *StopResponse {
+func (s *Server) finishStop(resp *StopResponse) *StopResponse {
+	if s.cfg.StoppedMarkerPath != "" {
+		if b, err := json.Marshal(resp); err == nil {
+			_ = writeMarkerAtomic(s.cfg.StoppedMarkerPath, b)
+		}
+	}
 	s.mu.Lock()
 	s.cachedResp = resp
-	if stopped {
-		s.stopped = true
-	}
+	s.stopped = true
 	s.mu.Unlock()
 	return resp
 }
@@ -400,19 +461,20 @@ func (s *Server) executeStop() *StopResponse {
 		var err error
 		stats, err = s.collector.Flush()
 		if err != nil {
-			return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
+			return s.finishStop(&StopResponse{OK: false, Error: err.Error()})
 		}
 		errs, err := s.collector.ErrorStats()
 		if err != nil {
-			return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("read kernel error stats: %v", err)}, false)
+			return s.finishStop(&StopResponse{OK: false, Error: fmt.Sprintf("read kernel error stats: %v", err)})
 		}
 		kernelErrs = errs
 	}
 
+	s.correlator.WaitResolutions(250 * time.Millisecond)
 	records := s.correlator.BuildRecords(stats)
 	rules, err := selector.ParseTargetsInputWithErr(s.cfg.Targets)
 	if err != nil {
-		return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("parse targets: %v", err)}, false)
+		return s.finishStop(&StopResponse{OK: false, Error: fmt.Sprintf("parse targets: %v", err)})
 	}
 	selCfg := selector.Config{
 		Rules:          rules,
@@ -424,7 +486,7 @@ func (s *Server) executeStop() *StopResponse {
 
 	approvals, err := diff.LoadApprovals(s.cfg.AllowFile)
 	if err != nil {
-		return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("load approvals: %v", err)}, false)
+		return s.finishStop(&StopResponse{OK: false, Error: fmt.Sprintf("load approvals: %v", err)})
 	}
 
 	var builtProfiles []*profile.BuiltProfile
@@ -438,9 +500,10 @@ func (s *Server) executeStop() *StopResponse {
 			BaselineMode:     s.cfg.BaselineMode,
 			RuntimeMode:      s.cfg.RuntimeMode,
 			ExtraAllow:       s.cfg.ExtraAllow,
+			KernelErrors:     kernelErrs,
 		})
 		if err != nil {
-			return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
+			return s.finishStop(&StopResponse{OK: false, Error: err.Error()})
 		}
 		builtProfiles = append(builtProfiles, bp)
 
@@ -448,7 +511,7 @@ func (s *Server) executeStop() *StopResponse {
 		if commPath != "" {
 			cp, err := profile.LoadOCIProfile(commPath)
 			if err != nil && !os.IsNotExist(err) {
-				return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("load committed profile %q: %v", commPath, err)}, false)
+				return s.finishStop(&StopResponse{OK: false, Error: fmt.Sprintf("load committed profile %q: %v", commPath, err)})
 			}
 			if cp != nil {
 				committedByTarget[t.Name] = cp
@@ -465,7 +528,7 @@ func (s *Server) executeStop() *StopResponse {
 		committed := committedByTarget[bp.TargetName]
 		td, err := diff.Compare(bp.TargetName, committed, &bp.OCI, &bp.Raw, approvals, now)
 		if err != nil {
-			return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
+			return s.finishStop(&StopResponse{OK: false, Error: err.Error()})
 		}
 		diffs = append(diffs, td)
 		newCount += len(td.Added)
@@ -509,12 +572,12 @@ func (s *Server) executeStop() *StopResponse {
 
 	gatePassed, gateReason, err := diff.EvaluateGate(diffs, s.cfg.OnChange, s.cfg.FailOn)
 	if err != nil {
-		return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error(), GatePassed: false}, false)
+		return s.finishStop(&StopResponse{OK: false, Error: err.Error(), GatePassed: false})
 	}
 
 	if kernelErrs.Any() {
 		summary := fmt.Sprintf("kernel error counters non-zero (%s): some containers or syscalls were not recorded, the generated profile may be incomplete", kernelErrs.String())
-		if !strings.EqualFold(strings.TrimSpace(s.cfg.FailOn), "none") {
+		if s.cfg.FailOn != "none" {
 			gatePassed = false
 			gateReason = summary
 		}
@@ -523,16 +586,16 @@ func (s *Server) executeStop() *StopResponse {
 
 	preLock, err := profile.LoadLockHashes(s.cfg.LockFile)
 	if err != nil {
-		return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
+		return s.finishStop(&StopResponse{OK: false, Error: err.Error()})
 	}
 
 	writeResults, err := profile.WriteTargetFiles(s.cfg.OutputDir, s.cfg.RawDir, s.cfg.LockFile, builtProfiles)
 	if err != nil {
-		return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
+		return s.finishStop(&StopResponse{OK: false, Error: err.Error()})
 	}
 
 	var updatedPaths []string
-	if gatePassed && strings.EqualFold(strings.TrimSpace(s.cfg.OnChange), "update-pr") {
+	if gatePassed && s.cfg.OnChange == "update-pr" {
 		targetCommitted := s.cfg.WorkingCommitted
 		if targetCommitted == "" {
 			targetCommitted = s.cfg.CommittedProfile
@@ -540,7 +603,7 @@ func (s *Server) executeStop() *StopResponse {
 		if targetCommitted != "" {
 			updatedPaths, err = profile.SyncCommittedProfiles(targetCommitted, s.cfg.OutputDir, s.cfg.LockFile, writeResults, preLock, builtProfiles)
 			if err != nil {
-				return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("update committed profiles: %v", err)}, false)
+				return s.finishStop(&StopResponse{OK: false, Error: fmt.Sprintf("update committed profiles: %v", err)})
 			}
 		}
 	}
@@ -569,13 +632,7 @@ func (s *Server) executeStop() *StopResponse {
 		MarkdownSummary:  md,
 	}
 
-	if s.cfg.StoppedMarkerPath != "" {
-		if b, err := json.Marshal(resp); err == nil {
-			_ = writeMarkerAtomic(s.cfg.StoppedMarkerPath, b)
-		}
-	}
-
-	return s.cacheStopResponse(resp, true)
+	return s.finishStop(resp)
 }
 
 func Ping(addr string) error {
@@ -614,7 +671,10 @@ func Stop(addr string, stoppedMarkerPath string) (*StopResponse, error) {
 		if stoppedMarkerPath != "" {
 			if data, readErr := profile.ReadFileNoSymlink(stoppedMarkerPath); readErr == nil && len(data) > 0 {
 				var cached StopResponse
-				if jsonErr := json.Unmarshal(data, &cached); jsonErr == nil && cached.OK {
+				if jsonErr := json.Unmarshal(data, &cached); jsonErr == nil && (cached.OK || cached.Error != "") {
+					if !cached.OK {
+						return &cached, fmt.Errorf("daemon stop error: %s", cached.Error)
+					}
 					return &cached, nil
 				}
 			}

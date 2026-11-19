@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/alexno10/seccomp-profiler/internal/baseline"
+	"github.com/alexno10/seccomp-profiler/internal/ebpf"
 	"github.com/alexno10/seccomp-profiler/internal/selector"
 	"github.com/alexno10/seccomp-profiler/internal/syscalls"
 )
@@ -117,7 +118,7 @@ type RawTargetInfo struct {
 	GroupBy            string             `json:"groupBy"`
 	ContainerCount     int                `json:"containerCount"`
 	DetectedRuntimes   []string           `json:"detectedRuntimes"`
-	CompatSyscallCount uint32             `json:"compatSyscallCount"`
+	CompatSyscallCount uint64             `json:"compatSyscallCount"`
 	Containers         []RawContainerInfo `json:"containers"`
 }
 
@@ -133,6 +134,7 @@ type RawProfileV1 struct {
 	GeneratorVersion string                     `json:"generatorVersion"`
 	Host             RawHostInfo                `json:"host"`
 	Target           RawTargetInfo              `json:"target"`
+	KernelErrors     ebpf.ErrorStats            `json:"kernelErrors,omitempty"`
 	Syscalls         map[string]RawSyscallEntry `json:"syscalls"`
 }
 
@@ -144,6 +146,7 @@ type BuildOptions struct {
 	BaselineMode     baseline.Mode
 	RuntimeMode      string
 	ExtraAllow       []string
+	KernelErrors     ebpf.ErrorStats
 }
 
 type BuiltProfile struct {
@@ -190,11 +193,13 @@ func Build(target selector.MatchedTarget, opts BuildOptions) (*BuiltProfile, err
 	rtMode := strings.ToLower(strings.TrimSpace(opts.RuntimeMode))
 	switch rtMode {
 	case "", "auto":
-		var firstImage string
-		if len(target.Containers) > 0 {
-			firstImage = target.Containers[0].Image
+		images := make([]string, 0, len(target.Containers))
+		for _, c := range target.Containers {
+			if c.Image != "" {
+				images = append(images, c.Image)
+			}
 		}
-		detectedRuntimes = baseline.DetectRuntimes(target.ExecutedBins, firstImage)
+		detectedRuntimes = baseline.DetectRuntimesFromImages(target.ExecutedBins, images)
 	case "none":
 		detectedRuntimes = []string{}
 	default:
@@ -264,8 +269,20 @@ func Build(target selector.MatchedTarget, opts BuildOptions) (*BuiltProfile, err
 		for _, tok := range strings.FieldsFunc(extra, func(r rune) bool {
 			return r == '\n' || r == '\r' || r == ',' || r == ' ' || r == '\t'
 		}) {
+			tok = strings.TrimSpace(tok)
+			if tok == "" || !nameKnownToArch(tok) {
+				continue
+			}
 			addSource(tok, baseline.SourceExtraAllow)
-			extraAllowed[strings.TrimSpace(tok)] = true
+			extraAllowed[tok] = true
+		}
+	}
+
+	// Whenever clone3 is blocked with ENOSYS so libcs fall back to clone, ensure
+	// the constrained clone allow rule exists even if clone was never observed.
+	if _, hasClone3 := entries["clone3"]; hasClone3 && !extraAllowed["clone3"] {
+		if _, hasClone := entries["clone"]; !hasClone && !extraAllowed["clone"] {
+			addBaselineSource("clone", "clone3-fallback")
 		}
 	}
 
@@ -372,7 +389,8 @@ func Build(target selector.MatchedTarget, opts BuildOptions) (*BuiltProfile, err
 			CompatSyscallCount: target.CompatHits,
 			Containers:         rawContainers,
 		},
-		Syscalls: rawSyscalls,
+		KernelErrors: opts.KernelErrors,
+		Syscalls:     rawSyscalls,
 	}
 
 	return &BuiltProfile{
@@ -418,7 +436,32 @@ func saveLockFile(lockFile string, lock lockFileSchema) error {
 	return writeFileAtomic(lockFile, lockBytes)
 }
 
-// LoadLockHashes loads a snapshot of existing target->sha256 entries from
+func lockKey(filePath string) string {
+	clean := filepath.Clean(filePath)
+	abs, err := filepath.Abs(clean)
+	if err == nil {
+		if cwd, cErr := os.Getwd(); cErr == nil {
+			if rel, rErr := filepath.Rel(cwd, abs); rErr == nil &&
+				rel != "" && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return filepath.ToSlash(rel)
+			}
+		}
+		return filepath.ToSlash(abs)
+	}
+	return filepath.ToSlash(clean)
+}
+
+func lookupLockHash(files map[string]string, filePath, targetName string) (string, bool) {
+	if h, ok := files[lockKey(filePath)]; ok {
+		return h, true
+	}
+	if h, ok := files[targetName]; ok {
+		return h, true
+	}
+	return "", false
+}
+
+// LoadLockHashes loads a snapshot of existing path/target->sha256 entries from
 // lockFile. Missing lockFile returns an empty map; corrupt lockFile fails.
 func LoadLockHashes(lockFile string) (map[string]string, error) {
 	lock, err := loadLockFile(lockFile)
@@ -478,7 +521,7 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 
 		if existingBytes, err := ReadFileNoSymlink(profilePath); err == nil {
 			existingHash := sha256Hex(existingBytes)
-			lockedHash, hasLock := lock.Files[b.TargetName]
+			lockedHash, hasLock := lookupLockHash(lock.Files, profilePath, b.TargetName)
 			if !hasLock || lockedHash != existingHash {
 				res.ProtectedManualEdit = true
 				res.SuggestedPath = filepath.Join(outDir, b.TargetName+".suggested.json")
@@ -495,7 +538,7 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 		if err := writeFileAtomic(profilePath, ociBytes); err != nil {
 			return nil, err
 		}
-		lock.Files[b.TargetName] = sha256Hex(ociBytes)
+		lock.Files[lockKey(profilePath)] = sha256Hex(ociBytes)
 		results = append(results, res)
 	}
 
@@ -570,7 +613,7 @@ func SyncCommittedProfiles(
 		ociBytes = append(ociBytes, '\n')
 
 		if existing, err := ReadFileNoSymlink(path); err == nil {
-			locked, hasLock := baselineHashes[b.TargetName]
+			locked, hasLock := lookupLockHash(baselineHashes, path, b.TargetName)
 			if !hasLock || locked != sha256Hex(existing) {
 				suggested := filepath.Join(filepath.Dir(path), b.TargetName+".suggested.json")
 				if err := writeFileAtomic(suggested, ociBytes); err != nil {
@@ -588,7 +631,7 @@ func SyncCommittedProfiles(
 		if err := writeFileAtomic(path, ociBytes); err != nil {
 			return nil, err
 		}
-		lock.Files[b.TargetName] = sha256Hex(ociBytes)
+		lock.Files[lockKey(path)] = sha256Hex(ociBytes)
 		lockDirty = true
 		updated = append(updated, path)
 	}
@@ -787,7 +830,9 @@ func openNoSymlinkDir(dir string, create bool, perm os.FileMode) (*os.Root, erro
 	return cur, nil
 }
 
-func mkdirAllChown(dir string, perm os.FileMode) error {
+// EnsureNoSymlinkDir ensures dir exists without traversing or creating any
+// symlink components along its path.
+func EnsureNoSymlinkDir(dir string, perm os.FileMode) error {
 	if strings.TrimSpace(dir) == "" || dir == "." {
 		return nil
 	}
@@ -796,6 +841,37 @@ func mkdirAllChown(dir string, perm os.FileMode) error {
 		return err
 	}
 	return r.Close()
+}
+
+// RemoveRegularFileNoSymlink removes a regular file without following symlinks
+// in any parent component or the destination itself.
+func RemoveRegularFileNoSymlink(path string) error {
+	clean := filepath.Clean(path)
+	dirRoot, err := openNoSymlinkDir(filepath.Dir(clean), false, 0)
+	if err != nil {
+		return err
+	}
+	defer dirRoot.Close()
+
+	base := filepath.Base(clean)
+	if base == "" || base == "." || base == ".." {
+		return fmt.Errorf("invalid target file name %q", path)
+	}
+	fi, err := dirRoot.Lstat(base)
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to remove symlink %s", path)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("refusing to remove non-regular file %s", path)
+	}
+	return dirRoot.Remove(base)
+}
+
+func mkdirAllChown(dir string, perm os.FileMode) error {
+	return EnsureNoSymlinkDir(dir, perm)
 }
 
 // WriteFileAtomicNoSymlink atomically writes data to path while verifying no
@@ -989,11 +1065,13 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 		var mergedContainers []RawContainerInfo
 		summaryOnlyContainers := 0
 		runtimeSet := make(map[string]bool)
-		var compatCount uint32
+		var compatCount uint64
+		var mergedErrors ebpf.ErrorStats
 		mergedSyscalls := make(map[string]*RawSyscallEntry)
 
 		for _, s := range shards {
 			compatCount += s.Target.CompatSyscallCount
+			mergedErrors = mergedErrors.Add(s.KernelErrors)
 			for _, rt := range s.Target.DetectedRuntimes {
 				if rt != "" {
 					runtimeSet[rt] = true
@@ -1034,6 +1112,17 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 				}
 				entry.TotalCalls += meta.TotalCalls
 				entry.ContainersSeen += meta.ContainersSeen
+			}
+		}
+
+		// Mirror profile.Build clone3->clone fallback when clone3 is ENOSYS'd.
+		if c3Entry, hasClone3 := mergedSyscalls["clone3"]; hasClone3 && !hasSource(c3Entry.Sources, baseline.SourceExtraAllow) {
+			if _, hasClone := mergedSyscalls["clone"]; !hasClone {
+				if _, knownClone := syscalls.NumberByName(arch, "clone"); knownClone {
+					mergedSyscalls["clone"] = &RawSyscallEntry{
+						Sources: []string{"clone3-fallback"},
+					}
+				}
 			}
 		}
 
@@ -1124,7 +1213,8 @@ func MergeRawProfiles(raws []*RawProfileV1, generatedAt time.Time, generatorVers
 				CompatSyscallCount: compatCount,
 				Containers:         mergedContainers,
 			},
-			Syscalls: finalSyscalls,
+			KernelErrors: mergedErrors,
+			Syscalls:     finalSyscalls,
 		}
 		out = append(out, &BuiltProfile{
 			TargetName: tName,

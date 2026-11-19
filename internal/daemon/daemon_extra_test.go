@@ -246,7 +246,7 @@ func TestDaemonUpdatePrDistinctPathsTwoRunsAndSamePathHandEdit(t *testing.T) {
 	}
 
 	cid := "1111111111111111111111111111111111111111111111111111111111111111"
-	runOnce := func(sockName string, hits map[int]uint32) *daemon.StopResponse {
+	runOnce := func(sockName string, hits map[int]uint64) *daemon.StopResponse {
 		var st ebpf.CgroupStats
 		for nr, cnt := range hits {
 			st.Counts[nr] = cnt
@@ -286,8 +286,8 @@ func TestDaemonUpdatePrDistinctPathsTwoRunsAndSamePathHandEdit(t *testing.T) {
 		return resp
 	}
 
-	_ = runOnce("run1", map[int]uint32{0: 1})
-	resp2 := runOnce("run2", map[int]uint32{0: 1, 1: 2})
+	_ = runOnce("run1", map[int]uint64{0: 1})
+	resp2 := runOnce("run2", map[int]uint64{0: 1, 1: 2})
 	if !resp2.OK || !resp2.GatePassed {
 		t.Fatalf("run2 failed: %+v", resp2)
 	}

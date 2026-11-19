@@ -63,49 +63,59 @@ var highRiskSyscalls = map[string]string{
 	"modify_ldt":        "Architecture-specific x86 LDT modification",
 	"lsm_set_self_attr": "Linux Security Module self-attribute modification",
 	"fanotify_init":     "Kernel filesystem notification (host-wide file monitoring)",
+	"fanotify_mark":     "Kernel filesystem notification mark manipulation",
 	"lookup_dcookie":    "Kernel cookie lookup / tracing surface",
 	"move_pages":        "Cross-process page migration",
 	"migrate_pages":     "Cross-process page migration",
+	"mbind":             "Cross-NUMA memory policy manipulation",
+	"set_mempolicy":     "Process NUMA memory policy manipulation",
+	"memfd_secret":      "Unmapped kernel-secret memory creation",
+	"seccomp":           "Seccomp filter installation or user-notification registration",
+	"process_mrelease":  "Cross-process memory release",
+	"mknod":             "Special or device node creation",
+	"mknodat":           "Special or device node creation",
+	"chroot":            "Root directory change",
+	"fchroot":           "Root directory change via file descriptor",
 	"uselib":            "Legacy shared library loading (binary injection vector)",
 	"vhangup":           "Terminal hangup manipulation",
 }
 
 var mediumRiskSyscalls = map[string]string{
-	"socket":    "New network or IPC socket creation",
-	"connect":   "Outbound network or socket connection",
-	"bind":      "Network port or socket binding",
-	"listen":    "Listening for incoming connections",
-	"accept":    "Accepting incoming connections",
-	"accept4":   "Accepting incoming connections",
-	"execve":    "Executing new binary",
-	"execveat":  "Executing new binary via file descriptor",
-	"clone":     "Process or thread creation (namespace flags must stay arg-constrained)",
-	"clone3":    "Process or thread creation (namespace flags must stay arg-constrained)",
-	"fork":      "Child process creation",
-	"vfork":     "Child process creation",
-	"chown":     "File ownership modification",
-	"fchown":    "File ownership modification",
-	"fchownat":  "File ownership modification",
-	"lchown":    "Symlink ownership modification",
-	"chmod":     "File permission / setuid bit modification",
-	"fchmod":    "File permission / setuid bit modification",
-	"fchmodat":  "File permission / setuid bit modification",
-	"fchmodat2": "File permission / setuid bit modification",
-	"setuid":    "User identity change",
-	"setgid":    "Group identity change",
-	"setgroups": "Supplementary group identity change",
-	"setfsuid":  "Filesystem user identity change",
-	"setfsgid":  "Filesystem group identity change",
-	"setreuid":  "Real/effective user ID change",
-	"setregid":  "Real/effective group ID change",
-	"setresuid": "Real/effective/saved user ID change",
-	"setresgid": "Real/effective/saved group ID change",
-	"capset":    "Process capability modification",
-	"chroot":    "Root directory change",
-	"fchroot":   "Root directory change via file descriptor",
-	"mknod":     "Special or device node creation",
-	"mknodat":   "Special or device node creation",
-	"ioctl":     "Device-specific control operation",
+	"socket":     "New network or IPC socket creation",
+	"connect":    "Outbound network or socket connection",
+	"bind":       "Network port or socket binding",
+	"listen":     "Listening for incoming connections",
+	"accept":     "Accepting incoming connections",
+	"accept4":    "Accepting incoming connections",
+	"execve":     "Executing new binary",
+	"execveat":   "Executing new binary via file descriptor",
+	"clone":      "Process or thread creation (namespace flags must stay arg-constrained)",
+	"clone3":     "Process or thread creation (namespace flags cannot be arg-masked in BPF)",
+	"fork":       "Child process creation",
+	"vfork":      "Child process creation",
+	"chown":      "File ownership modification",
+	"fchown":     "File ownership modification",
+	"fchownat":   "File ownership modification",
+	"lchown":     "Symlink ownership modification",
+	"chmod":      "File permission / setuid bit modification",
+	"fchmod":     "File permission / setuid bit modification",
+	"fchmodat":   "File permission / setuid bit modification",
+	"fchmodat2":  "File permission / setuid bit modification",
+	"setuid":     "User identity change",
+	"setgid":     "Group identity change",
+	"setgroups":  "Supplementary group identity change",
+	"setfsuid":   "Filesystem user identity change",
+	"setfsgid":   "Filesystem group identity change",
+	"setreuid":   "Real/effective user ID change",
+	"setregid":   "Real/effective group ID change",
+	"setresuid":  "Real/effective/saved user ID change",
+	"setresgid":  "Real/effective/saved group ID change",
+	"capset":     "Process capability modification",
+	"ioctl":      "Device-specific control operation",
+	"pidfd_open": "Process file descriptor acquisition",
+	"prctl":      "Process control operation",
+	"statmount":  "Mount information query",
+	"listmount":  "Mount hierarchy enumeration",
 }
 
 // ClassifySyscall classifies a syscall by name only (assumes an unconditional
@@ -115,15 +125,18 @@ func ClassifySyscall(name string) (RiskLevel, string) {
 	return ClassifySyscallRule(name, false)
 }
 
-// ClassifySyscallRule classifies a syscall rule. clone/clone3 only match the
+// ClassifySyscallRule classifies a syscall rule. clone only matches the
 // medium tier when the allow rule is arg-constrained (CLONE_NEW* masked out);
-// an unconditional clone allow is equivalent to unshare and is high risk.
+// clone3 cannot be arg-masked by seccomp BPF so it is always high risk.
 func ClassifySyscallRule(name string, hasArgs bool) (RiskLevel, string) {
 	if reason, ok := highRiskSyscalls[name]; ok {
 		return RiskHigh, reason
 	}
+	if name == "clone3" {
+		return RiskHigh, "clone3 passes flags inside struct clone_args*; seccomp cannot mask CLONE_NEW* pointer args"
+	}
 	if reason, ok := mediumRiskSyscalls[name]; ok {
-		if (name == "clone" || name == "clone3") && !hasArgs {
+		if name == "clone" && !hasArgs {
 			return RiskHigh, "Unconditional clone allow enables namespace creation (equivalent to unshare); constrain with CLONE_NEW* arg mask"
 		}
 		return RiskMedium, reason

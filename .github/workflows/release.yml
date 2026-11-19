@@ -84,19 +84,22 @@ jobs:
           mkdir -p dist
 
           make bpf-amd64 CLANG=clang-18
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${TAG_NAME}" -o dist/seccomp-profiler-linux-amd64 ./cmd/seccomp-profiler
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${EXPECTED_VER}" -o dist/seccomp-profiler-linux-amd64 ./cmd/seccomp-profiler
 
           make bpf-arm64 CLANG=clang-18
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${TAG_NAME}" -o dist/seccomp-profiler-linux-arm64 ./cmd/seccomp-profiler
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags embed_bpf -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${EXPECTED_VER}" -o dist/seccomp-profiler-linux-arm64 ./cmd/seccomp-profiler
 
           cd dist
           sha256sum seccomp-profiler-linux-amd64 seccomp-profiler-linux-arm64 > checksums.txt
           cat checksums.txt
 
       - name: Sign binaries and checksums.txt with Sigstore Cosign (keyless OIDC)
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           cd dist
-          CERT_REGEX='^https://github\.com/alexno10/seccomp-profiler/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+          ESCAPED_TAG="${TAG_NAME//./\\.}"
+          CERT_REGEX="^https://github\\.com/alexno10/seccomp-profiler/\\.github/workflows/release\\.yml@refs/tags/${ESCAPED_TAG}$"
           OIDC_ISSUER='https://token.actions.githubusercontent.com'
 
           for artifact in seccomp-profiler-linux-amd64 seccomp-profiler-linux-arm64 checksums.txt; do

@@ -183,10 +183,11 @@ var langSyscalls = map[string][]string{
 
 func LayerSyscalls(mode Mode, runtimeName string) map[string][]string {
 	out := make(map[string][]string)
-	if mode == ModeMinimal || mode == ModeStandard {
+	m := Mode(strings.ToLower(strings.TrimSpace(string(mode))))
+	if m == ModeMinimal || m == ModeStandard {
 		out[SourceRuntime] = append([]string(nil), runtimeSyscalls...)
 	}
-	if mode == ModeStandard {
+	if m == ModeStandard {
 		out[SourceLifecycle] = append([]string(nil), lifecycleSyscalls...)
 	}
 	rt := strings.ToLower(strings.TrimSpace(runtimeName))
@@ -199,6 +200,10 @@ func LayerSyscalls(mode Mode, runtimeName string) map[string][]string {
 }
 
 func DetectRuntimes(executedBins []string, imageName string) []string {
+	return DetectRuntimesFromImages(executedBins, []string{imageName})
+}
+
+func DetectRuntimesFromImages(executedBins []string, images []string) []string {
 	seen := make(map[string]bool)
 	for _, b := range executedBins {
 		base := strings.ToLower(filepath.Base(strings.ReplaceAll(b, "\\", "/")))
@@ -213,16 +218,20 @@ func DetectRuntimes(executedBins []string, imageName string) []string {
 			seen["go"] = true
 		}
 	}
-	imgLower := strings.ToLower(imageName)
-	switch {
-	case strings.Contains(imgLower, "python"):
-		seen["python"] = true
-	case strings.Contains(imgLower, "node"):
-		seen["node"] = true
-	case strings.Contains(imgLower, "openjdk") || strings.Contains(imgLower, "temurin") || strings.Contains(imgLower, "java"):
-		seen["java"] = true
-	case strings.Contains(imgLower, "golang"):
-		seen["go"] = true
+	for _, imageName := range images {
+		imgLower := strings.ToLower(imageName)
+		if strings.Contains(imgLower, "python") {
+			seen["python"] = true
+		}
+		if strings.Contains(imgLower, "node") {
+			seen["node"] = true
+		}
+		if strings.Contains(imgLower, "openjdk") || strings.Contains(imgLower, "temurin") || strings.Contains(imgLower, "java") {
+			seen["java"] = true
+		}
+		if strings.Contains(imgLower, "golang") {
+			seen["go"] = true
+		}
 	}
 
 	var out []string

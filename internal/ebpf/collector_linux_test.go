@@ -89,3 +89,33 @@ func TestLinuxCollectorCloseWaitsForReadLoopExit(t *testing.T) {
 		t.Fatal("Events() channel should be closed after Close() returns")
 	}
 }
+
+func TestResolveBPFObjectPathRootExcludesCWD(t *testing.T) {
+	// Root (euid=0) must prefer executable-relative or system paths and never fall
+	// back to an untrusted CWD relative bpf/profiler.bpf.o.
+	cwdOnly := func(p string) bool {
+		return p == "bpf/profiler.bpf.o"
+	}
+	gotRoot := resolveBPFObjectPathWith("", "", "/usr/local/bin/seccomp-profiler", 0, cwdOnly)
+	if gotRoot == "bpf/profiler.bpf.o" {
+		t.Fatalf("root must not resolve untrusted CWD relative path, got %q", gotRoot)
+	}
+
+	// Sibling next to executable wins over system path.
+	both := func(p string) bool {
+		return p == "/usr/local/bin/profiler.bpf.o" || p == "/usr/local/share/seccomp-profiler/profiler.bpf.o" || p == "bpf/profiler.bpf.o"
+	}
+	if got := resolveBPFObjectPathWith("", "", "/usr/local/bin/seccomp-profiler", 0, both); got != "/usr/local/bin/profiler.bpf.o" {
+		t.Fatalf("expected executable sibling path, got %q", got)
+	}
+
+	// Non-root dev run may fall back to CWD bpf/profiler.bpf.o when no installed copy exists.
+	if gotNonRoot := resolveBPFObjectPathWith("", "", "/tmp/dev/seccomp-profiler", 1000, cwdOnly); gotNonRoot != "bpf/profiler.bpf.o" {
+		t.Fatalf("expected non-root CWD fallback, got %q", gotNonRoot)
+	}
+
+	// Explicit --bpf-obj always wins.
+	if gotExplicit := resolveBPFObjectPathWith("/custom/profiler.bpf.o", "/env/profiler.bpf.o", "/usr/local/bin/seccomp-profiler", 0, both); gotExplicit != "/custom/profiler.bpf.o" {
+		t.Fatalf("expected explicit override, got %q", gotExplicit)
+	}
+}

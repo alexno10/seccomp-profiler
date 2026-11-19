@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -367,5 +368,97 @@ func TestExecuteStop_DriftDetectedBeforeWriteTargetFilesAndUpdatePrSkipsOnGateFa
 	}
 	if _, statErr := os.Stat(filepath.Join(workComm2, "alpine.suggested.json")); !os.IsNotExist(statErr) {
 		t.Fatalf("did not expect SyncCommittedProfiles to write into WorkingCommitted when gate fails")
+	}
+}
+
+func TestDaemonUnixRefusesNonSocketStopCachesErrorAndHandleDockerEventOrdering(t *testing.T) {
+	tmp := t.TempDir()
+
+	// 1. I8: Non-Windows Unix listener refuses to unlink non-socket regular file.
+	if runtime.GOOS != "windows" {
+		nonSock := filepath.Join(tmp, "not-a-sock")
+		if err := os.WriteFile(nonSock, []byte("precious"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenControl("unix", nonSock); err == nil || !strings.Contains(err.Error(), "non-socket") {
+			t.Fatalf("expected listenControl to refuse non-socket file, got err=%v", err)
+		}
+		if data, _ := os.ReadFile(nonSock); string(data) != "precious" {
+			t.Fatalf("non-socket file was modified or removed: %q", data)
+		}
+	}
+
+	// 2. I10: executeStop error writes stoppedMarker and Stop() surfaces real error instead of EOF/conn-refused.
+	markerErr := filepath.Join(tmp, "stopped-err")
+	srvErr, err := NewServer(Config{
+		ControlAddr:       "tcp://127.0.0.1:0",
+		StoppedMarkerPath: markerErr,
+		OutputDir:         filepath.Join(tmp, "out-err"),
+		RawDir:            filepath.Join(tmp, "raw-err"),
+		LockFile:          filepath.Join(tmp, "lock-err.json"),
+		// Missing valid YAML syntax in AllowFile causes LoadApprovals error inside executeStop.
+		AllowFile: filepath.Join(tmp, "bad-accepted.yml"),
+	}, nil, docker.NewCorrelator(func(string) (uint64, error) { return 0, os.ErrNotExist }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "bad-accepted.yml"), []byte("unknown_top: 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctxErr, cancelErr := context.WithCancel(context.Background())
+	defer cancelErr()
+	if err := srvErr.Start(ctxErr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Stop(srvErr.Addr(), markerErr); err == nil || !strings.Contains(err.Error(), "load approvals") {
+		t.Fatalf("expected first Stop to return load approvals error, got %v", err)
+	}
+	_ = srvErr.Wait()
+	if _, secondErr := Stop(srvErr.Addr(), markerErr); secondErr == nil || !strings.Contains(secondErr.Error(), "load approvals") {
+		t.Fatalf("expected second Stop via stoppedMarker to surface real error, got %v", secondErr)
+	}
+
+	// 3. I19: HandleDockerEvent + SetBeforeCollectorClose runs before collector.Close().
+	mc := &testStopCollector{
+		eventsCh: make(chan ebpf.KernelEvent, 4),
+		stats:    map[uint64]ebpf.CgroupStats{},
+	}
+	corr := docker.NewCorrelator(func(string) (uint64, error) { return 0, os.ErrNotExist })
+	srv3, err := NewServer(Config{
+		ControlAddr: "tcp://127.0.0.1:0",
+		OutputDir:   filepath.Join(tmp, "out3"),
+		RawDir:      filepath.Join(tmp, "raw3"),
+		LockFile:    filepath.Join(tmp, "lock3.json"),
+		FailOn:      "none",
+	}, mc, corr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeClosedCalled := false
+	srv3.SetBeforeCollectorClose(func() {
+		beforeClosedCalled = true
+	})
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	defer cancel3()
+	if err := srv3.Start(ctx3); err != nil {
+		t.Fatal(err)
+	}
+	cid := strings.Repeat("b", 64)
+	corr.BindCgroup(9191, cid)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		srv3.HandleDockerEvent(docker.DockerEvent{Action: "start", ID: cid, Image: "alpine:3.20", TimeNano: 10})
+		srv3.HandleDockerEvent(docker.DockerEvent{Action: "die", ID: cid, TimeNano: 20})
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = Stop(srv3.Addr(), "")
+	}()
+	wg.Wait()
+	_ = srv3.Wait()
+	if !beforeClosedCalled {
+		t.Fatal("expected SetBeforeCollectorClose hook to execute during shutdown")
 	}
 }

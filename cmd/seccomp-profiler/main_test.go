@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alexno10/seccomp-profiler/internal/baseline"
+	"github.com/alexno10/seccomp-profiler/internal/daemon"
 	"github.com/alexno10/seccomp-profiler/internal/docker"
 	"github.com/alexno10/seccomp-profiler/internal/ebpf"
 	"github.com/alexno10/seccomp-profiler/internal/profile"
@@ -168,34 +170,62 @@ func (f *fakeCollector) wasDeleted(cgID uint64) bool {
 }
 
 func TestDieBeforeKernelCgroupMkdirReclaimsBPFMap(t *testing.T) {
+	tmp := t.TempDir()
 	cid := strings.Repeat("f", 64)
 	corr := docker.NewCorrelator(func(string) (uint64, error) { return 0, os.ErrNotExist })
 
 	var st ebpf.CgroupStats
 	st.Counts[0] = 5
+	evCh := make(chan ebpf.KernelEvent, 4)
 	fc := &fakeCollector{stats: map[uint64]ebpf.CgroupStats{42: st}}
 
+	srv, err := daemon.NewServer(daemon.Config{
+		ControlAddr:  "tcp://127.0.0.1:0",
+		OutputDir:    filepath.Join(tmp, "out"),
+		RawDir:       filepath.Join(tmp, "raw"),
+		LockFile:     filepath.Join(tmp, "lock.json"),
+		BaselineMode: baseline.ModeNone,
+		RuntimeMode:  "none",
+		FailOn:       "none",
+	}, &chanCollector{fakeCollector: fc, ch: evCh}, corr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = srv.Wait()
+	}()
+
 	// Container exits (<100ms) and docker "die" arrives before ringbuf delivers EVENT_CGROUP_MKDIR.
-	handleDockerContainerEvent(docker.DockerEvent{
+	srv.HandleDockerEvent(docker.DockerEvent{
 		Action:   "start",
 		ID:       cid,
 		Image:    "alpine:3.20",
 		Name:     "short",
 		TimeNano: 100,
-	}, corr, fc)
-	handleDockerContainerEvent(docker.DockerEvent{
+	})
+	srv.HandleDockerEvent(docker.DockerEvent{
 		Action:   "die",
 		ID:       cid,
 		TimeNano: 200,
-	}, corr, fc)
+	})
 
-	// Delayed ringbuf event arrives afterwards.
-	handleKernelCollectorEvent(ebpf.KernelEvent{
+	// Delayed ringbuf event arrives afterwards and flows through Server's event loop.
+	evCh <- ebpf.KernelEvent{
 		Type:       ebpf.EventCgroupMkdir,
 		CgroupID:   42,
 		CgroupPath: "/docker/" + cid,
-	}, corr, fc)
+	}
 
+	deadline := time.Now().Add(time.Second)
+	for !fc.wasDeleted(42) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if !fc.wasDeleted(42) {
 		t.Fatal("expected cgroup 42 to be flushed and deleted from BPF maps when delayed EventCgroupMkdir arrives after die")
 	}
@@ -203,5 +233,47 @@ func TestDieBeforeKernelCgroupMkdirReclaimsBPFMap(t *testing.T) {
 	records := corr.BuildRecords(liveStats)
 	if len(records) != 1 || records[0].SyscallHits[0] != 5 {
 		t.Fatalf("expected flushed stats preserved in BuildRecords after reclaim, got %+v", records)
+	}
+}
+
+type chanCollector struct {
+	*fakeCollector
+	ch chan ebpf.KernelEvent
+}
+
+func (c *chanCollector) Events() <-chan ebpf.KernelEvent { return c.ch }
+
+func TestRunMerge_FailsClosedOnKernelErrorsAndWorkingAllowDrift(t *testing.T) {
+	tmp := t.TempDir()
+	shardDir := filepath.Join(tmp, "shards")
+	outDir := filepath.Join(tmp, "out")
+	rawDir := filepath.Join(tmp, "raw")
+	baseAllow := filepath.Join(tmp, "base-accepted.yml")
+	workAllow := filepath.Join(tmp, "work-accepted.yml")
+	_ = os.MkdirAll(shardDir, 0o755)
+	_ = os.WriteFile(baseAllow, []byte("version: 1\naccepted: []\n"), 0o644)
+	_ = os.WriteFile(workAllow, []byte("version: 1\naccepted:\n  - target: api\n    syscall: ptrace\n    reason: \"pr added\"\n"), 0o644)
+
+	shard := profile.RawProfileV1{
+		SchemaVersion: "v1",
+		Host:          profile.RawHostInfo{Arch: "amd64", SeccompArch: "SCMP_ARCH_X86_64"},
+		Target:        profile.RawTargetInfo{Name: "api", GroupBy: "image", ContainerCount: 1},
+		KernelErrors:  ebpf.ErrorStats{RingbufDrops: 2},
+		Syscalls:      map[string]profile.RawSyscallEntry{"read": {Sources: []string{"observed"}, TotalCalls: 1, ContainersSeen: 1}},
+	}
+	b, _ := json.Marshal(shard)
+	_ = os.WriteFile(filepath.Join(shardDir, "api.profile.v1.json"), b, 0o644)
+
+	err := runMerge([]string{
+		"--input-dir", shardDir,
+		"--output-dir", outDir,
+		"--raw-dir", rawDir,
+		"--lock-file", filepath.Join(tmp, "lock.json"),
+		"--allow-file", baseAllow,
+		"--working-allow-file", workAllow,
+		"--fail-on", "high-risk",
+	})
+	if err == nil || !strings.Contains(err.Error(), "kernel error counters non-zero") {
+		t.Fatalf("expected runMerge to fail closed when shards carry KernelErrors, got err=%v", err)
 	}
 }

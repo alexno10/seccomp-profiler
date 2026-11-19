@@ -38,12 +38,45 @@ const PINNED_BINARY_SHA256 = Object.freeze({
   arm64: "5da3813ecb4374acd02cef045098181c24fe4ab5daf49efa85aab79e4ec79bba",
 });
 
-const COSIGN_CERT_IDENTITY_REGEXP =
-  "^https://github\\.com/alexno10/seccomp-profiler/\\.github/workflows/release\\.yml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$";
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const COSIGN_CERT_IDENTITY_REGEXP = `^https://github\\.com/${escapeRegex(
+  PINNED_RELEASE_REPO
+)}/\\.github/workflows/release\\.yml@refs/tags/${escapeRegex(PINNED_RELEASE_VERSION)}$`;
 const COSIGN_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 
 const SAFE_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const TRUSTED_PATH_DIR_RE = /^\/(?:usr\/(?:local\/)?(?:sbin|bin)|sbin|bin)$/;
+
+const COSIGN_ENV_ALLOWLIST = Object.freeze([
+  "PATH",
+  "HOME",
+  "TMPDIR",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "NO_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "TUF_ROOT",
+]);
+
+function buildCosignEnv(baseEnv = process.env) {
+  const env = {};
+  for (const key of COSIGN_ENV_ALLOWLIST) {
+    if (baseEnv[key] !== undefined) {
+      env[key] = key === "PATH" ? sanitizePath(baseEnv[key]) : baseEnv[key];
+    }
+  }
+  if (env.PATH === undefined) {
+    env.PATH = SAFE_SYSTEM_PATH;
+  }
+  return env;
+}
 
 const DAEMON_ENV_ALLOWLIST = Object.freeze([
   "PATH",
@@ -82,7 +115,8 @@ function getInput(name, fallback = "") {
   const hyphenKey = "INPUT_" + upper;
   const underscoreKey = "INPUT_" + upper.replace(/-/g, "_");
   const val = process.env[hyphenKey] !== undefined ? process.env[hyphenKey] : process.env[underscoreKey];
-  return val !== undefined && val !== "" ? val.trim() : fallback;
+  const trimmed = typeof val === "string" ? val.trim() : "";
+  return trimmed !== "" ? trimmed : fallback;
 }
 
 function validateAbsoluteFilePath(p, label) {
@@ -100,13 +134,6 @@ function getSocketPath(env = process.env) {
 function getStoppedMarker(env = process.env) {
   const raw = env.STATE_STARTED_STOPPED_MARKER || env.SECCOMP_PROFILER_STOPPED_MARKER || DEFAULT_STOPPED_MARKER;
   return validateAbsoluteFilePath(raw, "SECCOMP_PROFILER_STOPPED_MARKER");
-}
-
-function resolveBpfObjPath() {
-  if (process.env.SECCOMP_PROFILER_BPF_OBJ) {
-    return validateAbsoluteFilePath(process.env.SECCOMP_PROFILER_BPF_OBJ, "SECCOMP_PROFILER_BPF_OBJ");
-  }
-  return path.resolve(__dirname, "..", "bpf", "profiler.bpf.o");
 }
 
 function appendCommandFile(filePath, key, value) {
@@ -313,7 +340,7 @@ function verifyCosignSignature(
       oidcIssuer,
       filePath,
     ],
-    { stdio: "inherit" }
+    { stdio: "inherit", env: buildCosignEnv() }
   );
 }
 
@@ -537,11 +564,34 @@ function validateGitRef(ref) {
 function resolveBaselineRef(env = process.env, explicit = getInput("baseline-ref", "")) {
   const eventName = env.GITHUB_EVENT_NAME || "";
   const baseRef = env.GITHUB_BASE_REF || "";
-  if (explicit && explicit.toLowerCase() !== "none") {
-    return validateGitRef(explicit);
+  const trimmedExplicit = typeof explicit === "string" ? explicit.trim() : "";
+  if (trimmedExplicit) {
+    if (trimmedExplicit.toLowerCase() === "none") {
+      return "";
+    }
+    return validateGitRef(trimmedExplicit);
   }
-  if ((eventName === "pull_request" || eventName === "pull_request_target" || eventName === "merge_group") && baseRef) {
+  if ((eventName === "pull_request" || eventName === "pull_request_target") && baseRef) {
     return validateGitRef(baseRef);
+  }
+  if (eventName === "merge_group") {
+    if (baseRef) {
+      return validateGitRef(baseRef);
+    }
+    if (env.GITHUB_EVENT_PATH) {
+      let payload;
+      try {
+        payload = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, "utf8"));
+      } catch (err) {
+        throw new Error(`Failed to read GITHUB_EVENT_PATH for merge_group baseline ref: ${err.message}`);
+      }
+      const mg = payload && payload.merge_group;
+      const rawRef = (mg && (mg.base_ref || mg.base_sha)) || "";
+      const stripped = typeof rawRef === "string" ? rawRef.trim().replace(/^refs\/heads\//, "") : "";
+      if (stripped) {
+        return validateGitRef(stripped);
+      }
+    }
   }
   return "";
 }
@@ -771,7 +821,7 @@ module.exports = {
   resolveStopConfig,
   resolveInBaseline,
   getInput,
-  resolveBpfObjPath,
+  buildCosignEnv,
   buildDaemonEnv,
   sudoArgv,
   validateGitRef,

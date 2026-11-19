@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alexno10/seccomp-profiler/internal/ebpf"
 )
 
 func TestExtractContainerID_DinDNestedPaths(t *testing.T) {
@@ -268,5 +272,77 @@ func TestScanRunningContainers_ToleratesVanishedContainerInBatch(t *testing.T) {
 	}
 	if len(evs) != 1 || evs[0].ID != cid1 {
 		t.Fatalf("expected 1 running event for %s, got %+v", cid1, evs)
+	}
+}
+
+func TestStaleDieReplayAndDeadStatsCoalesceAndBinsCap(t *testing.T) {
+	cid := strings.Repeat("c", 64)
+	corr := NewCorrelator(func(string) (uint64, error) { return 0, os.ErrNotExist })
+
+	// 1. Stale die replay before restarted startNano must NOT mark container dead.
+	corr.RecordDockerEvent(DockerEvent{Action: "start", ID: cid, Image: "alpine:3.20", TimeNano: 2000})
+	corr.RecordDockerEvent(DockerEvent{Action: "die", ID: cid, TimeNano: 1000})
+	if corr.IsContainerDead(cid) {
+		t.Fatal("stale replayed die event (timeNano < startNano) must not mark restarted container dead")
+	}
+
+	// 2. Empty live map entry must not clobber deadStats snapshot.
+	corr.BindCgroup(5001, cid)
+	var dead ebpf.CgroupStats
+	dead.Counts[0] = 17
+	dead.CompatCount = 3
+	corr.RecordDeadStats(5001, dead)
+	recs := corr.BuildRecords(map[uint64]ebpf.CgroupStats{5001: {}})
+	if len(recs) != 1 || recs[0].SyscallHits[0] != 17 || recs[0].CompatHits != 3 {
+		t.Fatalf("expected empty live entry not to clobber deadStats, got %+v", recs)
+	}
+
+	// 3. cgroupBins must deduplicate and cap at maxBinsPerCgroup (256).
+	for i := 0; i < 400; i++ {
+		corr.RecordKernelEvent(ebpf.KernelEvent{
+			Type:         ebpf.EventExec,
+			CgroupID:     5001,
+			ExecFilename: "/bin/tool-" + string(rune('a'+(i%26))) + "-" + string(rune('a'+((i/26)%26))),
+		})
+	}
+	recsCap := corr.BuildRecords(map[uint64]ebpf.CgroupStats{5001: {}})
+	if len(recsCap[0].ExecutedBins) > maxBinsPerCgroup {
+		t.Fatalf("expected executed bins capped at %d, got %d", maxBinsPerCgroup, len(recsCap[0].ExecutedBins))
+	}
+}
+
+func TestAsyncResolverDoesNotBlockRecordDockerEventAndExitErrorStderr(t *testing.T) {
+	cid := strings.Repeat("9", 64)
+	release := make(chan struct{})
+	corr := NewCorrelator(func(id string) (uint64, error) {
+		<-release
+		return 8844, nil
+	})
+	done := make(chan struct{})
+	go func() {
+		corr.RecordDockerEvent(DockerEvent{Action: "start", ID: cid, Image: "alpine:3.20", TimeNano: 10})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("RecordDockerEvent blocked on slow InodeResolver")
+	}
+	close(release)
+	corr.WaitResolutions(time.Second)
+	if cgs := corr.CgroupsForContainer(cid); len(cgs) != 1 || cgs[0] != 8844 {
+		t.Fatalf("expected async resolver to bind 8844, got %v", cgs)
+	}
+
+	// I13: Real *exec.ExitError carries "No such object" in Stderr while Error() is "exit status 1".
+	cmd := exec.Command("go", "version")
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/c", "echo Error: No such object: deadbeef 1>&2 && exit 1")
+	} else {
+		cmd = exec.Command("sh", "-c", "echo 'Error: No such object: deadbeef' >&2; exit 1")
+	}
+	_, err := cmd.Output()
+	if err == nil || !isContainerNotFoundErr(err) {
+		t.Fatalf("expected isContainerNotFoundErr to inspect ExitError.Stderr, got err=%v", err)
 	}
 }

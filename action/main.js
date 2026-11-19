@@ -23,6 +23,10 @@ async function startDaemon(binPath, baselineDir) {
     stdio: ["ignore", logFd, logFd],
     env: daemonEnv,
   });
+  let childExited = null;
+  child.on("exit", (code, signal) => {
+    childExited = { code, signal };
+  });
   child.unref();
   fs.closeSync(logFd);
 
@@ -35,6 +39,18 @@ async function startDaemon(binPath, baselineDir) {
       console.log("seccomp-profiler daemon is ready and tracing containers.");
       return logDir;
     } catch (_) {
+      if (childExited) {
+        let earlyLogs = "";
+        try {
+          earlyLogs = fs.readFileSync(logPath, "utf8");
+        } catch (_) {}
+        try {
+          fs.rmSync(logDir, { recursive: true, force: true });
+        } catch (_) {}
+        throw new Error(
+          `seccomp-profiler daemon exited early (code=${childExited.code}, signal=${childExited.signal}) before readiness on ${socketPath}.\nDaemon log:\n${earlyLogs}`
+        );
+      }
       await sleep(100);
     }
   }
@@ -75,6 +91,7 @@ async function run() {
     }
     try {
       await startDaemon(binPath, baselineDir);
+      lib.saveState("STARTED_READY", "true");
     } catch (err) {
       lib.removeRootSessionState();
       lib.cleanupBaselineCheckout(baselineDir);
@@ -105,7 +122,7 @@ module.exports = {
   verifyPinnedSha256: lib.verifyPinnedSha256,
   verifyCosignSignature: lib.verifyCosignSignature,
   getInput: lib.getInput,
-  resolveBpfObjPath: lib.resolveBpfObjPath,
+  buildCosignEnv: lib.buildCosignEnv,
   buildDaemonEnv: lib.buildDaemonEnv,
   sudoArgv: lib.sudoArgv,
   prepareBaselineCheckout: lib.prepareBaselineCheckout,

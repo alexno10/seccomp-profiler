@@ -11,7 +11,7 @@ func makeRec(id, image string, labels map[string]string) selector.ContainerRecor
 		ID:          id,
 		Image:       image,
 		Labels:      labels,
-		SyscallHits: map[int]uint32{0: 1},
+		SyscallHits: map[int]uint64{0: 1},
 	}
 }
 
@@ -143,5 +143,58 @@ func TestMatchRules_MissingLabelDoesNotMatchEmptyValue(t *testing.T) {
 	}
 	if len(skipped) != 1 || skipped[0].ID != "1" || skipped[0].Reason != "unmatched-selector" {
 		t.Fatalf("expected container missing label to be unmatched-selector, got %+v", skipped)
+	}
+}
+
+func TestExtraExcludesOverrideRulesCaseInsensitiveGroupByAndContainerImageName(t *testing.T) {
+	// I14: ExtraExcludes must exclude matching images even when explicit Rules match them.
+	cfg := selector.Config{
+		Rules:         []selector.TargetRule{{Name: "any", ImageGlob: "*"}},
+		ExtraExcludes: []string{"myorg/secret:*"},
+	}
+	_, skipped := selector.Evaluate(cfg, []selector.ContainerRecord{
+		makeRec("c1", "myorg/secret:v1", nil),
+	})
+	if len(skipped) != 1 || skipped[0].Reason != "excluded-user" {
+		t.Fatalf("expected ExtraExcludes to override Rules with excluded-user, got %+v", skipped)
+	}
+
+	// I14 + M3: Case-insensitive GroupBy ("IMAGE", "LABEL:...") and real image named "container".
+	targets, _ := selector.Evaluate(selector.Config{GroupBy: "LABEL:App"}, []selector.ContainerRecord{
+		makeRec("abcdef1234567890", "myorg/container:v1", map[string]string{"App": "web"}),
+	})
+	if len(targets) != 1 || targets[0].Name != "web" {
+		t.Fatalf("expected case-insensitive LABEL:App to resolve web, got %+v", targets)
+	}
+	targetsImg, _ := selector.Evaluate(selector.Config{GroupBy: "IMAGE"}, []selector.ContainerRecord{
+		makeRec("abcdef1234567890", "myorg/container:v1", nil),
+	})
+	if len(targetsImg) != 1 || targetsImg[0].Name != "container" {
+		t.Fatalf("expected myorg/container:v1 target name to remain \"container\", got %+v", targetsImg)
+	}
+}
+
+func TestParseTargetsInput_DashIndentQuotedKeysAndCommentEscapes(t *testing.T) {
+	yamlWithSpacedDash := `
+-   labels:
+      "app.kubernetes.io/name": web
+    image: "foo\\" # real inline comment
+    name: web-app
+`
+	rules, err := selector.ParseTargetsInputWithErr(yamlWithSpacedDash)
+	if err != nil {
+		t.Fatalf("expected spaced dash YAML with quoted key and trailing backslash string to parse, got %v", err)
+	}
+	if len(rules) != 1 || rules[0].Name != "web-app" || rules[0].ImageGlob != `foo\\` || rules[0].Labels["app.kubernetes.io/name"] != "web" {
+		t.Fatalf("unexpected parsed rule: %+v", rules)
+	}
+
+	shorthandWithHash := `image:"myorg/api:*" labels:note="a # b",env='c # d' -> api # end`
+	rulesShort, err := selector.ParseTargetsInputWithErr(shorthandWithHash)
+	if err != nil {
+		t.Fatalf("expected shorthand with # inside quoted label to parse, got %v", err)
+	}
+	if len(rulesShort) != 1 || rulesShort[0].Labels["note"] != "a # b" || rulesShort[0].Labels["env"] != "c # d" {
+		t.Fatalf("unexpected shorthand parsed rule: %+v", rulesShort)
 	}
 }

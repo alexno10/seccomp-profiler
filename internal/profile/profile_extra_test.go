@@ -15,7 +15,7 @@ import (
 	"github.com/alexno10/seccomp-profiler/internal/syscalls"
 )
 
-func buildTarget(t *testing.T, hits map[int]uint32, extra []string, arch syscalls.Arch) *profile.BuiltProfile {
+func buildTarget(t *testing.T, hits map[int]uint64, extra []string, arch syscalls.Arch) *profile.BuiltProfile {
 	t.Helper()
 	target := selector.MatchedTarget{
 		Name:                 "api",
@@ -54,7 +54,7 @@ func findRule(r profile.OCISeccompProfile, name string) *profile.OCISyscallRule 
 // Docker's default profile) and clone3 answers ENOSYS so libcs fall back.
 func TestBuildConstrainsCloneNamespaceCreation(t *testing.T) {
 	// amd64: clone=56, clone3=435
-	built := buildTarget(t, map[int]uint32{56: 10, 435: 5}, nil, syscalls.ArchAMD64)
+	built := buildTarget(t, map[int]uint64{56: 10, 435: 5}, nil, syscalls.ArchAMD64)
 
 	if built.OCI.DefaultErrnoRet == nil || *built.OCI.DefaultErrnoRet != 38 {
 		t.Fatalf("expected defaultErrnoRet=38 (ENOSYS), got %+v", built.OCI.DefaultErrnoRet)
@@ -81,7 +81,7 @@ func TestBuildConstrainsCloneNamespaceCreation(t *testing.T) {
 // Explicit extra-allow wins: the user consciously asked for an unconditional
 // clone allow.
 func TestBuildExtraAllowUnconditionalClone(t *testing.T) {
-	built := buildTarget(t, map[int]uint32{56: 10}, []string{"clone"}, syscalls.ArchAMD64)
+	built := buildTarget(t, map[int]uint64{56: 10}, []string{"clone"}, syscalls.ArchAMD64)
 	rule := findRule(built.OCI, "clone")
 	if rule == nil || len(rule.Args) != 0 {
 		t.Fatalf("expected extra-allowed clone to stay unconditional, got %+v", rule)
@@ -251,7 +251,7 @@ func TestMergeCommittedIntoOCIDoesNotTreatEmptyActionAsAllow(t *testing.T) {
 
 func TestUpdateCommittedProfilesLockProtectionAndMultiTarget(t *testing.T) {
 	tmp := t.TempDir()
-	built := buildTarget(t, map[int]uint32{0: 1}, nil, syscalls.ArchAMD64)
+	built := buildTarget(t, map[int]uint64{0: 1}, nil, syscalls.ArchAMD64)
 	handwritten := []byte("{\n  \"defaultAction\": \"SCMP_ACT_ERRNO\",\n  \"comment\": \"manual edit\"\n}\n")
 
 	// 1. Missing lock.json must protect existing profile and write .suggested.json instead.
@@ -314,7 +314,7 @@ func TestUpdateCommittedProfilesLockProtectionAndMultiTarget(t *testing.T) {
 
 	// 4. Multi-target parity with diff.ResolveCommittedProfilePath when pattern ends in .json without {name}.
 	multiDir := filepath.Join(tmp, "multi")
-	worker := buildTarget(t, map[int]uint32{1: 1}, nil, syscalls.ArchAMD64)
+	worker := buildTarget(t, map[int]uint64{1: 1}, nil, syscalls.ArchAMD64)
 	worker.TargetName = "worker"
 	worker.Raw.Target.Name = "worker"
 	if _, err := profile.UpdateCommittedProfiles(filepath.Join(multiDir, "profile.json"), filepath.Join(tmp, "multi-lock.json"), []*profile.BuiltProfile{built, worker}); err != nil {
@@ -333,7 +333,7 @@ func TestBuildFailsClosedOnUnknownObservedSyscallNumber(t *testing.T) {
 		Name:                 "api",
 		GroupBy:              "image",
 		Containers:           []selector.ContainerRecord{{ID: "c1", Image: "myorg/api:v1"}},
-		MergedHits:           map[int]uint32{511: 2},
+		MergedHits:           map[int]uint64{511: 2},
 		ContainersPerSyscall: map[int]int{511: 1},
 	}
 	if _, err := profile.Build(target, profile.BuildOptions{

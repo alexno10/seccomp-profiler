@@ -30,7 +30,7 @@ func TestFindApproval_ExactTargetBeatsWildcardRegardlessOfOrder(t *testing.T) {
 		{Target: "*", Syscall: "clone3", Reason: "wildcard", Expires: "2020-01-01"},
 		{Target: "api", Syscall: "clone3", Reason: "exact", Expires: "2099-01-01"},
 	}
-	got, ok := findApproval(approvals, "api", "clone3")
+	got, ok := findApproval(approvals, "api", "clone3", "add")
 	if !ok || got.Reason != "exact" {
 		t.Fatalf("expected exact match to beat earlier wildcard, got ok=%v entry=%+v", ok, got)
 	}

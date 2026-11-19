@@ -19,6 +19,7 @@ type ApprovalEntry struct {
 	Syscall string `json:"syscall" yaml:"syscall"`
 	Reason  string `json:"reason" yaml:"reason"`
 	Expires string `json:"expires" yaml:"expires"`
+	Scope   string `json:"scope,omitempty" yaml:"scope,omitempty"`
 }
 
 type approvalsFile struct {
@@ -31,6 +32,7 @@ var knownApprovalKeys = map[string]bool{
 	"syscall": true,
 	"reason":  true,
 	"expires": true,
+	"scope":   true,
 }
 
 // shortcut: parses the flat accepted.yml list without external yaml
@@ -146,7 +148,7 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 			return nil, fmt.Errorf("accepted.yml line %d: invalid key-value pair %q", lineNo, line)
 		}
 		if !knownApprovalKeys[k] {
-			return nil, fmt.Errorf("accepted.yml line %d: unknown key %q (allowed: target, syscall, reason, expires)", lineNo, k)
+			return nil, fmt.Errorf("accepted.yml line %d: unknown key %q (allowed: target, syscall, reason, expires, scope)", lineNo, k)
 		}
 		if seenKeys[k] {
 			return nil, fmt.Errorf("accepted.yml line %d: duplicate key %q in one entry", lineNo, k)
@@ -161,6 +163,8 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 			cur.Reason = v
 		case "expires":
 			cur.Expires = v
+		case "scope":
+			cur.Scope = v
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -176,25 +180,43 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 }
 
 func validateApprovalEntries(entries []ApprovalEntry) error {
-	seen := make(map[[2]string]bool, len(entries))
+	seen := make(map[[3]string]bool, len(entries))
 	for i, e := range entries {
 		t := strings.TrimSpace(e.Target)
 		s := strings.TrimSpace(e.Syscall)
+		r := strings.TrimSpace(e.Reason)
+		exp := strings.TrimSpace(e.Expires)
+		sc := strings.ToLower(strings.TrimSpace(e.Scope))
 		if t == "" || s == "" {
 			return fmt.Errorf("accepted.yml entry %d: must specify both target and syscall", i+1)
 		}
-		if exp := strings.TrimSpace(e.Expires); exp != "" {
+		switch sc {
+		case "", "add", "escalate", "args-change", "all":
+		default:
+			return fmt.Errorf("accepted.yml entry %d (%s/%s): invalid scope %q (allowed: add, escalate, args-change, all)", i+1, t, s, sc)
+		}
+		if exp != "" {
 			if _, err := time.Parse("2006-01-02", exp); err != nil {
 				if _, err := time.Parse(time.RFC3339, exp); err != nil {
 					return fmt.Errorf("accepted.yml entry %d (%s/%s): invalid expires %q (expected YYYY-MM-DD or RFC3339)", i+1, t, s, exp)
 				}
 			}
 		}
-		pair := [2]string{t, s}
-		if seen[pair] {
-			return fmt.Errorf("accepted.yml: duplicate approval entry for target=%q syscall=%q", t, s)
+		scopeKey := sc
+		if scopeKey == "" {
+			scopeKey = "add"
 		}
-		seen[pair] = true
+		triple := [3]string{t, s, scopeKey}
+		if seen[triple] {
+			return fmt.Errorf("accepted.yml: duplicate approval entry for target=%q syscall=%q scope=%q", t, s, scopeKey)
+		}
+		seen[triple] = true
+
+		entries[i].Target = t
+		entries[i].Syscall = s
+		entries[i].Reason = r
+		entries[i].Expires = exp
+		entries[i].Scope = sc
 	}
 	return nil
 }

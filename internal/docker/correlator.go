@@ -22,6 +22,7 @@ import (
 )
 
 const dockerInspectTimeout = 2 * time.Second
+const maxBinsPerCgroup = 256
 
 // ephemeralEventAttrs are Docker event Actor attributes that describe the
 // event rather than the container (exitCode, execID, ...). They must not leak
@@ -58,13 +59,16 @@ type containerMeta struct {
 }
 
 type Correlator struct {
-	mu           sync.Mutex
-	resolver     InodeResolver
-	containers   map[string]*containerMeta
-	cgroupToCID  map[uint64]string
-	cidToCgroups map[string][]uint64
-	cgroupBins   map[uint64][]string
-	deadStats    map[uint64]ebpf.CgroupStats
+	mu              sync.Mutex
+	resolver        InodeResolver
+	containers      map[string]*containerMeta
+	cgroupToCID     map[uint64]string
+	cidToCgroups    map[string][]uint64
+	cgroupBins      map[uint64][]string
+	deadStats       map[uint64]ebpf.CgroupStats
+	resolveSem      chan struct{}
+	resolveInFlight map[string]bool
+	resolveWg       sync.WaitGroup
 }
 
 func NewCorrelator(resolver InodeResolver) *Correlator {
@@ -72,12 +76,14 @@ func NewCorrelator(resolver InodeResolver) *Correlator {
 		resolver = DefaultResolveContainerCgroupInode
 	}
 	return &Correlator{
-		resolver:     resolver,
-		containers:   make(map[string]*containerMeta),
-		cgroupToCID:  make(map[uint64]string),
-		cidToCgroups: make(map[string][]uint64),
-		cgroupBins:   make(map[uint64][]string),
-		deadStats:    make(map[uint64]ebpf.CgroupStats),
+		resolver:        resolver,
+		containers:      make(map[string]*containerMeta),
+		cgroupToCID:     make(map[uint64]string),
+		cidToCgroups:    make(map[string][]uint64),
+		cgroupBins:      make(map[uint64][]string),
+		deadStats:       make(map[uint64]ebpf.CgroupStats),
+		resolveSem:      make(chan struct{}, 4),
+		resolveInFlight: make(map[string]bool),
 	}
 }
 
@@ -160,24 +166,72 @@ func (c *Correlator) RecordDockerEvent(ev DockerEvent) {
 			meta.endNano = 0
 			meta.dead = false
 		}
-		if len(c.cidToCgroups[ev.ID]) == 0 {
-			resolveID = ev.ID
+		if len(c.cidToCgroups[ev.ID]) == 0 && c.resolver != nil {
+			if c.resolveInFlight == nil {
+				c.resolveInFlight = make(map[string]bool)
+			}
+			if !c.resolveInFlight[ev.ID] {
+				c.resolveInFlight[ev.ID] = true
+				resolveID = ev.ID
+			}
 		}
 	case "die", "stop", "destroy":
+		// Ignore stale replayed die/stop events whose timestamp precedes the
+		// container's current start timestamp (e.g., --since rounded on reconnect).
+		if ev.TimeNano > 0 && meta.startNano > 0 && ev.TimeNano < meta.startNano {
+			break
+		}
 		if ev.Action == "die" || ev.Action == "destroy" {
 			meta.dead = true
 		}
-		if ev.TimeNano > 0 && meta.endNano == 0 {
+		if ev.TimeNano > 0 && (meta.endNano == 0 || ev.TimeNano > meta.endNano) {
 			meta.endNano = ev.TimeNano
 		}
 	}
 	c.mu.Unlock()
 
 	if resolveID != "" && c.resolver != nil {
-		if ino, err := c.resolver(resolveID); err == nil && ino != 0 {
-			c.BindCgroup(ino, resolveID)
-		}
+		c.resolveWg.Add(1)
+		go func(id string) {
+			defer c.resolveWg.Done()
+			if c.resolveSem != nil {
+				c.resolveSem <- struct{}{}
+				defer func() { <-c.resolveSem }()
+			}
+			if ino, err := c.resolver(id); err == nil && ino != 0 {
+				c.BindCgroup(ino, id)
+			}
+			c.mu.Lock()
+			delete(c.resolveInFlight, id)
+			c.mu.Unlock()
+		}(resolveID)
 	}
+}
+
+// WaitResolutions waits up to timeout for any asynchronous cgroup inode
+// resolutions spawned by RecordDockerEvent to complete.
+func (c *Correlator) WaitResolutions(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		c.resolveWg.Wait()
+		close(done)
+	}()
+	if timeout <= 0 {
+		<-done
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
+// IsContainerDead reports whether cid has emitted a current die or destroy event.
+func (c *Correlator) IsContainerDead(cid string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	meta := c.containers[cid]
+	return meta != nil && meta.dead
 }
 
 // IsCgroupContainerDead reports whether cgID is bound to a container that has
@@ -237,15 +291,6 @@ func (c *Correlator) RecordDeadStats(cgroupID uint64, stats ebpf.CgroupStats) {
 	c.deadStats[cgroupID] = stats
 }
 
-// DrainDeadStats returns and clears all accumulated dead-cgroup stats.
-func (c *Correlator) DrainDeadStats() map[uint64]ebpf.CgroupStats {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := c.deadStats
-	c.deadStats = make(map[uint64]ebpf.CgroupStats)
-	return out
-}
-
 func (c *Correlator) RecordKernelEvent(ev ebpf.KernelEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -257,8 +302,33 @@ func (c *Correlator) RecordKernelEvent(ev ebpf.KernelEvent) {
 		}
 	}
 	if ev.ExecFilename != "" {
-		c.cgroupBins[ev.CgroupID] = append(c.cgroupBins[ev.CgroupID], ev.ExecFilename)
+		bins := c.cgroupBins[ev.CgroupID]
+		if len(bins) < maxBinsPerCgroup {
+			dup := false
+			for _, existing := range bins {
+				if existing == ev.ExecFilename {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				c.cgroupBins[ev.CgroupID] = append(bins, ev.ExecFilename)
+			}
+		}
 	}
+}
+
+func coalesceCgroupStats(a, b ebpf.CgroupStats) ebpf.CgroupStats {
+	out := a
+	if b.CompatCount > out.CompatCount {
+		out.CompatCount = b.CompatCount
+	}
+	for i := 0; i < len(out.Counts); i++ {
+		if b.Counts[i] > out.Counts[i] {
+			out.Counts[i] = b.Counts[i]
+		}
+	}
+	return out
 }
 
 func (c *Correlator) BuildRecords(stats map[uint64]ebpf.CgroupStats) []selector.ContainerRecord {
@@ -277,7 +347,7 @@ func (c *Correlator) BuildRecords(stats map[uint64]ebpf.CgroupStats) []selector.
 			meta := c.containers[cid]
 			rec = &selector.ContainerRecord{
 				ID:          cid,
-				SyscallHits: make(map[int]uint32),
+				SyscallHits: make(map[int]uint64),
 				Labels:      make(map[string]string),
 			}
 			if meta != nil {
@@ -309,14 +379,18 @@ func (c *Correlator) BuildRecords(stats map[uint64]ebpf.CgroupStats) []selector.
 		}
 	}
 
-	for cgID, st := range stats {
-		merge(cgID, st)
-	}
-	// Dead containers whose BPF entries were already deleted still count.
+	mergedStats := make(map[uint64]ebpf.CgroupStats, len(stats)+len(c.deadStats))
 	for cgID, st := range c.deadStats {
-		if _, live := stats[cgID]; live {
-			continue
+		mergedStats[cgID] = st
+	}
+	for cgID, st := range stats {
+		if dead, ok := mergedStats[cgID]; ok {
+			mergedStats[cgID] = coalesceCgroupStats(st, dead)
+		} else {
+			mergedStats[cgID] = st
 		}
+	}
+	for cgID, st := range mergedStats {
 		merge(cgID, st)
 	}
 
@@ -559,7 +633,14 @@ func isContainerNotFoundErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := strings.ToLower(err.Error())
+	var sb strings.Builder
+	sb.WriteString(err.Error())
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+		sb.WriteByte('\n')
+		sb.Write(exitErr.Stderr)
+	}
+	s := strings.ToLower(sb.String())
 	return strings.Contains(s, "no such object") || strings.Contains(s, "no such container") || strings.Contains(s, "not found")
 }
 
@@ -764,9 +845,6 @@ func findCgroupDirByContainerID(cgroupRoot, containerID string, statFn func(stri
 		}
 		if !d.IsDir() {
 			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return fs.SkipDir
 		}
 		rel, rErr := filepath.Rel(cleanRoot, path)
 		if rErr != nil || rel == "." {

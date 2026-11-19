@@ -224,12 +224,29 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 		t.Fatal("handle_sched_process_exec must not suppress workload entrypoints merely named runc/crun")
 	}
 
-	// C2/C3/C4: cgroup_mkdir and sched_process_exit must use raw_tracepoint, inherit parent syscalls_per_cgroup, and count truncations.
-	if !strings.Contains(src, "raw_tracepoint/cgroup_mkdir") || !strings.Contains(src, "path_truncations") {
-		t.Fatal("missing raw_tracepoint/cgroup_mkdir or path_truncations handling")
+	// C2/C3/C4/I2/I3/I4/I5/M1/M2 invariants.
+	for _, want := range []string{
+		"raw_tracepoint/cgroup_mkdir",
+		"raw_tracepoint/sched_process_exit",
+		"path_truncations",
+		"read_errors",
+		"struct thread_info",
+		"old_pid",
+		"bpf_ringbuf_reserve",
+		"bpf_ringbuf_submit",
+		"bpf_ringbuf_discard",
+		"bpf_map_delete_elem(&candidate_cgroups",
+		"__u64 counts[MAX_SYSCALLS];",
+		"__u64 compat_count;",
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("profiler.bpf.c missing expected invariant %q", want)
+		}
 	}
-	if !strings.Contains(src, "raw_tracepoint/sched_process_exit") {
-		t.Fatal("missing raw_tracepoint/sched_process_exit cleanup hook")
+	for _, removed := range []string{"scratch_events", "BPF_MAP_TYPE_PERCPU_ARRAY", "STATE_ACTIVE", "thread_info_prefix"} {
+		if strings.Contains(src, removed) {
+			t.Fatalf("profiler.bpf.c must no longer contain %q", removed)
+		}
 	}
 
 	// Task 2: fork/exec hooks must block non-runtime threads already inside syscalls_per_cgroup.
@@ -301,10 +318,11 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 	if !strings.Contains(src, "int is_execve_syscall(") {
 		t.Fatal("missing is_execve_syscall helper in profiler.bpf.c")
 	}
-	execDispatchIdx := strings.Index(sysEnterBody, "if (is_execve_syscall(id))")
+	execDispatchIdx := strings.Index(sysEnterBody, "is_execve_syscall(id)")
+	execEnterCallIdx := strings.Index(sysEnterBody, "handle_exec_enter(cgroup_id)")
 	statsCheckIdx := strings.Index(sysEnterBody, "if (!stats)")
-	if execDispatchIdx == -1 || statsCheckIdx == -1 || execDispatchIdx > statsCheckIdx {
-		t.Fatalf("handle_sys_enter must dispatch is_execve_syscall(id) before !stats early return (execIdx=%d statsIdx=%d)", execDispatchIdx, statsCheckIdx)
+	if execDispatchIdx == -1 || execEnterCallIdx == -1 || statsCheckIdx == -1 || execDispatchIdx > statsCheckIdx || execEnterCallIdx > statsCheckIdx {
+		t.Fatalf("handle_sys_enter must dispatch is_execve_syscall(id) -> handle_exec_enter before !stats early return (execIdx=%d callIdx=%d statsIdx=%d)", execDispatchIdx, execEnterCallIdx, statsCheckIdx)
 	}
 	collectorLinuxSrc, err := os.ReadFile(filepath.Join(".", "collector_linux.go"))
 	if err != nil {
@@ -318,6 +336,9 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 	if !strings.Contains(string(collectorLinuxSrc), `attach raw_tracepoint/sched_process_exit`) ||
 		!strings.Contains(string(collectorLinuxSrc), `attach raw_tracepoint/cgroup_mkdir`) {
 		t.Fatal("collector_linux.go must fatally attach raw_tracepoint/cgroup_mkdir and raw_tracepoint/sched_process_exit")
+	}
+	if !strings.Contains(string(collectorLinuxSrc), "c.decodeErrors.Add(1)") {
+		t.Fatal("collector_linux.go must record ringbuf DecodeKernelEvent errors via c.decodeErrors.Add(1)")
 	}
 }
 
@@ -397,6 +418,8 @@ func TestDecodeKernelEventErrorsAndEdgeCases(t *testing.T) {
 		{RingbufDrops: 2},
 		{OobSyscalls: 3},
 		{PathTruncations: 4},
+		{ReadErrors: 5},
+		{DecodeErrors: 6},
 	} {
 		if !es.Any() {
 			t.Fatalf("expected Any() true for %+v", es)
@@ -404,5 +427,9 @@ func TestDecodeKernelEventErrorsAndEdgeCases(t *testing.T) {
 		if es.String() == "" {
 			t.Fatal("expected non-empty String()")
 		}
+	}
+	sum := (ebpf.ErrorStats{CgroupMapFull: 1, ReadErrors: 2}).Add(ebpf.ErrorStats{CgroupMapFull: 3, DecodeErrors: 4})
+	if sum.CgroupMapFull != 4 || sum.ReadErrors != 2 || sum.DecodeErrors != 4 {
+		t.Fatalf("unexpected ErrorStats.Add result: %+v", sum)
 	}
 }

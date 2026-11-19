@@ -197,7 +197,9 @@ func TestExpandedHighRiskList(t *testing.T) {
 		"mount_setattr", "pidfd_getfd", "process_madvise", "kcmp",
 		"io_uring_setup", "io_uring_enter", "io_uring_register",
 		"clock_settime", "settimeofday", "adjtimex", "sethostname",
-		"personality", "fanotify_init", "move_pages", "migrate_pages",
+		"personality", "fanotify_init", "fanotify_mark", "move_pages", "migrate_pages",
+		"mbind", "set_mempolicy", "memfd_secret", "seccomp", "process_mrelease",
+		"mknod", "mknodat", "chroot", "fchroot",
 		"uselib", "vhangup",
 		"quotactl_fd", "clock_adjtime", "modify_ldt", "lsm_set_self_attr",
 	} {
@@ -206,11 +208,15 @@ func TestExpandedHighRiskList(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"setgroups", "setfsuid", "setfsgid", "fchmodat2", "fchroot",
+		"setgroups", "setfsuid", "setfsgid", "fchmodat2",
+		"pidfd_open", "prctl", "statmount", "listmount",
 	} {
 		if risk, _ := diff.ClassifySyscall(name); risk != diff.RiskMedium {
 			t.Fatalf("expected %q to be medium risk, got %s", name, risk)
 		}
+	}
+	if risk, _ := diff.ClassifySyscallRule("clone3", true); risk != diff.RiskHigh {
+		t.Fatalf("expected arg-constrained clone3 rule to stay RiskHigh, got %s", risk)
 	}
 }
 
@@ -449,14 +455,24 @@ func TestArgsChangedDefaultActionAndArchitecturesGate(t *testing.T) {
 		t.Fatalf("expected unapproved clone ArgsChanged losing CLONE_NEW* mask to fail high-risk gate, passed=%v err=%v", passed, err)
 	}
 
-	// Explicit approval in accepted.yml allows the ArgsChanged.
-	approvals := []diff.ApprovalEntry{{Target: "api", Syscall: "clone", Reason: "intentional clone args update", Expires: "2027-01-01"}}
+	// Unscoped approval (scope="") must NOT auto-approve loosening/removing clone args constraints.
+	unscopedOnly := []diff.ApprovalEntry{{Target: "api", Syscall: "clone", Reason: "add only", Expires: "2027-01-01"}}
+	tdLooseUnscoped, err := diff.Compare("api", committed, loosened, nil, unscopedOnly, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed, _, err := diff.EvaluateGate([]*diff.TargetDiff{tdLooseUnscoped}, "report", "high-risk"); err != nil || passed {
+		t.Fatalf("expected unscoped approval not to waive clone ArgsChanged, passed=%v err=%v", passed, err)
+	}
+
+	// Explicit scope: args-change approval in accepted.yml allows the ArgsChanged.
+	approvals := []diff.ApprovalEntry{{Target: "api", Syscall: "clone", Reason: "intentional clone args update", Expires: "2027-01-01", Scope: "args-change"}}
 	tdLooseApproved, err := diff.Compare("api", committed, loosened, nil, approvals, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if passed, reason, err := diff.EvaluateGate([]*diff.TargetDiff{tdLooseApproved}, "report", "high-risk"); err != nil || !passed {
-		t.Fatalf("expected approved clone ArgsChanged to pass high-risk gate, passed=%v reason=%s err=%v", passed, reason, err)
+		t.Fatalf("expected args-change scoped clone approval to pass high-risk gate, passed=%v reason=%s err=%v", passed, reason, err)
 	}
 
 	// Widening DefaultAction fails high-risk gate.
@@ -609,5 +625,83 @@ func TestLoadApprovalsRejectsSymlinkTraversal(t *testing.T) {
 	}
 	if _, err := diff.LoadApprovals(linkPath); err == nil {
 		t.Fatal("expected LoadApprovals to reject symlink accepted.yml")
+	}
+}
+
+func TestApprovalScopes_EscalateAllInvalidAndTrimmedFields(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	tmp := t.TempDir()
+	accPath := filepath.Join(tmp, "accepted.yml")
+	if err := os.WriteFile(accPath, []byte(`version: 1
+accepted:
+  - target: " api "
+    syscall: " socket "
+    reason: " scoped escalate "
+    expires: " 2027-01-01 "
+    scope: " ESCALATE "
+  - target: api
+    syscall: ioctl
+    reason: "wildcard scope"
+    scope: all
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := diff.LoadApprovals(accPath)
+	if err != nil {
+		t.Fatalf("LoadApprovals failed: %v", err)
+	}
+	if len(entries) != 2 || entries[0].Target != "api" || entries[0].Syscall != "socket" ||
+		entries[0].Reason != "scoped escalate" || entries[0].Expires != "2027-01-01" || entries[0].Scope != "escalate" {
+		t.Fatalf("expected M7 trimmed ApprovalEntry fields, got %+v", entries[0])
+	}
+
+	// Unknown scope must fail closed.
+	badScope := filepath.Join(tmp, "bad-scope.yml")
+	_ = os.WriteFile(badScope, []byte("version: 1\naccepted:\n  - target: api\n    syscall: bpf\n    scope: bogus\n"), 0o644)
+	if _, err := diff.LoadApprovals(badScope); err == nil {
+		t.Fatal("expected invalid approval scope to fail closed")
+	}
+
+	condRule := []profile.OCISyscallArg{{Index: 0, Value: 1, Op: "SCMP_CMP_EQ"}}
+	committed := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []profile.OCISyscallRule{
+			{Names: []string{"socket", "ioctl"}, Action: "SCMP_ACT_ALLOW", Args: condRule},
+		},
+	}
+	// Escalating both socket and ioctl: socket matches scope=escalate, ioctl matches scope=all.
+	escalated := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []profile.OCISyscallRule{
+			{Names: []string{"socket", "ioctl"}, Action: "SCMP_ACT_ALLOW"},
+		},
+	}
+	tdEsc, err := diff.Compare("api", committed, escalated, nil, entries, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed, reason, err := diff.EvaluateGate([]*diff.TargetDiff{tdEsc}, "report", "high-risk"); err != nil || !passed {
+		t.Fatalf("expected escalate and all scoped approvals to pass gate, passed=%v reason=%s err=%v", passed, reason, err)
+	}
+
+	// Adding socket as brand new must NOT match socket(scope=escalate), while ioctl(scope=all) matches!
+	committedEmpty := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls:      []profile.OCISyscallRule{{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"}},
+	}
+	added := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls:      []profile.OCISyscallRule{{Names: []string{"read", "socket"}, Action: "SCMP_ACT_ALLOW"}},
+	}
+	tdAdd, err := diff.Compare("api", committedEmpty, added, nil, entries, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tdAdd.Added) != 1 || tdAdd.Added[0].Approved {
+		t.Fatalf("scope=escalate approval must NOT auto-approve Added syscall, got %+v", tdAdd.Added)
 	}
 }

@@ -35,11 +35,9 @@ func main() {
 		panic(err)
 	}
 	// Go treats *_amd64.go and *_arm64.go as mutually exclusive GOARCH build constraints.
-	// Emit both tables into each file so cross-arch lookups (e.g. ArchARM64 on an amd64 host) work on both target architectures.
-	if err := writeTables(filepath.Join(syscallsDir, "zsyscalls_amd64.go"), amd64, arm64); err != nil {
-		panic(err)
-	}
-	if err := writeTables(filepath.Join(syscallsDir, "zsyscalls_arm64.go"), amd64, arm64); err != nil {
+	// Emit a single architecture-neutral file containing both tables so cross-arch
+	// lookups (e.g. ArchARM64 on an amd64 host) work on every GOOS/GOARCH without duplication.
+	if err := writeTables(filepath.Join(syscallsDir, "zsyscalls_gen.go"), amd64, arm64); err != nil {
 		panic(err)
 	}
 }
