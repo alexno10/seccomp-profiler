@@ -578,13 +578,16 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	__u32 data_loc = ctx->__data_loc_filename;
 	__u16 offset = data_loc & 0xffff;
 
-	__u8 *cand = bpf_map_lookup_elem(&candidate_cgroups, &cgroup_id);
-	struct syscall_stats *existing = 0;
-	if (!cand) {
-		existing = bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id);
+	__u8 in_cand = 0;
+	__u8 tracked = 0;
+	if (bpf_map_lookup_elem(&candidate_cgroups, &cgroup_id)) {
+		in_cand = 1;
+		tracked = 1;
+	} else if (bpf_map_lookup_elem(&syscalls_per_cgroup, &cgroup_id)) {
+		tracked = 1;
 	}
 
-	if (!cand && !existing) {
+	if (!tracked) {
 		// Outside tracked/candidate container cgroups: clean up stale runtime_tids
 		// and exec_pending entries on normal host/helper execs (I2/I3).
 		__u8 pending = 0;
@@ -652,13 +655,14 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 		if (old_tid != 0 && old_tid != tid) {
 			bpf_map_delete_elem(&runtime_tids, &old_tid);
 		}
-		if (cand) {
+		if (in_cand) {
 			bpf_map_delete_elem(&candidate_cgroups, &cgroup_id);
 		}
 		long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
 		if (ret != 0 && ret != -17) {
-			if (e) {
-				__sync_fetch_and_add(&e->cgroup_map_full, 1);
+			struct error_counters *e2 = get_error_counters();
+			if (e2) {
+				__sync_fetch_and_add(&e2->cgroup_map_full, 1);
 			}
 		}
 		return 0;
@@ -693,7 +697,7 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 		bpf_map_delete_elem(&runtime_tids, &old_tid);
 	}
 
-	if (cand) {
+	if (in_cand) {
 		bpf_map_delete_elem(&candidate_cgroups, &cgroup_id);
 	}
 	long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
