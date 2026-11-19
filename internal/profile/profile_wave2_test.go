@@ -135,3 +135,108 @@ func TestWriteFileAtomic_RejectsSymlinkDestination(t *testing.T) {
 		t.Fatal("expected writeFileAtomic to reject symlink destination")
 	}
 }
+
+func TestWriteAndLoadRejectSymlinkParentDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	realDir := filepath.Join(tmp, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(tmp, "linked")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlink creation not permitted: %v", err)
+	}
+	if err := writeFileAtomic(filepath.Join(linkDir, "api.json"), []byte("{}")); err == nil {
+		t.Fatal("expected writeFileAtomic to reject symlink parent directory")
+	}
+	targetFile := filepath.Join(realDir, "profile.json")
+	_ = os.WriteFile(targetFile, []byte(`{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}`), 0o644)
+	if _, err := LoadOCIProfile(filepath.Join(linkDir, "profile.json")); err == nil {
+		t.Fatal("expected LoadOCIProfile to reject symlink parent directory")
+	}
+}
+
+func TestLoadOCIProfileRejectsDockerIncludesAndListenerPath(t *testing.T) {
+	tmp := t.TempDir()
+	withIncludes := filepath.Join(tmp, "docker-default.json")
+	_ = os.WriteFile(withIncludes, []byte(`{
+		"defaultAction": "SCMP_ACT_ERRNO",
+		"syscalls": [{"names": ["mount"], "action": "SCMP_ACT_ALLOW", "includes": {"caps": ["CAP_SYS_ADMIN"]}}]
+	}`), 0o644)
+	if _, err := LoadOCIProfile(withIncludes); err == nil {
+		t.Fatal("expected LoadOCIProfile to fail closed on Docker includes filter")
+	}
+
+	withListener := filepath.Join(tmp, "listener.json")
+	_ = os.WriteFile(withListener, []byte(`{
+		"defaultAction": "SCMP_ACT_ERRNO",
+		"listenerPath": "/run/seccomp.sock",
+		"syscalls": [{"names": ["read"], "action": "SCMP_ACT_ALLOW"}]
+	}`), 0o644)
+	if _, err := LoadOCIProfile(withListener); err == nil {
+		t.Fatal("expected LoadOCIProfile to fail closed on listenerPath")
+	}
+
+	withArchMap := filepath.Join(tmp, "archmap.json")
+	_ = os.WriteFile(withArchMap, []byte(`{
+		"defaultAction": "SCMP_ACT_ERRNO",
+		"archMap": [{"architecture": "SCMP_ARCH_X86_64", "subArchitectures": ["SCMP_ARCH_X86"]}],
+		"syscalls": [{"names": ["read"], "action": "SCMP_ACT_ALLOW"}]
+	}`), 0o644)
+	p, err := LoadOCIProfile(withArchMap)
+	if err != nil {
+		t.Fatalf("expected valid archMap profile to load, got: %v", err)
+	}
+	archs := p.EffectiveArchitectures()
+	if len(archs) != 2 || archs[0] != "SCMP_ARCH_X86" || archs[1] != "SCMP_ARCH_X86_64" {
+		t.Fatalf("unexpected EffectiveArchitectures: %v", archs)
+	}
+}
+
+func TestMergeCommittedIntoOCI_PreservesCommittedConstraintsHardDenyAndDedupsErrno(t *testing.T) {
+	condIoctl := []OCISyscallArg{{Index: 1, Value: 21505, Op: "SCMP_CMP_EQ"}}
+	errno38 := uint32(38)
+
+	curr := &OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Syscalls: []OCISyscallRule{
+			// Unconditional baseline allow for ioctl & mount must NOT wipe committed constraint / kill rule.
+			{Names: []string{"read", "ioctl", "mount"}, Action: "SCMP_ACT_ALLOW"},
+			{Names: []string{"clone3"}, Action: "SCMP_ACT_ERRNO", ErrnoRet: &errno38},
+		},
+	}
+	committed := &OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Syscalls: []OCISyscallRule{
+			{Names: []string{"ioctl"}, Action: "SCMP_ACT_ALLOW", Args: condIoctl},
+			{Names: []string{"mount"}, Action: "SCMP_ACT_KILL_PROCESS"},
+			// clone3 without explicit errnoRet colliding with curr's errnoRet=38 -> must dedup to 1 rule.
+			{Names: []string{"clone3"}, Action: "SCMP_ACT_ERRNO"},
+		},
+	}
+
+	MergeCommittedIntoOCI(curr, committed)
+
+	var ioctlRules, mountRules, clone3Rules []OCISyscallRule
+	for _, r := range curr.Syscalls {
+		for _, n := range r.Names {
+			switch n {
+			case "ioctl":
+				ioctlRules = append(ioctlRules, r)
+			case "mount":
+				mountRules = append(mountRules, r)
+			case "clone3":
+				clone3Rules = append(clone3Rules, r)
+			}
+		}
+	}
+	if len(ioctlRules) != 1 || len(ioctlRules[0].Args) != 1 {
+		t.Fatalf("committed conditional ioctl must not be widened or duplicated by curr uncond allow, got %+v", ioctlRules)
+	}
+	if len(mountRules) != 1 || mountRules[0].Action != "SCMP_ACT_KILL_PROCESS" {
+		t.Fatalf("committed hard-deny mount rule must survive merge without uncond allow override, got %+v", mountRules)
+	}
+	if len(clone3Rules) != 1 || clone3Rules[0].Action != "SCMP_ACT_ERRNO" || clone3Rules[0].ErrnoRet == nil || *clone3Rules[0].ErrnoRet != 38 {
+		t.Fatalf("expected conflicting clone3 SCMP_ACT_ERRNO rules to deduplicate to single rule with errnoRet=38, got %+v", clone3Rules)
+	}
+}

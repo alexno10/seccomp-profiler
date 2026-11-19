@@ -291,6 +291,224 @@ test("installBinaryAtomically creates root cache dir, installs staging file, and
   assert.equal(calls[2].args.includes("-f"), true);
 });
 
+test("installBinaryAtomically verifies staged binary digest before atomic mv and removes stage on mismatch", () => {
+  const lib = require("./lib.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-stage-test-"));
+  try {
+    const src = path.join(tmpDir, "src");
+    fs.writeFileSync(src, "trusted-binary-bytes");
+    const wantDigest = crypto.createHash("sha256").update("trusted-binary-bytes").digest("hex");
+    const destDir = path.join(tmpDir, "opt", "v1.2.0");
+    const destPath = path.join(destDir, "seccomp-profiler");
+    const ops = [];
+
+    const mockExec = (cmd, args) => {
+      if (args[0] === "install" && args[1] === "-d") {
+        ops.push("mkdir");
+        fs.mkdirSync(args[args.length - 1], { recursive: true });
+      } else if (args[0] === "install") {
+        ops.push("stage");
+        fs.copyFileSync(args[args.length - 2], args[args.length - 1]);
+      } else if (args[0] === "mv") {
+        ops.push("mv");
+        fs.renameSync(args[args.length - 1 - 1], args[args.length - 1]);
+      } else if (args[0] === "rm") {
+        ops.push("rm");
+        fs.rmSync(args[args.length - 1], { force: true });
+      }
+    };
+
+    lib.installBinaryAtomically(src, destDir, destPath, mockExec, wantDigest, { skipRootCheck: true });
+    assert.deepEqual(ops, ["mkdir", "stage", "mv"]);
+    assert.equal(fs.readFileSync(destPath, "utf8"), "trusted-binary-bytes");
+
+    const opsBad = [];
+    const wrongDigest = "0".repeat(64);
+    assert.throws(
+      () =>
+        lib.installBinaryAtomically(
+          src,
+          destDir,
+          destPath + ".bad",
+          (cmd, args) => {
+            if (args[0] === "install" && args[1] !== "-d") {
+              opsBad.push("stage");
+              fs.copyFileSync(args[args.length - 2], args[args.length - 1]);
+            } else if (args[0] === "mv") {
+              opsBad.push("mv");
+            } else if (args[0] === "rm") {
+              opsBad.push("rm");
+              fs.rmSync(args[args.length - 1], { force: true });
+            }
+          },
+          wrongDigest,
+          { skipRootCheck: true }
+        ),
+      /Pinned SHA-256 mismatch/
+    );
+    assert.equal(opsBad.includes("mv"), false);
+    assert.equal(opsBad.includes("rm"), true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("post hook skips when STATE_STARTED_BIN is missing even if GITHUB_ENV has SECCOMP_PROFILER_BIN", () => {
+  const post = require("./post.js");
+  const res = post.resolvePostConfig({
+    SECCOMP_PROFILER_BIN: "/tmp/evil-bin",
+    SECCOMP_PROFILER_SOCKET: "/tmp/evil.sock",
+    SECCOMP_PROFILER_STOPPED_MARKER: "/tmp/evil-stopped",
+  });
+  assert.equal(res.skip, true);
+});
+
+test("resolveStopConfig uses root session.json and ignores poisoned GITHUB_ENV", () => {
+  const lib = require("./lib.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-stop-cfg-"));
+  const prevEnv = {
+    bin: process.env.SECCOMP_PROFILER_BIN,
+    sock: process.env.SECCOMP_PROFILER_SOCKET,
+    marker: process.env.SECCOMP_PROFILER_STOPPED_MARKER,
+  };
+  try {
+    const binPath = path.join(tmpDir, "seccomp-profiler");
+    fs.writeFileSync(binPath, "real-binary-content");
+    const binSha = lib.sha256File(binPath);
+    const sockPath = path.join(tmpDir, "ctl.sock");
+    const markerPath = path.join(tmpDir, "stopped");
+    const sessionPath = path.join(tmpDir, "session.json");
+    fs.writeFileSync(
+      sessionPath,
+      JSON.stringify({
+        binPath,
+        binSha256: binSha,
+        socketPath: sockPath,
+        stoppedMarker: markerPath,
+        baselineDir: "",
+      })
+    );
+
+    process.env.SECCOMP_PROFILER_BIN = path.join(tmpDir, "poisoned-evil");
+    process.env.SECCOMP_PROFILER_SOCKET = path.join(tmpDir, "poisoned.sock");
+    process.env.SECCOMP_PROFILER_STOPPED_MARKER = path.join(tmpDir, "poisoned.stopped");
+
+    const cfg = lib.resolveStopConfig({
+      sessionPath,
+      cachePath: path.join(tmpDir, "missing-cache"),
+      skipRootCheck: true,
+    });
+    assert.equal(cfg.binPath, binPath);
+    assert.equal(cfg.socketPath, sockPath);
+    assert.equal(cfg.stoppedMarker, markerPath);
+    assert.equal(cfg.fromSession, true);
+
+    // Tampered binary must fail verification.
+    fs.writeFileSync(binPath, "tampered-after-start");
+    assert.throws(
+      () =>
+        lib.resolveStopConfig({
+          sessionPath,
+          cachePath: path.join(tmpDir, "missing-cache"),
+          skipRootCheck: true,
+        }),
+      /Pinned SHA-256 mismatch/
+    );
+
+    // Without session.json, fallback refuses GITHUB_ENV overrides and checks cachePath against pinned digest.
+    fs.rmSync(sessionPath);
+    const fakeCache = path.join(tmpDir, "cached");
+    fs.writeFileSync(fakeCache, "tampered-cache");
+    assert.throws(
+      () => lib.resolveStopConfig({ sessionPath, cachePath: fakeCache, arch: "amd64", skipRootCheck: true }),
+      /Pinned SHA-256 mismatch/
+    );
+  } finally {
+    if (prevEnv.bin === undefined) delete process.env.SECCOMP_PROFILER_BIN;
+    else process.env.SECCOMP_PROFILER_BIN = prevEnv.bin;
+    if (prevEnv.sock === undefined) delete process.env.SECCOMP_PROFILER_SOCKET;
+    else process.env.SECCOMP_PROFILER_SOCKET = prevEnv.sock;
+    if (prevEnv.marker === undefined) delete process.env.SECCOMP_PROFILER_STOPPED_MARKER;
+    else process.env.SECCOMP_PROFILER_STOPPED_MARKER = prevEnv.marker;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("daemonArgs enforces baselineDir containment and rejects traversal or external absolute paths", () => {
+  process.env["INPUT_ALLOW-FILE"] = "../evil/accepted.yml";
+  try {
+    assert.throws(() => daemonArgs("/bin/seccomp-profiler", "/run/seccomp-profiler/baseline-deadbeef"), /traversal/i);
+
+    process.env["INPUT_ALLOW-FILE"] = path.resolve(os.tmpdir(), "outside", "accepted.yml");
+    assert.throws(
+      () => daemonArgs("/bin/seccomp-profiler", "/run/seccomp-profiler/baseline-deadbeef"),
+      /out-of-workspace/i
+    );
+
+    // Absolute path inside process.cwd() remaps cleanly inside baselineDir.
+    process.env["INPUT_ALLOW-FILE"] = path.resolve(process.cwd(), ".seccomp-profiler", "accepted.yml");
+    const args = daemonArgs("/bin/seccomp-profiler", "/run/seccomp-profiler/baseline-deadbeef");
+    const allowFlag = args[args.indexOf("--allow-file") + 1];
+    assert.equal(allowFlag, path.resolve("/run/seccomp-profiler/baseline-deadbeef", ".seccomp-profiler", "accepted.yml"));
+  } finally {
+    delete process.env["INPUT_ALLOW-FILE"];
+  }
+});
+
+test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writable dirs on POSIX", () => {
+  const lib = require("./lib.js");
+  const makeStat = ({ uid = 0, mode = 0o100755, isFile = true, isSymlink = false }) => ({
+    uid,
+    mode,
+    isFile: () => isFile && !isSymlink,
+    isSymbolicLink: () => isSymlink,
+  });
+
+  // Strict root chain passes.
+  lib.assertRootOwnedFile("/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+    platform: "linux",
+    lstatSync: (p) =>
+      p.endsWith("seccomp-profiler") && p.includes("v1.2.0/")
+        ? makeStat({ uid: 0, mode: 0o100755 })
+        : makeStat({ uid: 0, mode: 0o040755, isFile: false }),
+  });
+
+  // Group-writable parent directory rejected.
+  assert.throws(
+    () =>
+      lib.assertRootOwnedFile("/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+        platform: "linux",
+        lstatSync: (p) =>
+          p === "/opt/seccomp-profiler"
+            ? makeStat({ uid: 0, mode: 0o040775, isFile: false })
+            : makeStat({ uid: 0, mode: 0o100755 }),
+      }),
+    /group\/world-writable/
+  );
+
+  // Non-root owner rejected.
+  assert.throws(
+    () =>
+      lib.assertRootOwnedFile("/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+        platform: "linux",
+        lstatSync: (p) =>
+          p.includes("v1.2.0/") ? makeStat({ uid: 1001, mode: 0o100755 }) : makeStat({ uid: 0, mode: 0o040755 }),
+      }),
+    /owned by root/
+  );
+
+  // Symlink parent rejected.
+  assert.throws(
+    () =>
+      lib.assertRootOwnedFile("/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+        platform: "linux",
+        lstatSync: (p) =>
+          p === "/opt" ? makeStat({ uid: 0, mode: 0o120777, isSymlink: true, isFile: false }) : makeStat({ uid: 0, mode: 0o100755 }),
+      }),
+    /symlink/
+  );
+});
+
 test("setState and setOutput encode multiline values safely using delimiters", () => {
   const lib = require("./lib.js");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-env-test-"));

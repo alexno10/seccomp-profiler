@@ -35,7 +35,7 @@ jobs:
           node --check action/main.js
           node --check action/post.js
           node --test action/action.test.js
-          go test ./... -v
+          go test -race ./... -v
 
       - name: Compile eBPF program and install seccomp-profiler
         run: |
@@ -93,13 +93,19 @@ jobs:
           #    dispatching to the echo applet despite argv[0] rewriting.
           docker run --rm alpine:3.20 sh -c 'exec -a echo /proc/self/exe re-exec-ok'
 
+          # 6. Regression (C1): /proc/self/root/* entrypoint must NOT trigger
+          #    runtime self-ref suppression; container must be observed normally.
+          docker run --rm alpine:3.20 /proc/self/root/bin/sh -c 'uname -a'
+
       - name: Stop Seccomp Profiler Action (mode=stop)
         id: stop_profiler
         uses: ./
         with:
           mode: stop
         env:
-          SECCOMP_PROFILER_BIN: /usr/local/bin/seccomp-profiler
+          # Regression (C15): mode=stop must read root-owned session.json and
+          # ignore poisoned $GITHUB_ENV binary overrides.
+          SECCOMP_PROFILER_BIN: /tmp/poisoned-github-env-bin
 
       - name: Verify Action outputs, eBPF profile accuracy, enforcement, diff, and merge
         run: |
@@ -130,7 +136,7 @@ jobs:
           done
 
           # Verify 64-bit container syscalls were NOT misclassified as 32-bit compat,
-          # that Ryuk was excluded (4 profiled containers), and that the positive e2e
+          # that Ryuk was excluded (5 profiled containers), and that the positive e2e
           # syscalls (add_key of the keyctl probe, execve of the /proc/self/exe
           # re-exec) were really captured by the eBPF hooks.
           node -e '
@@ -139,8 +145,8 @@ jobs:
             if (raw.target.compatSyscallCount !== 0) {
               throw new Error(`Expected compatSyscallCount=0, got ${raw.target.compatSyscallCount}`);
             }
-            if (raw.target.containerCount !== 4) {
-              throw new Error(`Expected containerCount=4 (ryuk excluded), got ${raw.target.containerCount}`);
+            if (raw.target.containerCount !== 5) {
+              throw new Error(`Expected containerCount=5 (ryuk excluded), got ${raw.target.containerCount}`);
             }
             const observed = Object.entries(raw.syscalls || {}).filter(([, v]) => (v.sources || []).includes("observed"));
             if (observed.length === 0) {

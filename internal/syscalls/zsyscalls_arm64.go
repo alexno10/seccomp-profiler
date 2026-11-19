@@ -339,6 +339,7 @@ var nameByNr_amd64 = map[int]string{
 	333: "io_pgetevents",
 	334: "rseq",
 	335: "uretprobe",
+	336: "uprobe",
 	424: "pidfd_send_signal",
 	425: "io_uring_setup",
 	426: "io_uring_enter",
@@ -378,6 +379,16 @@ var nameByNr_amd64 = map[int]string{
 	460: "lsm_set_self_attr",
 	461: "lsm_list_modules",
 	462: "mseal",
+	463: "setxattrat",
+	464: "getxattrat",
+	465: "listxattrat",
+	466: "removexattrat",
+	467: "open_tree_attr",
+	468: "file_getattr",
+	469: "file_setattr",
+	470: "listns",
+	471: "rseq_slice_yield",
+	472: "fchroot",
 }
 
 var nrByName_amd64 = map[string]int{
@@ -717,6 +728,7 @@ var nrByName_amd64 = map[string]int{
 	"io_pgetevents":           333,
 	"rseq":                    334,
 	"uretprobe":               335,
+	"uprobe":                  336,
 	"pidfd_send_signal":       424,
 	"io_uring_setup":          425,
 	"io_uring_enter":          426,
@@ -756,6 +768,16 @@ var nrByName_amd64 = map[string]int{
 	"lsm_set_self_attr":       460,
 	"lsm_list_modules":        461,
 	"mseal":                   462,
+	"setxattrat":              463,
+	"getxattrat":              464,
+	"listxattrat":             465,
+	"removexattrat":           466,
+	"open_tree_attr":          467,
+	"file_getattr":            468,
+	"file_setattr":            469,
+	"listns":                  470,
+	"rseq_slice_yield":        471,
+	"fchroot":                 472,
 }
 
 var nameByNr_arm64 = map[int]string{
@@ -1077,6 +1099,16 @@ var nameByNr_arm64 = map[int]string{
 	460: "lsm_set_self_attr",
 	461: "lsm_list_modules",
 	462: "mseal",
+	463: "setxattrat",
+	464: "getxattrat",
+	465: "listxattrat",
+	466: "removexattrat",
+	467: "open_tree_attr",
+	468: "file_getattr",
+	469: "file_setattr",
+	470: "listns",
+	471: "rseq_slice_yield",
+	472: "fchroot",
 }
 
 var nrByName_arm64 = map[string]int{
@@ -1398,4 +1430,14 @@ var nrByName_arm64 = map[string]int{
 	"lsm_set_self_attr":       460,
 	"lsm_list_modules":        461,
 	"mseal":                   462,
+	"setxattrat":              463,
+	"getxattrat":              464,
+	"listxattrat":             465,
+	"removexattrat":           466,
+	"open_tree_attr":          467,
+	"file_getattr":            468,
+	"file_setattr":            469,
+	"listns":                  470,
+	"rseq_slice_yield":        471,
+	"fchroot":                 472,
 }

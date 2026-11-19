@@ -193,7 +193,7 @@ func TestUnconditionalCloneIsHighRisk(t *testing.T) {
 // syscalls must be classified as high risk.
 func TestExpandedHighRiskList(t *testing.T) {
 	for _, name := range []string{
-		"fsopen", "fsmount", "fsconfig", "fspick", "move_mount", "open_tree",
+		"fsopen", "fsmount", "fsconfig", "fspick", "move_mount", "open_tree", "open_tree_attr",
 		"mount_setattr", "pidfd_getfd", "process_madvise", "kcmp",
 		"io_uring_setup", "io_uring_enter", "io_uring_register",
 		"clock_settime", "settimeofday", "adjtimex", "sethostname",
@@ -206,7 +206,7 @@ func TestExpandedHighRiskList(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"setgroups", "setfsuid", "setfsgid", "fchmodat2",
+		"setgroups", "setfsuid", "setfsgid", "fchmodat2", "fchroot",
 	} {
 		if risk, _ := diff.ClassifySyscall(name); risk != diff.RiskMedium {
 			t.Fatalf("expected %q to be medium risk, got %s", name, risk)
@@ -487,5 +487,127 @@ func TestArgsChangedDefaultActionAndArchitecturesGate(t *testing.T) {
 	}
 	if passed, _, err := diff.EvaluateGate([]*diff.TargetDiff{tdArch}, "report", "high-risk"); err != nil || passed {
 		t.Fatalf("expected extra Architecture to fail high-risk gate, passed=%v err=%v", passed, err)
+	}
+}
+
+func TestCloneDuplicateArgIndexBypassRejected(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	committed := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls:      []profile.OCISyscallRule{{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"}},
+	}
+	// Duplicate index 0 triggers OR-splitting in runc/crun, allowing clone unconditionally.
+	orSplitClone := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []profile.OCISyscallRule{
+			{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"},
+			{
+				Names:  []string{"clone"},
+				Action: "SCMP_ACT_ALLOW",
+				Args: []profile.OCISyscallArg{
+					{Index: 0, Value: 2114060288, ValueTwo: 0, Op: "SCMP_CMP_MASKED_EQ"},
+					{Index: 0, Value: 0, Op: "SCMP_CMP_GE"},
+				},
+			},
+		},
+	}
+	td, err := diff.Compare("api", committed, orSplitClone, nil, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(td.Added) != 1 || td.Added[0].Risk != diff.RiskHigh {
+		t.Fatalf("expected duplicate-index clone rule to be RiskHigh, got %+v", td.Added)
+	}
+	if passed, _, err := diff.EvaluateGate([]*diff.TargetDiff{td}, "report", "high-risk"); err != nil || passed {
+		t.Fatalf("expected duplicate-index clone bypass to fail high-risk gate, passed=%v err=%v", passed, err)
+	}
+
+	// Out-of-bounds seccomp arg index (>5) must also fail as invalid/unconstrained.
+	oobIdxClone := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []profile.OCISyscallRule{
+			{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"},
+			{
+				Names:  []string{"clone"},
+				Action: "SCMP_ACT_ALLOW",
+				Args: []profile.OCISyscallArg{
+					{Index: 0, Value: 2114060288, ValueTwo: 0, Op: "SCMP_CMP_MASKED_EQ"},
+					{Index: 6, Value: 0, Op: "SCMP_CMP_EQ"},
+				},
+			},
+		},
+	}
+	tdOOB, err := diff.Compare("api", committed, oobIdxClone, nil, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed, _, err := diff.EvaluateGate([]*diff.TargetDiff{tdOOB}, "report", "high-risk"); err != nil || passed {
+		t.Fatalf("expected out-of-range arg index on clone to fail high-risk gate, passed=%v err=%v", passed, err)
+	}
+}
+
+func TestMediumSyscallVacuousArgsChangedFailsHighRiskGateAndArchMapGate(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	committed := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []profile.OCISyscallRule{
+			{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"},
+			{Names: []string{"socket"}, Action: "SCMP_ACT_ALLOW", Args: []profile.OCISyscallArg{{Index: 0, Value: 1, Op: "SCMP_CMP_EQ"}}},
+		},
+	}
+	vacuousSocket := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []profile.OCISyscallRule{
+			{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"},
+			{Names: []string{"socket"}, Action: "SCMP_ACT_ALLOW", Args: []profile.OCISyscallArg{{Index: 0, Value: 0, Op: "SCMP_CMP_GE"}}},
+		},
+	}
+	td, err := diff.Compare("api", committed, vacuousSocket, nil, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed, _, err := diff.EvaluateGate([]*diff.TargetDiff{td}, "report", "high-risk"); err != nil || passed {
+		t.Fatalf("expected unapproved vacuous ArgsChanged on socket to fail high-risk gate, passed=%v err=%v", passed, err)
+	}
+
+	// archMap adding SCMP_ARCH_X86 must fail even if committed has empty architectures.
+	emptyArchCommitted := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Syscalls:      committed.Syscalls,
+	}
+	archMapCurrent := &profile.OCISeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		ArchMap: []profile.OCISeccompArchMap{{
+			Architecture:     "SCMP_ARCH_X86_64",
+			SubArchitectures: []string{"SCMP_ARCH_X86", "SCMP_ARCH_X32"},
+		}},
+		Syscalls: committed.Syscalls,
+	}
+	tdArchMap, err := diff.Compare("api", emptyArchCommitted, archMapCurrent, nil, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed, _, err := diff.EvaluateGate([]*diff.TargetDiff{tdArchMap}, "report", "high-risk"); err != nil || passed {
+		t.Fatalf("expected archMap 32-bit architectures to fail high-risk gate even with empty committed.Architectures, passed=%v err=%v", passed, err)
+	}
+}
+
+func TestLoadApprovalsRejectsSymlinkTraversal(t *testing.T) {
+	tmp := t.TempDir()
+	secret := filepath.Join(tmp, "secret.txt")
+	if err := os.WriteFile(secret, []byte("root:x:0:0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(tmp, "accepted.yml")
+	if err := os.Symlink(secret, linkPath); err != nil {
+		t.Skipf("symlink creation not permitted: %v", err)
+	}
+	if _, err := diff.LoadApprovals(linkPath); err == nil {
+		t.Fatal("expected LoadApprovals to reject symlink accepted.yml")
 	}
 }

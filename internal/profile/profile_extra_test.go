@@ -327,3 +327,20 @@ func TestUpdateCommittedProfilesLockProtectionAndMultiTarget(t *testing.T) {
 		t.Fatalf("expected multi-target worker.json: %v", err)
 	}
 }
+
+func TestBuildFailsClosedOnUnknownObservedSyscallNumber(t *testing.T) {
+	target := selector.MatchedTarget{
+		Name:                 "api",
+		GroupBy:              "image",
+		Containers:           []selector.ContainerRecord{{ID: "c1", Image: "myorg/api:v1"}},
+		MergedHits:           map[int]uint32{511: 2},
+		ContainersPerSyscall: map[int]int{511: 1},
+	}
+	if _, err := profile.Build(target, profile.BuildOptions{
+		Arch:         syscalls.ArchAMD64,
+		BaselineMode: baseline.ModeNone,
+		RuntimeMode:  "none",
+	}); err == nil {
+		t.Fatal("expected profile.Build to fail closed when an unmapped syscall number is observed")
+	}
+}

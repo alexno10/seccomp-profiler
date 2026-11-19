@@ -19,20 +19,22 @@ type CgroupStats struct {
 
 // ErrorStats mirrors the kernel-side error counters map. Any non-zero value
 // means the profiler silently lost visibility (full map, dropped ring buffer
-// event, or an out-of-range syscall id) and the resulting profile may be
-// incomplete.
+// event, out-of-range syscall id, or truncated/unreadable cgroup path) and the
+// resulting profile may be incomplete.
 type ErrorStats struct {
-	CgroupMapFull uint64 `json:"cgroupMapFull"`
-	RingbufDrops  uint64 `json:"ringbufDrops"`
-	OobSyscalls   uint64 `json:"oobSyscalls"`
+	CgroupMapFull   uint64 `json:"cgroupMapFull"`
+	RingbufDrops    uint64 `json:"ringbufDrops"`
+	OobSyscalls     uint64 `json:"oobSyscalls"`
+	PathTruncations uint64 `json:"pathTruncations"`
 }
 
 func (e ErrorStats) Any() bool {
-	return e.CgroupMapFull > 0 || e.RingbufDrops > 0 || e.OobSyscalls > 0
+	return e.CgroupMapFull > 0 || e.RingbufDrops > 0 || e.OobSyscalls > 0 || e.PathTruncations > 0
 }
 
 func (e ErrorStats) String() string {
-	return fmt.Sprintf("cgroupMapFull=%d ringbufDrops=%d oobSyscalls=%d", e.CgroupMapFull, e.RingbufDrops, e.OobSyscalls)
+	return fmt.Sprintf("cgroupMapFull=%d ringbufDrops=%d oobSyscalls=%d pathTruncations=%d",
+		e.CgroupMapFull, e.RingbufDrops, e.OobSyscalls, e.PathTruncations)
 }
 
 type KernelEvent struct {
@@ -59,7 +61,7 @@ type Collector interface {
 	Close() error
 }
 
-const RawKernelEventSize = 272
+const RawKernelEventSize = 528
 
 func DecodeKernelEvent(raw []byte) (KernelEvent, error) {
 	if len(raw) < RawKernelEventSize {

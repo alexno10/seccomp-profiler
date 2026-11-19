@@ -11,6 +11,9 @@ const { execFileSync } = require("node:child_process");
 
 const DEFAULT_SOCKET_PATH = "/run/seccomp-profiler/ctl.sock";
 const DEFAULT_STOPPED_MARKER = "/run/seccomp-profiler/stopped";
+const SESSION_STATE_DIR = "/run/seccomp-profiler";
+const SESSION_STATE_PATH = `${SESSION_STATE_DIR}/session.json`;
+const BASELINE_DIR_PREFIX = `${SESSION_STATE_DIR}/baseline-`;
 const SOCKET_PATH = process.env.SECCOMP_PROFILER_SOCKET || DEFAULT_SOCKET_PATH;
 const STOPPED_MARKER = process.env.SECCOMP_PROFILER_STOPPED_MARKER || DEFAULT_STOPPED_MARKER;
 
@@ -198,11 +201,49 @@ function downloadFile(url, dest, depth = 0) {
   });
 }
 
-function assertRegularFileNotSymlink(filePath, label) {
-  const st = fs.lstatSync(filePath);
+function assertRegularFileNotSymlink(filePath, label, lstatFn = fs.lstatSync) {
+  const st = lstatFn(filePath);
   if (st.isSymbolicLink() || !st.isFile()) {
     throw new Error(`${label} must be a regular non-symlink file: ${filePath}`);
   }
+  return st;
+}
+
+function assertRootOwnedFile(filePath, label, opts = {}) {
+  const lstatFn = opts.lstatSync || fs.lstatSync;
+  const platform = opts.platform || process.platform;
+  if (!path.isAbsolute(filePath)) {
+    throw new Error(`${label} must be an absolute path: ${filePath}`);
+  }
+  assertRegularFileNotSymlink(filePath, label, lstatFn);
+  if (platform === "win32" || opts.skipRootCheck) {
+    return;
+  }
+  let cur = path.posix.resolve(filePath);
+  while (true) {
+    const cst = lstatFn(cur);
+    if (cst.isSymbolicLink()) {
+      throw new Error(`${label} path component must not be a symlink: ${cur}`);
+    }
+    if (typeof cst.uid === "number" && cst.uid !== 0) {
+      throw new Error(`${label} path component must be owned by root (uid=0, got ${cst.uid}): ${cur}`);
+    }
+    if (typeof cst.mode === "number" && (cst.mode & 0o022) !== 0) {
+      throw new Error(
+        `${label} path component must not be group/world-writable (${(cst.mode & 0o777).toString(8)}): ${cur}`
+      );
+    }
+    const parent = path.posix.dirname(cur);
+    if (parent === cur) {
+      break;
+    }
+    cur = parent;
+  }
+}
+
+function sha256File(filePath) {
+  assertRegularFileNotSymlink(filePath, path.basename(filePath));
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
 function verifyPinnedSha256(filePath, expectedHex, label) {
@@ -294,13 +335,24 @@ async function downloadReleaseAssets(repo, version, assetName, tmpDir) {
   return { binTmp, sigTmp, certTmp, sumsTmp, sumsSigTmp, sumsCertTmp };
 }
 
-function installBinaryAtomically(srcPath, destDir, destPath, execFn = execFileSync) {
+function installBinaryAtomically(
+  srcPath,
+  destDir,
+  destPath,
+  execFn = execFileSync,
+  expectedSha256 = "",
+  verifyOpts = {}
+) {
   const sudo = sudoBin();
   const env = buildDaemonEnv();
   execFn(sudo, ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", destDir], { stdio: "inherit", env });
   const stagePath = `${destPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
   try {
     execFn(sudo, ["install", "-o", "root", "-g", "root", "-m", "0755", srcPath, stagePath], { stdio: "inherit", env });
+    if (expectedSha256) {
+      assertRootOwnedFile(stagePath, `staged ${path.basename(destPath)}`, verifyOpts);
+      verifyPinnedSha256(stagePath, expectedSha256, `staged ${path.basename(destPath)}`);
+    }
     execFn(sudo, ["mv", "-f", stagePath, destPath], { stdio: "inherit", env });
   } catch (err) {
     try {
@@ -310,12 +362,95 @@ function installBinaryAtomically(srcPath, destDir, destPath, execFn = execFileSy
   }
 }
 
+function writeRootSessionState(session, sessionPath = SESSION_STATE_PATH, execFn = execFileSync) {
+  const sudo = sudoBin();
+  const env = buildDaemonEnv();
+  const dir = path.posix.dirname(sessionPath);
+  execFn(sudo, ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", dir], { stdio: "inherit", env });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-session-"));
+  const tmpJson = path.join(tmpDir, "session.json");
+  const stagePath = `${sessionPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    fs.writeFileSync(tmpJson, JSON.stringify(session, null, 2) + "\n", { mode: 0o600 });
+    execFn(sudo, ["install", "-o", "root", "-g", "root", "-m", "0644", tmpJson, stagePath], {
+      stdio: "inherit",
+      env,
+    });
+    execFn(sudo, ["mv", "-f", stagePath, sessionPath], { stdio: "inherit", env });
+  } catch (err) {
+    try {
+      execFn(sudo, ["rm", "-f", stagePath], { stdio: "ignore", env });
+    } catch (_) {}
+    throw err;
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function readRootSessionState(sessionPath = SESSION_STATE_PATH, opts = {}) {
+  assertRootOwnedFile(sessionPath, "seccomp-profiler session state", opts);
+  const raw = (opts.readFileSync || fs.readFileSync)(sessionPath, "utf8");
+  const session = JSON.parse(raw);
+  if (!session || typeof session !== "object") {
+    throw new Error(`Invalid session state JSON in ${sessionPath}`);
+  }
+  validateAbsoluteFilePath(session.binPath, "session.binPath");
+  if (!session.binSha256 || !/^[0-9a-f]{64}$/i.test(session.binSha256)) {
+    throw new Error(`Missing or invalid session.binSha256 in ${sessionPath}`);
+  }
+  validateAbsoluteFilePath(session.socketPath, "session.socketPath");
+  validateAbsoluteFilePath(session.stoppedMarker, "session.stoppedMarker");
+  if (session.baselineDir) {
+    validateAbsoluteFilePath(session.baselineDir, "session.baselineDir");
+  }
+  return session;
+}
+
+function removeRootSessionState(sessionPath = SESSION_STATE_PATH, execFn = execFileSync) {
+  try {
+    execFn(sudoBin(), ["rm", "-f", "--", sessionPath], { stdio: "ignore", env: buildDaemonEnv() });
+  } catch (_) {}
+}
+
+function resolveStopConfig(opts = {}) {
+  const sessionPath = opts.sessionPath || SESSION_STATE_PATH;
+  const cachePath = opts.cachePath || BIN_CACHE_PATH;
+  const arch = opts.arch || (process.arch === "arm64" ? "arm64" : "amd64");
+  const existsFn = opts.existsSync || fs.existsSync;
+
+  if (existsFn(sessionPath)) {
+    const session = readRootSessionState(sessionPath, opts);
+    assertRootOwnedFile(session.binPath, "started seccomp-profiler binary", opts);
+    verifyPinnedSha256(session.binPath, session.binSha256, "started seccomp-profiler binary");
+    return {
+      binPath: session.binPath,
+      socketPath: session.socketPath,
+      stoppedMarker: session.stoppedMarker,
+      baselineDir: session.baselineDir || "",
+      fromSession: true,
+    };
+  }
+
+  // Fallback without session.json (e.g. standalone mode: stop): never trust
+  // $GITHUB_ENV's SECCOMP_PROFILER_BIN/SOCKET/STOPPED_MARKER; require root-owned
+  // pinned cache binary verified against the hardcoded release digest.
+  assertRootOwnedFile(cachePath, "cached seccomp-profiler binary", opts);
+  verifyPinnedSha256(cachePath, PINNED_BINARY_SHA256[arch], `cached seccomp-profiler-linux-${arch}`);
+  return {
+    binPath: cachePath,
+    socketPath: DEFAULT_SOCKET_PATH,
+    stoppedMarker: DEFAULT_STOPPED_MARKER,
+    baselineDir: "",
+    fromSession: false,
+  };
+}
+
 async function ensureBinary() {
   // Explicit override (repo CI testing a fresh build, local development):
-  // the caller takes responsibility for the binary.
+  // require root ownership and regular non-symlink file.
   if (process.env.SECCOMP_PROFILER_BIN) {
     const binPath = validateAbsoluteFilePath(process.env.SECCOMP_PROFILER_BIN, "SECCOMP_PROFILER_BIN");
-    assertRegularFileNotSymlink(binPath, "SECCOMP_PROFILER_BIN");
+    assertRootOwnedFile(binPath, "SECCOMP_PROFILER_BIN");
     return { binPath, fromCache: false };
   }
 
@@ -323,9 +458,10 @@ async function ensureBinary() {
   const assetName = `seccomp-profiler-linux-${arch}`;
 
   if (fs.existsSync(BIN_CACHE_PATH)) {
-    // A cached binary is only trusted after re-verification against the
-    // commit-locked digest (shared runners can be poisoned between jobs).
+    // A cached binary is only trusted after root-ownership + pinned SHA-256
+    // verification (shared runners can be poisoned between jobs).
     try {
+      assertRootOwnedFile(BIN_CACHE_PATH, `cached ${assetName}`);
       verifyPinnedSha256(BIN_CACHE_PATH, PINNED_BINARY_SHA256[arch], `cached ${assetName}`);
       return { binPath: BIN_CACHE_PATH, fromCache: true };
     } catch (err) {
@@ -358,7 +494,7 @@ async function ensureBinary() {
     verifyCosignSignature(cosignBin, binTmp, sigTmp, certTmp);
 
     fs.chmodSync(binTmp, 0o755);
-    installBinaryAtomically(binTmp, BIN_CACHE_DIR, BIN_CACHE_PATH);
+    installBinaryAtomically(binTmp, BIN_CACHE_DIR, BIN_CACHE_PATH, execFileSync, PINNED_BINARY_SHA256[arch]);
     return { binPath: BIN_CACHE_PATH, fromCache: true };
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -407,39 +543,100 @@ function resolveBaselineRef(env = process.env, explicit = getInput("baseline-ref
   return "";
 }
 
-// Review item 1: read the committed profile and approvals from the pristine
-// PR base ref instead of the working tree, so a PR cannot widen its own
-// baseline or self-approve syscalls via accepted.yml.
+// Review item 1: read the committed profile and approvals from a root-owned
+// 0700 snapshot of the pristine PR base ref so neither working-tree edits nor
+// runner-owned test code during the job can widen the baseline or self-approve.
 function prepareBaselineCheckout() {
   const ref = resolveBaselineRef();
   if (!ref) {
     return null;
   }
   console.log(`Fetching pristine baseline from origin/${ref} (committed profile & approvals are read from the base ref).`);
-  execFileSync("git", ["fetch", "--depth=1", "--quiet", "--", "origin", ref], {
+  const gitHardening = [
+    "-c",
+    "core.symlinks=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "submodule.recurse=false",
+  ];
+  execFileSync("git", gitHardening.concat(["fetch", "--depth=1", "--quiet", "--", "origin", ref]), {
     stdio: ["ignore", "ignore", "inherit"],
   });
   const sha = execFileSync("git", ["rev-parse", "FETCH_HEAD"], { encoding: "utf8" }).trim();
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-profiler-baseline-"));
+  const wtDir = fs.mkdtempSync(path.join(os.tmpdir(), "seccomp-profiler-wt-"));
+  const rootBaselineDir = `${BASELINE_DIR_PREFIX}${crypto.randomBytes(8).toString("hex")}`;
+  const sudo = sudoBin();
+  const env = buildDaemonEnv();
   try {
-    execFileSync("git", ["worktree", "add", "--detach", "--quiet", "--", dir, sha], {
+    execFileSync("git", gitHardening.concat(["worktree", "add", "--detach", "--quiet", "--", wtDir, sha]), {
       stdio: ["ignore", "ignore", "inherit"],
     });
+    execFileSync(sudo, ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", SESSION_STATE_DIR], {
+      stdio: "inherit",
+      env,
+    });
+    execFileSync(sudo, ["install", "-d", "-o", "root", "-g", "root", "-m", "0700", rootBaselineDir], {
+      stdio: "inherit",
+      env,
+    });
+    execFileSync(sudo, ["cp", "-a", `${wtDir}/.`, rootBaselineDir], { stdio: "inherit", env });
+    execFileSync(sudo, ["chown", "-R", "root:root", rootBaselineDir], { stdio: "inherit", env });
+    execFileSync(sudo, ["chmod", "-R", "go-rwx", rootBaselineDir], { stdio: "inherit", env });
+    return rootBaselineDir;
   } catch (err) {
-    fs.rmSync(dir, { recursive: true, force: true });
+    cleanupBaselineCheckout(rootBaselineDir);
     throw err;
+  } finally {
+    try {
+      execFileSync("git", ["worktree", "remove", "--force", "--", wtDir], { stdio: "ignore" });
+    } catch (_) {}
+    try {
+      fs.rmSync(wtDir, { recursive: true, force: true });
+    } catch (_) {}
   }
-  return dir;
 }
 
 function cleanupBaselineCheckout(dir) {
   if (!dir) return;
+  if (new RegExp(`^${SESSION_STATE_DIR.replace(/\//g, "\\/")}/baseline-[0-9a-f]+$`).test(dir)) {
+    try {
+      execFileSync(sudoBin(), ["rm", "-rf", "--", dir], { stdio: "ignore", env: buildDaemonEnv() });
+    } catch (_) {}
+    return;
+  }
   try {
     execFileSync("git", ["worktree", "remove", "--force", "--", dir], { stdio: "ignore" });
   } catch (_) {}
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (_) {}
+}
+
+function resolveInBaseline(inputPath, baselineDir, workspaceDir = process.cwd()) {
+  const raw = String(inputPath || "").trim();
+  if (!raw) {
+    throw new Error("Baseline path must not be empty");
+  }
+  let rel = raw;
+  if (path.isAbsolute(raw)) {
+    const absWorkspace = path.resolve(workspaceDir);
+    const absTarget = path.resolve(raw);
+    const computed = path.relative(absWorkspace, absTarget);
+    if (computed.startsWith("..") || path.isAbsolute(computed)) {
+      throw new Error(`Refusing out-of-workspace absolute path when baseline-ref is active: ${inputPath}`);
+    }
+    rel = computed || ".";
+  }
+  const baseRoot = path.resolve(baselineDir);
+  const resolved = path.resolve(baseRoot, rel);
+  const back = path.relative(baseRoot, resolved);
+  if (back.startsWith("..") || path.isAbsolute(back)) {
+    throw new Error(`Refusing baseline path traversal outside ${baselineDir}: ${inputPath}`);
+  }
+  return resolved;
 }
 
 function daemonArgs(binPath, baselineDir) {
@@ -452,9 +649,8 @@ function daemonArgs(binPath, baselineDir) {
   let workingAllow = "";
 
   if (baselineDir) {
-    const resolveIn = (p) => (path.isAbsolute(p) ? p : path.resolve(baselineDir, p));
-    committedArg = resolveIn(committedInput);
-    allowArg = resolveIn(allowInput);
+    committedArg = resolveInBaseline(committedInput, baselineDir);
+    allowArg = resolveInBaseline(allowInput, baselineDir);
     // Drift detection: flag committed profile / approvals files that the PR
     // itself modified (reported in the summary, review required).
     workingCommitted = path.isAbsolute(committedInput) ? committedInput : path.resolve(process.cwd(), committedInput);
@@ -529,20 +725,22 @@ function stopDaemon(binPath, socketPath = getSocketPath(), stoppedMarker = getSt
   const rawJson = execFileSync(
     sudoBin(),
     sudoArgv([binPath, "stop", "--json", "--socket", socketPath, "--stopped-marker", stoppedMarker]),
-    { encoding: "utf8", env: buildDaemonEnv() }
+    { encoding: "utf8", env: buildDaemonEnv(), maxBuffer: 16 * 1024 * 1024 }
   );
   const resp = JSON.parse(rawJson.trim());
   applyStopOutputs(resp, getInput("output-dir", ".seccomp-profiler/profiles"), ".seccomp-profiler/raw");
 
   if (!resp.gatePassed) {
-    console.error(`Security gate failed: ${resp.gateReason}`);
-    process.exit(1);
+    throw new Error(`Security gate failed: ${resp.gateReason}`);
   }
 }
 
 module.exports = {
   DEFAULT_SOCKET_PATH,
   DEFAULT_STOPPED_MARKER,
+  SESSION_STATE_DIR,
+  SESSION_STATE_PATH,
+  BASELINE_DIR_PREFIX,
   SOCKET_PATH,
   STOPPED_MARKER,
   BIN_CACHE_DIR,
@@ -557,10 +755,17 @@ module.exports = {
   createDaemonLogPath,
   validateDownloadUrl,
   downloadFile,
+  assertRootOwnedFile,
+  sha256File,
   verifySha256,
   verifyPinnedSha256,
   verifyCosignSignature,
   installBinaryAtomically,
+  writeRootSessionState,
+  readRootSessionState,
+  removeRootSessionState,
+  resolveStopConfig,
+  resolveInBaseline,
   getInput,
   resolveBpfObjPath,
   buildDaemonEnv,

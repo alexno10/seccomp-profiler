@@ -186,6 +186,51 @@ func TestReadDockerEventStream_ErrorsAndLargeLines(t *testing.T) {
 			t.Fatalf("got events %+v, want 1 event for %s", got, cid)
 		}
 	})
+
+	t.Run("skips >1MiB lines without breaking stream", func(t *testing.T) {
+		cid := strings.Repeat("f", 64)
+		huge := `{"status":"start","id":"bad","huge":"` + strings.Repeat("a", 1200*1024) + `"}` + "\n"
+		good := `{"status":"start","id":"` + cid + `","timeNano":456,"Actor":{"ID":"` + cid + `","Attributes":{"image":"alpine"}}}` + "\n"
+		var got []DockerEvent
+		err := readDockerEventStream(context.Background(), strings.NewReader(huge+good), func(ev DockerEvent) {
+			got = append(got, ev)
+		}, func() error { return nil })
+		if err != nil {
+			t.Fatalf("expected >1MiB line to be skipped cleanly, got err=%v", err)
+		}
+		if len(got) != 1 || got[0].ID != cid {
+			t.Fatalf("expected subsequent event %s after oversized line, got %+v", cid, got)
+		}
+	})
+
+	t.Run("cancels child before waitFn on reader error", func(t *testing.T) {
+		canceled := false
+		pr, pw := newErrReader(errors.New("broken stream"))
+		_ = pw
+		err := readDockerEventStreamWithCancel(
+			context.Background(),
+			pr,
+			func(DockerEvent) {},
+			func() { canceled = true },
+			func() error {
+				if !canceled {
+					return errors.New("waitFn ran before cancelFn")
+				}
+				return nil
+			},
+		)
+		if err == nil || !canceled {
+			t.Fatalf("expected read error with cancelFn called first, got err=%v canceled=%v", err, canceled)
+		}
+	})
+}
+
+type failingReader struct{ err error }
+
+func (f failingReader) Read([]byte) (int, error) { return 0, f.err }
+
+func newErrReader(err error) (failingReader, struct{}) {
+	return failingReader{err: err}, struct{}{}
 }
 
 func TestScanRunningContainers_ToleratesVanishedContainerInBatch(t *testing.T) {

@@ -481,12 +481,16 @@ func runMerge(args []string) error {
 	if err != nil {
 		return err
 	}
+	passed, reason, err := diff.EvaluateGate(diffs, *onChange, *failOn)
+	if err != nil {
+		return err
+	}
 	writeRes, err := profile.WriteTargetFiles(*outDir, *rawDir, *lockFile, built)
 	if err != nil {
 		return err
 	}
 	var updatedPaths []string
-	if strings.EqualFold(strings.TrimSpace(*onChange), "update-pr") {
+	if passed && strings.EqualFold(strings.TrimSpace(*onChange), "update-pr") {
 		targetCommitted := *workingCommitted
 		if targetCommitted == "" {
 			targetCommitted = *committedPattern
@@ -497,10 +501,6 @@ func runMerge(args []string) error {
 				return fmt.Errorf("update committed profiles: %w", err)
 			}
 		}
-	}
-	passed, reason, err := diff.EvaluateGate(diffs, *onChange, *failOn)
-	if err != nil {
-		return err
 	}
 	md := report.RenderMarkdown(report.SummaryInput{
 		Profiles:     built,

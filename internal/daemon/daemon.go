@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alexno10/seccomp-profiler/internal/baseline"
@@ -158,6 +159,8 @@ type Server struct {
 	listenAddr string
 
 	mu           sync.Mutex
+	stopMu       sync.Mutex
+	stopping     atomic.Bool
 	stopped      bool
 	shuttingDown bool
 	cachedResp   *StopResponse
@@ -247,9 +250,9 @@ func (s *Server) Start(ctx context.Context) error {
 						return
 					}
 					s.correlator.RecordKernelEvent(ev)
-					if ev.Type == ebpf.EventCgroupMkdir && s.correlator.IsCgroupContainerDead(ev.CgroupID) {
+					if ev.Type == ebpf.EventCgroupMkdir && !s.stopping.Load() && s.correlator.IsCgroupContainerDead(ev.CgroupID) {
 						s.mu.Lock()
-						if !s.shuttingDown {
+						if !s.stopping.Load() && !s.shuttingDown {
 							docker.ReclaimCgroup(s.correlator, s.collector, ev.CgroupID)
 						}
 						s.mu.Unlock()
@@ -287,12 +290,14 @@ func (s *Server) shutdown() {
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}
+		s.stopMu.Lock()
 		s.mu.Lock()
 		s.shuttingDown = true
+		s.mu.Unlock()
 		if s.collector != nil {
 			_ = s.collector.Close()
 		}
-		s.mu.Unlock()
+		s.stopMu.Unlock()
 		s.closeDone()
 	})
 }
@@ -317,11 +322,13 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		if err != nil {
 			return
 		}
+		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
 }
 
 func (s *Server) handleConn(conn net.Conn) {
+	defer s.wg.Done()
 	defer conn.Close()
 	// Untrusted/local clients must not be able to hold control connections
 	// open forever (the tcp:// control endpoint has no authentication).
@@ -331,75 +338,81 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 	cmd := strings.TrimSpace(sc.Text())
-	_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	switch cmd {
 	case "PING":
+		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, _ = fmt.Fprintln(conn, `{"ok":true}`)
 	case "STOP":
-		s.wg.Add(1)
-		defer func() {
-			go func() {
-				defer s.wg.Done()
-				select {
-				case <-time.After(50 * time.Millisecond):
-					s.shutdown()
-				case <-s.doneCh:
-				}
-			}()
-		}()
 		resp := s.executeStop()
 		b, _ := json.Marshal(resp)
+		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, _ = conn.Write(append(b, '\n'))
+		_ = conn.Close()
+		s.shutdown()
 	default:
+		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		b, _ := json.Marshal(StopResponse{OK: false, Error: fmt.Sprintf("unknown command %q", cmd)})
 		_, _ = conn.Write(append(b, '\n'))
 	}
 }
 
-func (s *Server) executeStop() *StopResponse {
+func (s *Server) cacheStopResponse(resp *StopResponse, stopped bool) *StopResponse {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.cachedResp = resp
+	if stopped {
+		s.stopped = true
+	}
+	s.mu.Unlock()
+	return resp
+}
 
+func (s *Server) executeStop() *StopResponse {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+
+	s.mu.Lock()
 	if s.stopped && s.cachedResp != nil {
-		return s.cachedResp
+		resp := s.cachedResp
+		s.mu.Unlock()
+		return resp
 	}
 	if s.shuttingDown {
+		s.mu.Unlock()
 		return &StopResponse{OK: false, Error: "daemon shutting down"}
 	}
+	s.stopping.Store(true)
+	s.mu.Unlock()
 
 	var stats map[uint64]ebpf.CgroupStats
 	var kernelErrs ebpf.ErrorStats
 	if s.collector != nil {
 		// 1. Detach programs first so no new map updates race the flush.
 		_ = s.collector.Detach()
-		// 2. Let the ring buffer drain into the correlator: wait until the
-		// event channel is empty (the channel itself only closes on Close,
-		// so waiting for it would always burn the full timeout).
+		// 2. Let the ring buffer drain into the correlator without holding s.mu,
+		// so any event-consumer ReclaimCgroup check cannot self-deadlock here.
 		events := s.collector.Events()
 		deadline := time.Now().Add(2 * time.Second)
 		for len(events) > 0 && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 		}
-		time.Sleep(50 * time.Millisecond) // grace for one event in flight
+		time.Sleep(25 * time.Millisecond) // grace for one event in flight
 		// 3. Snapshot the maps.
 		var err error
 		stats, err = s.collector.Flush()
 		if err != nil {
-			resp := &StopResponse{OK: false, Error: err.Error()}
-			s.cachedResp = resp
-			return resp
+			return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
 		}
-		if errs, err := s.collector.ErrorStats(); err == nil {
-			kernelErrs = errs
+		errs, err := s.collector.ErrorStats()
+		if err != nil {
+			return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("read kernel error stats: %v", err)}, false)
 		}
+		kernelErrs = errs
 	}
 
 	records := s.correlator.BuildRecords(stats)
 	rules, err := selector.ParseTargetsInputWithErr(s.cfg.Targets)
 	if err != nil {
-		resp := &StopResponse{OK: false, Error: fmt.Sprintf("parse targets: %v", err)}
-		s.cachedResp = resp
-		return resp
+		return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("parse targets: %v", err)}, false)
 	}
 	selCfg := selector.Config{
 		Rules:          rules,
@@ -411,9 +424,7 @@ func (s *Server) executeStop() *StopResponse {
 
 	approvals, err := diff.LoadApprovals(s.cfg.AllowFile)
 	if err != nil {
-		resp := &StopResponse{OK: false, Error: fmt.Sprintf("load approvals: %v", err)}
-		s.cachedResp = resp
-		return resp
+		return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("load approvals: %v", err)}, false)
 	}
 
 	var builtProfiles []*profile.BuiltProfile
@@ -429,9 +440,7 @@ func (s *Server) executeStop() *StopResponse {
 			ExtraAllow:       s.cfg.ExtraAllow,
 		})
 		if err != nil {
-			resp := &StopResponse{OK: false, Error: err.Error()}
-			s.cachedResp = resp
-			return resp
+			return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
 		}
 		builtProfiles = append(builtProfiles, bp)
 
@@ -439,9 +448,7 @@ func (s *Server) executeStop() *StopResponse {
 		if commPath != "" {
 			cp, err := profile.LoadOCIProfile(commPath)
 			if err != nil && !os.IsNotExist(err) {
-				resp := &StopResponse{OK: false, Error: fmt.Sprintf("load committed profile %q: %v", commPath, err)}
-				s.cachedResp = resp
-				return resp
+				return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("load committed profile %q: %v", commPath, err)}, false)
 			}
 			if cp != nil {
 				committedByTarget[t.Name] = cp
@@ -458,9 +465,7 @@ func (s *Server) executeStop() *StopResponse {
 		committed := committedByTarget[bp.TargetName]
 		td, err := diff.Compare(bp.TargetName, committed, &bp.OCI, &bp.Raw, approvals, now)
 		if err != nil {
-			resp := &StopResponse{OK: false, Error: err.Error()}
-			s.cachedResp = resp
-			return resp
+			return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
 		}
 		diffs = append(diffs, td)
 		newCount += len(td.Added)
@@ -474,51 +479,20 @@ func (s *Server) executeStop() *StopResponse {
 				highRiskCount++
 			}
 		}
+		for _, ac := range td.ArgsChangeDetails {
+			if !ac.Approved {
+				highRiskCount++
+			}
+		}
 		if !s.cfg.Prune {
 			// Never auto-remove syscalls or args rules present in the committed baseline.
 			profile.MergeCommittedIntoOCI(&bp.OCI, committed)
 		}
 	}
 
-	preLock, err := profile.LoadLockHashes(s.cfg.LockFile)
-	if err != nil {
-		resp := &StopResponse{OK: false, Error: err.Error()}
-		s.cachedResp = resp
-		return resp
-	}
-
-	writeResults, err := profile.WriteTargetFiles(s.cfg.OutputDir, s.cfg.RawDir, s.cfg.LockFile, builtProfiles)
-	if err != nil {
-		resp := &StopResponse{OK: false, Error: err.Error()}
-		s.cachedResp = resp
-		return resp
-	}
-
-	var updatedPaths []string
-	if strings.EqualFold(strings.TrimSpace(s.cfg.OnChange), "update-pr") {
-		targetCommitted := s.cfg.WorkingCommitted
-		if targetCommitted == "" {
-			targetCommitted = s.cfg.CommittedProfile
-		}
-		if targetCommitted != "" {
-			updatedPaths, err = profile.SyncCommittedProfiles(targetCommitted, s.cfg.OutputDir, s.cfg.LockFile, writeResults, preLock, builtProfiles)
-			if err != nil {
-				resp := &StopResponse{OK: false, Error: fmt.Sprintf("update committed profiles: %v", err)}
-				s.cachedResp = resp
-				return resp
-			}
-		}
-	}
-
-	gatePassed, gateReason, err := diff.EvaluateGate(diffs, s.cfg.OnChange, s.cfg.FailOn)
-	if err != nil {
-		resp := &StopResponse{OK: false, Error: err.Error(), GatePassed: false}
-		s.cachedResp = resp
-		return resp
-	}
-
-	// Baseline drift: committed profile / approvals changed inside this PR
-	// (read from the pristine baseline ref). Report, never silently pass.
+	// Evaluate baseline drift and security gate BEFORE writing files into
+	// WorkingCommitted / OutputDir so WriteTargetFiles never masks PR edits
+	// and update-pr never writes committed profiles when the gate fails.
 	var driftNotes []string
 	if s.cfg.WorkingCommitted != "" && s.cfg.WorkingCommitted != s.cfg.CommittedProfile {
 		for _, bp := range builtProfiles {
@@ -533,6 +507,11 @@ func (s *Server) executeStop() *StopResponse {
 		driftNotes = append(driftNotes, fmt.Sprintf("syscall approvals file `%s` differs from `%s` in this PR — review carefully", s.cfg.WorkingAllowFile, s.cfg.AllowFile))
 	}
 
+	gatePassed, gateReason, err := diff.EvaluateGate(diffs, s.cfg.OnChange, s.cfg.FailOn)
+	if err != nil {
+		return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error(), GatePassed: false}, false)
+	}
+
 	if kernelErrs.Any() {
 		summary := fmt.Sprintf("kernel error counters non-zero (%s): some containers or syscalls were not recorded, the generated profile may be incomplete", kernelErrs.String())
 		if !strings.EqualFold(strings.TrimSpace(s.cfg.FailOn), "none") {
@@ -540,6 +519,30 @@ func (s *Server) executeStop() *StopResponse {
 			gateReason = summary
 		}
 		driftNotes = append(driftNotes, summary)
+	}
+
+	preLock, err := profile.LoadLockHashes(s.cfg.LockFile)
+	if err != nil {
+		return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
+	}
+
+	writeResults, err := profile.WriteTargetFiles(s.cfg.OutputDir, s.cfg.RawDir, s.cfg.LockFile, builtProfiles)
+	if err != nil {
+		return s.cacheStopResponse(&StopResponse{OK: false, Error: err.Error()}, false)
+	}
+
+	var updatedPaths []string
+	if gatePassed && strings.EqualFold(strings.TrimSpace(s.cfg.OnChange), "update-pr") {
+		targetCommitted := s.cfg.WorkingCommitted
+		if targetCommitted == "" {
+			targetCommitted = s.cfg.CommittedProfile
+		}
+		if targetCommitted != "" {
+			updatedPaths, err = profile.SyncCommittedProfiles(targetCommitted, s.cfg.OutputDir, s.cfg.LockFile, writeResults, preLock, builtProfiles)
+			if err != nil {
+				return s.cacheStopResponse(&StopResponse{OK: false, Error: fmt.Sprintf("update committed profiles: %v", err)}, false)
+			}
+		}
 	}
 
 	md := report.RenderMarkdown(report.SummaryInput{
@@ -572,9 +575,7 @@ func (s *Server) executeStop() *StopResponse {
 		}
 	}
 
-	s.stopped = true
-	s.cachedResp = resp
-	return resp
+	return s.cacheStopResponse(resp, true)
 }
 
 func Ping(addr string) error {
@@ -601,31 +602,7 @@ func Ping(addr string) error {
 }
 
 func writeMarkerAtomic(path string, data []byte) error {
-	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to overwrite symlink %q", path)
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".stopped-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return profile.WriteFileAtomicNoSymlink(path, data, false)
 }
 
 func Stop(addr string, stoppedMarkerPath string) (*StopResponse, error) {
@@ -635,7 +612,7 @@ func Stop(addr string, stoppedMarkerPath string) (*StopResponse, error) {
 		// Fall back to the stopped marker only after confirming the live
 		// daemon is unreachable (e.g. second idempotent stop from post hook).
 		if stoppedMarkerPath != "" {
-			if data, readErr := os.ReadFile(stoppedMarkerPath); readErr == nil && len(data) > 0 {
+			if data, readErr := profile.ReadFileNoSymlink(stoppedMarkerPath); readErr == nil && len(data) > 0 {
 				var cached StopResponse
 				if jsonErr := json.Unmarshal(data, &cached); jsonErr == nil && cached.OK {
 					return &cached, nil

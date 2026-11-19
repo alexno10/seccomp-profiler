@@ -52,24 +52,42 @@ async function startDaemon(binPath, baselineDir) {
 
 async function run() {
   const mode = lib.getInput("mode", "start").toLowerCase();
-  const { binPath, fromCache } = await lib.ensureBinary();
   if (mode === "start") {
+    const { binPath, fromCache } = await lib.ensureBinary();
+    const binSha256 = lib.sha256File(binPath);
     const baselineDir = lib.prepareBaselineCheckout();
+    const socketPath = lib.getSocketPath();
+    const stoppedMarker = lib.getStoppedMarker();
+    lib.writeRootSessionState({
+      binPath,
+      binSha256,
+      socketPath,
+      stoppedMarker,
+      baselineDir: baselineDir || "",
+    });
     lib.saveState("STARTED_BIN", binPath);
+    lib.saveState("STARTED_BIN_SHA256", binSha256);
     lib.saveState("STARTED_BIN_FROM_CACHE", fromCache ? "true" : "false");
-    lib.saveState("STARTED_SOCKET", lib.getSocketPath());
-    lib.saveState("STARTED_STOPPED_MARKER", lib.getStoppedMarker());
+    lib.saveState("STARTED_SOCKET", socketPath);
+    lib.saveState("STARTED_STOPPED_MARKER", stoppedMarker);
     if (baselineDir) {
       lib.saveState("STARTED_BASELINE_DIR", baselineDir);
     }
     try {
       await startDaemon(binPath, baselineDir);
     } catch (err) {
+      lib.removeRootSessionState();
       lib.cleanupBaselineCheckout(baselineDir);
       throw err;
     }
   } else if (mode === "stop") {
-    lib.stopDaemon(binPath);
+    const cfg = lib.resolveStopConfig();
+    try {
+      lib.stopDaemon(cfg.binPath, cfg.socketPath, cfg.stoppedMarker);
+    } finally {
+      lib.cleanupBaselineCheckout(cfg.baselineDir);
+      lib.removeRootSessionState();
+    }
   } else {
     throw new Error(`Invalid mode "${mode}": must be "start" or "stop"`);
   }

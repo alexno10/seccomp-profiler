@@ -69,7 +69,8 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 	execProg := coll.Programs["handle_sched_process_exec"]
 	sysEnterProg := coll.Programs["handle_sys_enter"]
 	forkProg := coll.Programs["handle_sched_process_fork"]
-	if mkdirProg == nil || execProg == nil || sysEnterProg == nil || forkProg == nil {
+	exitProg := coll.Programs["handle_sched_process_exit"]
+	if mkdirProg == nil || execProg == nil || sysEnterProg == nil || forkProg == nil || exitProg == nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("missing required BPF programs in %q", objPath)
 	}
@@ -85,20 +86,36 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 
 	// Core hooks: without these the profiler cannot observe containers at
 	// all — a failure here is fatal.
-	if err := attach("cgroup", "cgroup_mkdir", mkdirProg); err != nil {
+	l1, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+		Name:    "cgroup_mkdir",
+		Program: mkdirProg,
+	})
+	if err != nil {
 		_ = c.Close()
-		return nil, err
+		return nil, fmt.Errorf("attach raw_tracepoint/cgroup_mkdir: %w", err)
 	}
+	c.links = append(c.links, l1)
 	if err := attach("sched", "sched_process_exec", execProg); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
 
-	// Suppression-refinement hooks are best-effort: if a kernel refuses to
-	// link one of them, runtime setup syscalls of secondary "docker exec"
-	// workloads may be recorded (over-permissive profiles, never
-	// under-recording), which the summary reveals. Losing the daemon over
-	// a kernel quirk would be strictly worse.
+	// Mandatory exit cleanup BEFORE fork marking: if exit cleanup cannot
+	// attach, PID/TID reuse could leave workload threads suppressed inside
+	// runtime_tids.
+	lExit, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+		Name:    "sched_process_exit",
+		Program: exitProg,
+	})
+	if err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("attach raw_tracepoint/sched_process_exit: %w", err)
+	}
+	c.links = append(c.links, lExit)
+
+	// Fork refinement hook is best-effort on unusual kernels: if linking
+	// refuses it, secondary "docker exec" setup syscalls may be over-recorded
+	// rather than hidden.
 	if l4, err := link.AttachRawTracepoint(link.RawTracepointOptions{
 		Name:    "sched_process_fork",
 		Program: forkProg,
@@ -106,11 +123,6 @@ func NewCollector(bpfObjPath string) (Collector, error) {
 		fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: attach raw_tracepoint/sched_process_fork: %v; runtime-suppression degraded: secondary docker exec setup syscalls may be recorded\n", err)
 	} else {
 		c.links = append(c.links, l4)
-	}
-	if exitProg := coll.Programs["handle_sched_process_exit"]; exitProg != nil {
-		if err := attach("sched", "sched_process_exit", exitProg); err != nil {
-			fmt.Fprintf(os.Stderr, "[seccomp-profiler] warn: %v; exiting runtime tids will rely on LRU eviction\n", err)
-		}
 	}
 
 	l3, err := link.AttachRawTracepoint(link.RawTracepointOptions{

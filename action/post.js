@@ -6,33 +6,43 @@ const path = require("node:path");
 const lib = require("./lib.js");
 
 function resolvePostConfig(env = process.env, defaults = {}) {
+  if (!env.STATE_STARTED_BIN) {
+    return {
+      skip: true,
+      reason: "no STARTED_BIN recorded in GITHUB_STATE (not the start step)",
+      baselineDir: env.STATE_STARTED_BASELINE_DIR || "",
+      logDir: env.STATE_STARTED_LOG_DIR || "",
+    };
+  }
   const cachePath = defaults.CACHE_PATH || lib.BIN_CACHE_PATH;
   const defaultSocket = defaults.SOCKET_PATH || lib.DEFAULT_SOCKET_PATH;
   const defaultMarker = defaults.STOPPED_MARKER || lib.DEFAULT_STOPPED_MARKER;
+  const arch = defaults.ARCH || (process.arch === "arm64" ? "arm64" : "amd64");
 
-  const hasStateBin = Boolean(env.STATE_STARTED_BIN);
-  const binPath = env.STATE_STARTED_BIN || env.SECCOMP_PROFILER_BIN || cachePath;
-  const socketPath = env.STATE_STARTED_SOCKET || env.SECCOMP_PROFILER_SOCKET || defaultSocket;
-  const stoppedMarker = env.STATE_STARTED_STOPPED_MARKER || env.SECCOMP_PROFILER_STOPPED_MARKER || defaultMarker;
-
-  // Require pinned SHA-256 verification whenever we run the cached release binary
-  // (or when start recorded cache usage in GITHUB_STATE), even if $GITHUB_ENV was
-  // tampered with by an intermediate job step.
-  const requirePinnedVerify = hasStateBin
-    ? env.STATE_STARTED_BIN_FROM_CACHE === "true" || binPath === cachePath
-    : !env.SECCOMP_PROFILER_BIN || binPath === cachePath;
+  const binPath = env.STATE_STARTED_BIN;
+  const socketPath = env.STATE_STARTED_SOCKET || defaultSocket;
+  const stoppedMarker = env.STATE_STARTED_STOPPED_MARKER || defaultMarker;
+  const fromCache = env.STATE_STARTED_BIN_FROM_CACHE === "true" || binPath === cachePath;
+  const expectedSha256 = fromCache ? lib.PINNED_BINARY_SHA256[arch] : env.STATE_STARTED_BIN_SHA256 || "";
 
   return {
+    skip: false,
     binPath,
     socketPath,
     stoppedMarker,
-    requirePinnedVerify,
+    requirePinnedVerify: fromCache || Boolean(expectedSha256),
+    expectedSha256,
     baselineDir: env.STATE_STARTED_BASELINE_DIR || "",
     logDir: env.STATE_STARTED_LOG_DIR || "",
   };
 }
 
-function verifyPostBinary(binPath, requirePinnedVerify, arch = process.arch === "arm64" ? "arm64" : "amd64") {
+function verifyPostBinary(
+  binPath,
+  requirePinnedVerify,
+  arch = process.arch === "arm64" ? "arm64" : "amd64",
+  opts = {}
+) {
   if (!path.isAbsolute(binPath)) {
     throw new Error(`Post binary path must be absolute: ${binPath}`);
   }
@@ -41,12 +51,19 @@ function verifyPostBinary(binPath, requirePinnedVerify, arch = process.arch === 
     throw new Error(`Post binary must be a regular non-symlink file: ${binPath}`);
   }
   if (requirePinnedVerify) {
-    lib.verifyPinnedSha256(binPath, lib.PINNED_BINARY_SHA256[arch], `cached post ${path.basename(binPath)}`);
+    const digest = opts.expectedSha256 || lib.PINNED_BINARY_SHA256[arch];
+    lib.verifyPinnedSha256(binPath, digest, `post ${path.basename(binPath)}`);
+  }
+  if (opts.checkRootOwnership) {
+    lib.assertRootOwnedFile(binPath, `post ${path.basename(binPath)}`, opts);
   }
 }
 
 function runPost() {
   const cfg = resolvePostConfig();
+  if (cfg.skip) {
+    return;
+  }
   try {
     if (fs.existsSync(cfg.stoppedMarker)) {
       console.log("seccomp-profiler was already stopped explicitly via mode: stop; skipping post hook.");
@@ -61,10 +78,15 @@ function runPost() {
       return;
     }
 
-    verifyPostBinary(cfg.binPath, cfg.requirePinnedVerify);
+    const arch = process.arch === "arm64" ? "arm64" : "amd64";
+    verifyPostBinary(cfg.binPath, cfg.requirePinnedVerify, arch, {
+      expectedSha256: cfg.expectedSha256,
+      checkRootOwnership: true,
+    });
     lib.stopDaemon(cfg.binPath, cfg.socketPath, cfg.stoppedMarker);
   } finally {
     lib.cleanupBaselineCheckout(cfg.baselineDir);
+    lib.removeRootSessionState();
     if (cfg.logDir) {
       try {
         fs.rmSync(cfg.logDir, { recursive: true, force: true });

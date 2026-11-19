@@ -131,13 +131,22 @@ func isPermittingDefaultAction(action string) bool {
 }
 
 func hasCloneNamespaceMask(args []profile.OCISyscallArg) bool {
+	if len(args) == 0 {
+		return false
+	}
+	seenIdx := make(map[uint]bool, len(args))
+	hasMask := false
 	for _, a := range args {
+		if a.Index > 5 || seenIdx[a.Index] {
+			return false
+		}
+		seenIdx[a.Index] = true
 		if a.Index == 0 && a.Op == "SCMP_CMP_MASKED_EQ" &&
 			(a.Value&cloneNewNamespaceMask) == cloneNewNamespaceMask && a.ValueTwo == 0 {
-			return true
+			hasMask = true
 		}
 	}
-	return false
+	return hasMask
 }
 
 func effectiveHasArgs(name string, entries []condRuleEntry) bool {
@@ -261,20 +270,32 @@ func Compare(
 			(committed.DefaultErrnoRet != nil && current.DefaultErrnoRet != nil && *committed.DefaultErrnoRet != *current.DefaultErrnoRet) {
 			td.DefaultErrnoRetChanged = true
 		}
-		if len(committed.Architectures) > 0 {
-			commArch := make(map[string]bool, len(committed.Architectures))
-			for _, a := range committed.Architectures {
+	}
+	if current != nil {
+		currArchs := current.EffectiveArchitectures()
+		if committed != nil && len(committed.EffectiveArchitectures()) > 0 {
+			commArchs := committed.EffectiveArchitectures()
+			commArch := make(map[string]bool, len(commArchs))
+			for _, a := range commArchs {
 				commArch[a] = true
 			}
 			seenExtra := make(map[string]bool)
-			for _, a := range current.Architectures {
+			for _, a := range currArchs {
 				if !commArch[a] && !seenExtra[a] {
 					seenExtra[a] = true
 					td.AddedArchitectures = append(td.AddedArchitectures, a)
 				}
 			}
-			sort.Strings(td.AddedArchitectures)
+		} else {
+			seenExtra := make(map[string]bool)
+			for _, a := range currArchs {
+				if a != "SCMP_ARCH_X86_64" && a != "SCMP_ARCH_AARCH64" && !seenExtra[a] {
+					seenExtra[a] = true
+					td.AddedArchitectures = append(td.AddedArchitectures, a)
+				}
+			}
 		}
+		sort.Strings(td.AddedArchitectures)
 	}
 
 	committedUncond, committedCond, err := allowRuleSets([]*profile.OCISeccompProfile{committed})
@@ -513,9 +534,7 @@ func EvaluateGate(diffs []*TargetDiff, onChange string, failOn string) (bool, st
 			}
 			msg := fmt.Sprintf("%s:%s (args changed)", d.TargetName, ac.Name)
 			unapprovedAny = append(unapprovedAny, msg)
-			if ac.Risk == RiskHigh {
-				unapprovedHigh = append(unapprovedHigh, msg)
-			}
+			unapprovedHigh = append(unapprovedHigh, msg)
 		}
 	}
 
@@ -584,10 +603,10 @@ func isExpired(expires string, now time.Time) bool {
 }
 
 // FileChanged reports whether two files differ. If both are missing it returns
-// false; if only one exists or reading fails otherwise, it returns true.
+// false; if only one exists or reading fails (including symlinks) it returns true.
 func FileChanged(aPath, bPath string) bool {
-	ab, aErr := os.ReadFile(aPath)
-	bb, bErr := os.ReadFile(bPath)
+	ab, aErr := profile.ReadFileNoSymlink(aPath)
+	bb, bErr := profile.ReadFileNoSymlink(bPath)
 	if aErr != nil || bErr != nil {
 		if os.IsNotExist(aErr) && os.IsNotExist(bErr) {
 			return false

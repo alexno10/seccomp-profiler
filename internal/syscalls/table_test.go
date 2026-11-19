@@ -61,13 +61,38 @@ func TestSyscallTableRoundTripAndArchSpecific(t *testing.T) {
 		}
 	}
 
-	// Arch-specific exclusions: arch_prctl/access/dup2 exist on amd64, not arm64.
-	for _, name := range []string{"arch_prctl", "access", "dup2"} {
+	// Arch-specific exclusions: arch_prctl/access/dup2/uprobe exist on amd64, not arm64.
+	for _, name := range []string{"arch_prctl", "access", "dup2", "uprobe"} {
 		if _, ok := syscalls.NumberByName(syscalls.ArchAMD64, name); !ok {
 			t.Fatalf("expected %q to exist on amd64", name)
 		}
 		if _, ok := syscalls.NumberByName(syscalls.ArchARM64, name); ok {
 			t.Fatalf("expected %q not to exist on arm64", name)
+		}
+	}
+
+	// Linux 6.13–7.0 shared syscalls (463..472) must exist on both amd64 and arm64.
+	for nr, name := range map[int]string{
+		463: "setxattrat",
+		464: "getxattrat",
+		465: "listxattrat",
+		466: "removexattrat",
+		467: "open_tree_attr",
+		468: "file_getattr",
+		469: "file_setattr",
+		470: "listns",
+		471: "rseq_slice_yield",
+		472: "fchroot",
+	} {
+		for _, arch := range []syscalls.Arch{syscalls.ArchAMD64, syscalls.ArchARM64} {
+			gotName, ok := syscalls.NameByNumber(arch, nr)
+			if !ok || gotName != name {
+				t.Fatalf("arch=%s nr=%d got (%q, %v), want (%q, true)", arch, nr, gotName, ok, name)
+			}
+			gotNr, ok := syscalls.NumberByName(arch, name)
+			if !ok || gotNr != nr {
+				t.Fatalf("arch=%s name=%q got (%d, %v), want (%d, true)", arch, name, gotNr, ok, nr)
+			}
 		}
 	}
 }

@@ -12,15 +12,15 @@ import (
 // ring buffer samples.
 func FuzzDecodeKernelEvent(f *testing.F) {
 	f.Add([]byte{1, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, '/', 0})
-	f.Add(make([]byte, 272))
+	f.Add(make([]byte, ebpf.RawKernelEventSize))
 
-	mkdirSeed := make([]byte, 272)
+	mkdirSeed := make([]byte, ebpf.RawKernelEventSize)
 	binary.LittleEndian.PutUint32(mkdirSeed[0:4], ebpf.EventCgroupMkdir)
 	binary.LittleEndian.PutUint64(mkdirSeed[8:16], 4242)
 	copy(mkdirSeed[16:], "/docker/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 	f.Add(mkdirSeed)
 
-	execSeed := make([]byte, 272)
+	execSeed := make([]byte, ebpf.RawKernelEventSize)
 	binary.LittleEndian.PutUint32(execSeed[0:4], ebpf.EventExec)
 	binary.LittleEndian.PutUint64(execSeed[8:16], 4242)
 	copy(execSeed[16:], "/usr/local/bin/app")

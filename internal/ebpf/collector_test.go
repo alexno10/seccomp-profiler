@@ -16,7 +16,7 @@ func TestDecodeKernelEvent(t *testing.T) {
 	_ = binary.Write(&raw, binary.LittleEndian, uint32(ebpf.EventCgroupMkdir))
 	_ = binary.Write(&raw, binary.LittleEndian, uint32(0))
 	_ = binary.Write(&raw, binary.LittleEndian, uint64(424242))
-	var pathBytes [256]byte
+	var pathBytes [512]byte
 	copy(pathBytes[:], "/system.slice/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope")
 	raw.Write(pathBytes[:])
 
@@ -32,7 +32,7 @@ func TestDecodeKernelEvent(t *testing.T) {
 	_ = binary.Write(&raw, binary.LittleEndian, uint32(ebpf.EventExec))
 	_ = binary.Write(&raw, binary.LittleEndian, uint32(0))
 	_ = binary.Write(&raw, binary.LittleEndian, uint64(424242))
-	var execBytes [256]byte
+	var execBytes [512]byte
 	copy(execBytes[:], "/usr/local/bin/python3")
 	raw.Write(execBytes[:])
 
@@ -49,7 +49,7 @@ func isHexCharMirror(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
 }
 
-func checkHexAnchorMirror(path *[256]byte, anchor int) bool {
+func checkHexAnchorMirror(path *[512]byte, anchor int) bool {
 	if !isHexCharMirror(path[anchor]) {
 		return false
 	}
@@ -73,22 +73,27 @@ func checkHexAnchorMirror(path *[256]byte, anchor int) bool {
 }
 
 func has64HexIDMirror(s string) bool {
-	var buf [256]byte
-	if len(s) >= 256 {
-		copy(buf[:255], s[:255])
+	var buf [512]byte
+	if len(s) >= 512 {
+		copy(buf[:511], s[:511])
 	} else {
 		copy(buf[:], s)
 	}
-	return checkHexAnchorMirror(&buf, 63) || checkHexAnchorMirror(&buf, 127) || checkHexAnchorMirror(&buf, 191)
+	for _, anchor := range []int{63, 127, 191, 255, 319, 383, 447} {
+		if checkHexAnchorMirror(&buf, anchor) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAnchor64HexDetectionExhaustiveOffsets(t *testing.T) {
 	const cid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	for start := 0; start <= 191; start++ {
+	for start := 0; start <= 447; start++ {
 		prefix := bytes.Repeat([]byte{'/'}, start)
 		path := string(prefix) + cid + ".scope"
-		if len(path) > 255 {
-			path = path[:255]
+		if len(path) > 511 {
+			path = path[:511]
 		}
 		if !has64HexIDMirror(path) {
 			t.Fatalf("expected 64-hex match at start offset %d", start)
@@ -96,14 +101,63 @@ func TestAnchor64HexDetectionExhaustiveOffsets(t *testing.T) {
 	}
 	// 63 hex chars must never match at any offset
 	shortCID := cid[:63]
-	for start := 0; start <= 192; start++ {
+	for start := 0; start <= 448; start++ {
 		prefix := bytes.Repeat([]byte{'/'}, start)
 		path := string(prefix) + shortCID + ".scope"
-		if len(path) > 255 {
-			path = path[:255]
+		if len(path) > 511 {
+			path = path[:511]
 		}
 		if has64HexIDMirror(path) {
 			t.Fatalf("unexpected match for 63-hex string at offset %d", start)
+		}
+	}
+}
+
+func isDecimalFDMirror(s string) bool {
+	if len(s) == 0 || len(s) >= 12 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isRuntimeSelfrefMirror(filename string) bool {
+	if filename == "/proc/self/exe" {
+		return true
+	}
+	if strings.HasPrefix(filename, "/proc/self/fd/") {
+		return isDecimalFDMirror(filename[len("/proc/self/fd/"):])
+	}
+	if strings.HasPrefix(filename, "/dev/fd/") {
+		return isDecimalFDMirror(filename[len("/dev/fd/"):])
+	}
+	return false
+}
+
+func TestIsRuntimeSelfrefRejectsTraversalAndMemfdPrefixes(t *testing.T) {
+	for _, match := range []string{"/proc/self/exe", "/proc/self/fd/3", "/dev/fd/0", "/dev/fd/123"} {
+		if !isRuntimeSelfrefMirror(match) {
+			t.Fatalf("expected %q to match exact selfref", match)
+		}
+	}
+	for _, bypass := range []string{
+		"/proc/self/root/bin/sh",
+		"/proc/self/cwd/app",
+		"/proc/self/exe2",
+		"/proc/self/fd/3/evil",
+		"/proc/self/fd/",
+		"/dev/fd/",
+		"/dev/fd/abc",
+		"/dev/fd/3/evil",
+		"/memfd:app",
+		"",
+	} {
+		if isRuntimeSelfrefMirror(bypass) {
+			t.Fatalf("selfref bypass must NOT match %q", bypass)
 		}
 	}
 }
@@ -145,7 +199,8 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 		t.Fatal("profiler.bpf.c must explicitly check __TARGET_ARCH_x86 and error on unsupported arch")
 	}
 
-	// Task 2: is_runtime_selfref must not treat empty filename as self-ref.
+	// Task 2 + C1: is_runtime_selfref must not treat empty filename, /memfd:,
+	// or open prefix (/proc/self/root...) as self-ref.
 	selfRefIdx := strings.Index(src, "int is_runtime_selfref(")
 	if selfRefIdx == -1 {
 		t.Fatal("missing is_runtime_selfref")
@@ -154,6 +209,9 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 	selfRefBody := src[selfRefIdx : selfRefIdx+selfRefEnd]
 	if strings.Contains(selfRefBody, "filename[0] == '\\0'") {
 		t.Fatal("is_runtime_selfref must not treat empty filename as self-referential")
+	}
+	if strings.Contains(selfRefBody, "memfd") || !strings.Contains(selfRefBody, "is_decimal_fd") {
+		t.Fatal("is_runtime_selfref must require exact /proc/self/exe or numeric fd target without /memfd:")
 	}
 
 	// Task 2: post-exec in handle_sched_process_exec must not keep tid suppressed solely via is_runtime_comm.
@@ -166,9 +224,12 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 		t.Fatal("handle_sched_process_exec must not suppress workload entrypoints merely named runc/crun")
 	}
 
-	// Task 2: sched_process_exit cleanup must exist.
-	if !strings.Contains(src, "tracepoint/sched/sched_process_exit") {
-		t.Fatal("missing sched_process_exit cleanup hook")
+	// C2/C3/C4: cgroup_mkdir and sched_process_exit must use raw_tracepoint, inherit parent syscalls_per_cgroup, and count truncations.
+	if !strings.Contains(src, "raw_tracepoint/cgroup_mkdir") || !strings.Contains(src, "path_truncations") {
+		t.Fatal("missing raw_tracepoint/cgroup_mkdir or path_truncations handling")
+	}
+	if !strings.Contains(src, "raw_tracepoint/sched_process_exit") {
+		t.Fatal("missing raw_tracepoint/sched_process_exit cleanup hook")
 	}
 
 	// Task 2: fork/exec hooks must block non-runtime threads already inside syscalls_per_cgroup.
@@ -254,6 +315,10 @@ func TestBPFErrorStatsAndSafetyInvariants(t *testing.T) {
 			t.Fatalf("collector_linux.go must not attach per-syscall tracepoint %q", banned)
 		}
 	}
+	if !strings.Contains(string(collectorLinuxSrc), `attach raw_tracepoint/sched_process_exit`) ||
+		!strings.Contains(string(collectorLinuxSrc), `attach raw_tracepoint/cgroup_mkdir`) {
+		t.Fatal("collector_linux.go must fatally attach raw_tracepoint/cgroup_mkdir and raw_tracepoint/sched_process_exit")
+	}
 }
 
 func TestSelectBPFCollectionSourcePrecedence(t *testing.T) {
@@ -308,7 +373,7 @@ func TestDecodeKernelEventErrorsAndEdgeCases(t *testing.T) {
 		}
 	}
 
-	// 3. Full 256-byte non-NUL-terminated path is truncated safely to 256 bytes without NUL.
+	// 3. Full 512-byte non-NUL-terminated path is truncated safely to 512 bytes without NUL.
 	buf := make([]byte, ebpf.RawKernelEventSize)
 	binary.LittleEndian.PutUint32(buf[0:4], ebpf.EventExec)
 	binary.LittleEndian.PutUint64(buf[8:16], 12345)
@@ -319,7 +384,7 @@ func TestDecodeKernelEventErrorsAndEdgeCases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeKernelEvent full non-NUL buffer failed: %v", err)
 	}
-	if len(ev.ExecFilename) != 256 || ev.CgroupPath != "" || ev.CgroupID != 12345 {
+	if len(ev.ExecFilename) != 512 || ev.CgroupPath != "" || ev.CgroupID != 12345 {
 		t.Fatalf("unexpected decoded event: %+v (len=%d)", ev, len(ev.ExecFilename))
 	}
 
@@ -331,6 +396,7 @@ func TestDecodeKernelEventErrorsAndEdgeCases(t *testing.T) {
 		{CgroupMapFull: 1},
 		{RingbufDrops: 2},
 		{OobSyscalls: 3},
+		{PathTruncations: 4},
 	} {
 		if !es.Any() {
 			t.Fatalf("expected Any() true for %+v", es)

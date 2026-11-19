@@ -11,9 +11,10 @@
 //      (setns, mount, ...) are suppressed (covers crun which does not re-exec).
 //   3. tracepoint/sched/sched_process_exec: an exec is only treated as a
 //      runtime self-exec when the exec was *initiated by runc/crun* (pending
-//      flag) AND lands on a self-referential binary (/proc/self/*, /dev/fd/*,
-//      /memfd:*). Every other exec unmarks the tid and activates/records the
-//      cgroup - including container entrypoints named "runc"/"crun",
+//      flag) AND lands on an exact self-referential procfs/fd target
+//      (/proc/self/exe, /proc/self/fd/<digits>, /dev/fd/<digits>). Every other
+//      exec unmarks the tid and activates/records the cgroup - including
+//      /proc/self/root/* paths, container entrypoints named "runc"/"crun",
 //      application re-execs via /proc/self/exe, and fexecve.
 //   4. raw_tracepoint/sys_enter: suppression is keyed ONLY on the tid map,
 //      and workload threads inside syscalls_per_cgroup can never add tids to
@@ -44,7 +45,7 @@ typedef unsigned long long __u64;
 #define EVENT_EXEC 2
 
 #define MAX_SYSCALLS 512
-#define MAX_PATH_LEN 256
+#define MAX_PATH_LEN 512
 
 #define TS_COMPAT 0x0002
 #define TIF_32BIT (1ULL << 22)
@@ -59,6 +60,7 @@ struct error_counters {
 	__u64 cgroup_map_full;
 	__u64 ringbuf_drops;
 	__u64 oob_syscalls;
+	__u64 path_truncations;
 };
 
 struct kernel_event {
@@ -139,14 +141,6 @@ static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *unsafe_p
 static long (*bpf_probe_read_kernel_str)(void *dst, __u32 size, const void *unsafe_ptr) = (void *)115;
 static long (*bpf_ringbuf_output)(void *ringbuf, void *data, __u64 size, __u64 flags) = (void *)130;
 
-struct trace_event_raw_cgroup_mkdir {
-	__u64 unused;
-	int root;
-	int level;
-	__u64 id;
-	__u32 __data_loc_path;
-};
-
 struct trace_event_raw_sched_process_exec {
 	__u64 unused;
 	__u32 __data_loc_filename;
@@ -157,6 +151,30 @@ struct trace_event_raw_sched_process_exec {
 struct bpf_raw_tracepoint_args {
 	__u64 args[2];
 };
+
+// Minimal CO-RE cgroup hierarchy structs resolved by name against kernel BTF
+// (used in raw_tracepoint/cgroup_mkdir to filter cgroup v1 hierarchies and
+// propagate active tracking into newly created container sub-cgroups).
+struct kernfs_node {
+	__u64 id;
+} __attribute__((preserve_access_index));
+
+struct cgroup_root {
+	int hierarchy_id;
+} __attribute__((preserve_access_index));
+
+struct cgroup;
+
+struct cgroup_subsys_state {
+	struct cgroup *cgroup;
+	struct cgroup_subsys_state *parent;
+} __attribute__((preserve_access_index));
+
+struct cgroup {
+	struct cgroup_subsys_state self;
+	struct cgroup_root *root;
+	struct kernfs_node *kn;
+} __attribute__((preserve_access_index));
 
 static __inline struct error_counters *get_error_counters(void) {
 	__u32 zero = 0;
@@ -192,7 +210,8 @@ static __inline int check_hex_anchor(const char *path, int anchor) {
 	return 1;
 }
 
-// Every 64-byte substring inside NUL-terminated path[0..254] straddles index 63, 127, or 191.
+// Every 64-byte substring inside NUL-terminated path[0..510] straddles at
+// least one of these 7 fixed anchor offsets (63..447).
 static __inline int has_64_hex_id(const char *path) {
 	if (check_hex_anchor(path, 63)) {
 		return 1;
@@ -201,6 +220,18 @@ static __inline int has_64_hex_id(const char *path) {
 		return 1;
 	}
 	if (check_hex_anchor(path, 191)) {
+		return 1;
+	}
+	if (check_hex_anchor(path, 255)) {
+		return 1;
+	}
+	if (check_hex_anchor(path, 319)) {
+		return 1;
+	}
+	if (check_hex_anchor(path, 383)) {
+		return 1;
+	}
+	if (check_hex_anchor(path, 447)) {
 		return 1;
 	}
 	return 0;
@@ -244,25 +275,45 @@ struct task_struct {
 	int pid;
 } __attribute__((preserve_access_index));
 
+static __inline int is_decimal_fd(const char *s) {
+	int digits = 0;
+	for (int i = 0; i < 12; i++) {
+		unsigned char c = (unsigned char)s[i];
+		if (c == '\0') {
+			return digits > 0;
+		}
+		if (c < '0' || c > '9') {
+			return 0;
+		}
+		digits++;
+	}
+	return 0;
+}
+
 // Self-referential exec targets used by runc bootstrap re-execs. Only
-// consulted for execs that runtime initiated (exec_pending), so application
-// re-execs of /proc/self/exe or fexecve/memfd payloads are never suppressed.
+// consulted for execs that runtime initiated (exec_pending). Strictly matches
+// exact "/proc/self/exe", "/proc/self/fd/<digits>", or "/dev/fd/<digits>" so
+// paths like "/proc/self/root/bin/sh" or "/memfd:app" cannot keep a container
+// workload suppressed in runtime_tids.
 static __inline int is_runtime_selfref(const char *filename) {
-	// "/proc/self/" (covers both "/proc/self/exe" and "/proc/self/fd/<N>")
+	// Exact "/proc/self/exe\0"
 	if (filename[0] == '/' && filename[1] == 'p' && filename[2] == 'r' && filename[3] == 'o' &&
 	    filename[4] == 'c' && filename[5] == '/' && filename[6] == 's' && filename[7] == 'e' &&
-	    filename[8] == 'l' && filename[9] == 'f' && filename[10] == '/') {
+	    filename[8] == 'l' && filename[9] == 'f' && filename[10] == '/' &&
+	    filename[11] == 'e' && filename[12] == 'x' && filename[13] == 'e' && filename[14] == '\0') {
 		return 1;
 	}
-	// "/dev/fd/"
+	// Exact "/proc/self/fd/<digits>\0"
+	if (filename[0] == '/' && filename[1] == 'p' && filename[2] == 'r' && filename[3] == 'o' &&
+	    filename[4] == 'c' && filename[5] == '/' && filename[6] == 's' && filename[7] == 'e' &&
+	    filename[8] == 'l' && filename[9] == 'f' && filename[10] == '/' &&
+	    filename[11] == 'f' && filename[12] == 'd' && filename[13] == '/') {
+		return is_decimal_fd(&filename[14]);
+	}
+	// Exact "/dev/fd/<digits>\0"
 	if (filename[0] == '/' && filename[1] == 'd' && filename[2] == 'e' && filename[3] == 'v' &&
 	    filename[4] == '/' && filename[5] == 'f' && filename[6] == 'd' && filename[7] == '/') {
-		return 1;
-	}
-	// "/memfd:" (cloned memfd re-execs)
-	if (filename[0] == '/' && filename[1] == 'm' && filename[2] == 'e' && filename[3] == 'm' &&
-	    filename[4] == 'f' && filename[5] == 'd' && filename[6] == ':') {
-		return 1;
+		return is_decimal_fd(&filename[8]);
 	}
 	return 0;
 }
@@ -314,38 +365,118 @@ static __inline int is_execve_syscall(long id) {
 #endif
 }
 
-SEC("tracepoint/cgroup/cgroup_mkdir")
-int handle_cgroup_mkdir(struct trace_event_raw_cgroup_mkdir *ctx) {
+// Cgroup v2 creation & sub-cgroup propagation: attached as raw_tracepoint
+// (args[0] = struct cgroup *cgrp, args[1] = const char *path) so we can:
+//   - ignore cgroup v1 multi-hierarchy events (hierarchy_id != 0),
+//   - propagate active tracking immediately into sub-cgroups created by tracked
+//     containers (even if a process migrates into them without execve),
+//   - detect >=511-byte path truncations fail-closed.
+SEC("raw_tracepoint/cgroup_mkdir")
+int handle_cgroup_mkdir(struct bpf_raw_tracepoint_args *ctx) {
+	struct cgroup *cgrp = (struct cgroup *)ctx->args[0];
+	const char *path_ptr = (const char *)ctx->args[1];
+	if (!cgrp || !path_ptr) {
+		return 0;
+	}
+
+	struct cgroup_root *root = 0;
+	if (bpf_probe_read_kernel(&root, sizeof(root),
+	    __builtin_preserve_access_index(&cgrp->root)) != 0 || !root) {
+		return 0;
+	}
+	int hierarchy_id = -1;
+	if (bpf_probe_read_kernel(&hierarchy_id, sizeof(hierarchy_id),
+	    __builtin_preserve_access_index(&root->hierarchy_id)) != 0 || hierarchy_id != 0) {
+		return 0;
+	}
+
+	struct kernfs_node *kn = 0;
+	if (bpf_probe_read_kernel(&kn, sizeof(kn),
+	    __builtin_preserve_access_index(&cgrp->kn)) != 0 || !kn) {
+		return 0;
+	}
+	__u64 cgroup_id = 0;
+	if (bpf_probe_read_kernel(&cgroup_id, sizeof(cgroup_id),
+	    __builtin_preserve_access_index(&kn->id)) != 0 || cgroup_id == 0) {
+		return 0;
+	}
+
+	__u8 parent_active = 0;
+	struct cgroup *cur = cgrp;
+	#pragma unroll
+	for (int depth = 0; depth < 8; depth++) {
+		struct cgroup_subsys_state *pcss = 0;
+		if (bpf_probe_read_kernel(&pcss, sizeof(pcss),
+		    __builtin_preserve_access_index(&cur->self.parent)) != 0 || !pcss) {
+			break;
+		}
+		struct cgroup *pcgrp = 0;
+		if (bpf_probe_read_kernel(&pcgrp, sizeof(pcgrp),
+		    __builtin_preserve_access_index(&pcss->cgroup)) != 0 || !pcgrp) {
+			break;
+		}
+		struct kernfs_node *pkn = 0;
+		if (bpf_probe_read_kernel(&pkn, sizeof(pkn),
+		    __builtin_preserve_access_index(&pcgrp->kn)) != 0 || !pkn) {
+			break;
+		}
+		__u64 pcg_id = 0;
+		if (bpf_probe_read_kernel(&pcg_id, sizeof(pcg_id),
+		    __builtin_preserve_access_index(&pkn->id)) != 0 || pcg_id == 0) {
+			break;
+		}
+		if (bpf_map_lookup_elem(&syscalls_per_cgroup, &pcg_id)) {
+			parent_active = 1;
+			break;
+		}
+		cur = pcgrp;
+	}
+
 	__u32 zero = 0;
 	struct kernel_event *ev = bpf_map_lookup_elem(&scratch_events, &zero);
 	if (!ev) {
 		return 0;
 	}
 
-	__u32 data_loc = ctx->__data_loc_path;
-	__u16 offset = data_loc & 0xffff;
-	if (offset < 12U || offset >= 4096U) {
-		return 0;
-	}
-	const char *path_ptr = (const char *)ctx + offset;
-
-	__builtin_memset(ev->path, 0, sizeof(ev->path));
+	__builtin_memset(ev->path, 0, 256);
+	__builtin_memset(ev->path + 256, 0, 256);
 	long n = bpf_probe_read_kernel_str(ev->path, sizeof(ev->path), path_ptr);
-	if (n <= 0) {
-		return 0;
-	}
-
-	if (!has_64_hex_id(ev->path)) {
-		return 0;
-	}
-
-	__u64 cgroup_id = ctx->id;
-	__u8 state = STATE_PENDING_EXEC;
-	long ret = bpf_map_update_elem(&candidate_cgroups, &cgroup_id, &state, BPF_ANY);
-	if (ret != 0) {
+	if (n <= 0 || n == sizeof(ev->path)) {
 		struct error_counters *e = get_error_counters();
 		if (e) {
-			__sync_fetch_and_add(&e->cgroup_map_full, 1);
+			__sync_fetch_and_add(&e->path_truncations, 1);
+		}
+		if (parent_active) {
+			long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
+			if (ret != 0 && ret != -17) {
+				if (e) {
+					__sync_fetch_and_add(&e->cgroup_map_full, 1);
+				}
+			}
+		}
+		return 0;
+	}
+
+	if (!parent_active && !has_64_hex_id(ev->path)) {
+		return 0;
+	}
+
+	if (parent_active) {
+		long ret = bpf_map_update_elem(&syscalls_per_cgroup, &cgroup_id, &empty_stats, BPF_NOEXIST);
+		if (ret != 0 && ret != -17) {
+			struct error_counters *e = get_error_counters();
+			if (e) {
+				__sync_fetch_and_add(&e->cgroup_map_full, 1);
+			}
+		}
+	} else {
+		__u8 state = STATE_PENDING_EXEC;
+		long ret = bpf_map_update_elem(&candidate_cgroups, &cgroup_id, &state, BPF_ANY);
+		if (ret != 0) {
+			struct error_counters *e = get_error_counters();
+			if (e) {
+				__sync_fetch_and_add(&e->cgroup_map_full, 1);
+			}
 		}
 	}
 
@@ -453,7 +584,8 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	__u32 data_loc = ctx->__data_loc_filename;
 	__u16 offset = data_loc & 0xffff;
 
-	__builtin_memset(ev->path, 0, sizeof(ev->path));
+	__builtin_memset(ev->path, 0, 256);
+	__builtin_memset(ev->path + 256, 0, 256);
 	long read_ok = -1;
 	if (offset >= 12U && offset < 4096U) {
 		const char *fname_ptr = (const char *)ctx + offset;
@@ -535,8 +667,8 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	return 0;
 }
 
-SEC("tracepoint/sched/sched_process_exit")
-int handle_sched_process_exit(void *ctx) {
+SEC("raw_tracepoint/sched_process_exit")
+int handle_sched_process_exit(struct bpf_raw_tracepoint_args *ctx) {
 	(void)ctx;
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	bpf_map_delete_elem(&runtime_tids, &tid);

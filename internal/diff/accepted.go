@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/alexno10/seccomp-profiler/internal/profile"
 )
 
 type ApprovalEntry struct {
@@ -39,7 +41,7 @@ func LoadApprovals(path string) ([]ApprovalEntry, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := profile.ReadFileNoSymlink(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil

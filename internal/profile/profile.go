@@ -1,10 +1,13 @@
 package profile
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,18 +30,65 @@ const cloneNewNamespaceMask = 2114060288
 // musl fall back to older syscall paths (clone3->clone, faccessat2, statx...).
 const errnoRetENOSYS uint32 = 38
 
+type OCISeccompArchMap struct {
+	Architecture     string   `json:"architecture"`
+	SubArchitectures []string `json:"subArchitectures,omitempty"`
+}
+
 type OCISeccompProfile struct {
-	DefaultAction   string           `json:"defaultAction"`
-	DefaultErrnoRet *uint32          `json:"defaultErrnoRet,omitempty"`
-	Architectures   []string         `json:"architectures"`
-	Syscalls        []OCISyscallRule `json:"syscalls"`
+	DefaultAction    string              `json:"defaultAction"`
+	DefaultErrnoRet  *uint32             `json:"defaultErrnoRet,omitempty"`
+	Architectures    []string            `json:"architectures,omitempty"`
+	ArchMap          []OCISeccompArchMap `json:"archMap,omitempty"`
+	Flags            []string            `json:"flags,omitempty"`
+	ListenerPath     string              `json:"listenerPath,omitempty"`
+	ListenerMetadata string              `json:"listenerMetadata,omitempty"`
+	Comment          string              `json:"comment,omitempty"`
+	Syscalls         []OCISyscallRule    `json:"syscalls"`
+}
+
+// EffectiveArchitectures returns the sorted deduplicated union of Architectures
+// and ArchMap entries (both Architecture and SubArchitectures).
+func (p *OCISeccompProfile) EffectiveArchitectures() []string {
+	if p == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	add := func(a string) {
+		a = strings.TrimSpace(a)
+		if a != "" && !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	for _, a := range p.Architectures {
+		add(a)
+	}
+	for _, m := range p.ArchMap {
+		add(m.Architecture)
+		for _, sub := range m.SubArchitectures {
+			add(sub)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+type OCISyscallFilter struct {
+	Caps      []string `json:"caps,omitempty"`
+	Arches    []string `json:"arches,omitempty"`
+	MinKernel string   `json:"minKernel,omitempty"`
 }
 
 type OCISyscallRule struct {
-	Names    []string        `json:"names"`
-	Action   string          `json:"action"`
-	ErrnoRet *uint32         `json:"errnoRet,omitempty"`
-	Args     []OCISyscallArg `json:"args,omitempty"`
+	Names    []string          `json:"names"`
+	Action   string            `json:"action"`
+	ErrnoRet *uint32           `json:"errnoRet,omitempty"`
+	Args     []OCISyscallArg   `json:"args,omitempty"`
+	Comment  string            `json:"comment,omitempty"`
+	Includes *OCISyscallFilter `json:"includes,omitempty"`
+	Excludes *OCISyscallFilter `json:"excludes,omitempty"`
 }
 
 type OCISyscallArg struct {
@@ -188,7 +238,7 @@ func Build(target selector.MatchedTarget, opts BuildOptions) (*BuiltProfile, err
 		}
 		name, ok := syscalls.NameByNumber(arch, nr)
 		if !ok {
-			continue
+			return nil, fmt.Errorf("observed unknown syscall number %d on arch %q (%d calls): update internal/syscalls tables", nr, arch, count)
 		}
 		addSource(name, baseline.SourceObserved)
 		entries[name].TotalCalls += uint64(count)
@@ -337,7 +387,7 @@ func loadLockFile(lockFile string) (lockFileSchema, error) {
 	if strings.TrimSpace(lockFile) == "" {
 		return lock, nil
 	}
-	lockData, err := os.ReadFile(lockFile)
+	lockData, err := ReadFileNoSymlink(lockFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return lock, nil
@@ -365,11 +415,7 @@ func saveLockFile(lockFile string, lock lockFileSchema) error {
 		return err
 	}
 	lockBytes = append(lockBytes, '\n')
-	if err := writeFileAtomic(lockFile, lockBytes); err != nil {
-		return err
-	}
-	chownToSudoUser(lockFile)
-	return nil
+	return writeFileAtomic(lockFile, lockBytes)
 }
 
 // LoadLockHashes loads a snapshot of existing target->sha256 entries from
@@ -423,7 +469,6 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 		if err := writeFileAtomic(rawPath, rawBytes); err != nil {
 			return nil, err
 		}
-		chownToSudoUser(rawPath)
 
 		res := WriteResult{
 			TargetName:  b.TargetName,
@@ -431,7 +476,7 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 			RawPath:     rawPath,
 		}
 
-		if existingBytes, err := os.ReadFile(profilePath); err == nil {
+		if existingBytes, err := ReadFileNoSymlink(profilePath); err == nil {
 			existingHash := sha256Hex(existingBytes)
 			lockedHash, hasLock := lock.Files[b.TargetName]
 			if !hasLock || lockedHash != existingHash {
@@ -440,7 +485,6 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 				if err := writeFileAtomic(res.SuggestedPath, ociBytes); err != nil {
 					return nil, err
 				}
-				chownToSudoUser(res.SuggestedPath)
 				results = append(results, res)
 				continue
 			}
@@ -451,7 +495,6 @@ func WriteTargetFiles(outDir, rawDir, lockFile string, built []*BuiltProfile) ([
 		if err := writeFileAtomic(profilePath, ociBytes); err != nil {
 			return nil, err
 		}
-		chownToSudoUser(profilePath)
 		lock.Files[b.TargetName] = sha256Hex(ociBytes)
 		results = append(results, res)
 	}
@@ -526,14 +569,13 @@ func SyncCommittedProfiles(
 		}
 		ociBytes = append(ociBytes, '\n')
 
-		if existing, err := os.ReadFile(path); err == nil {
+		if existing, err := ReadFileNoSymlink(path); err == nil {
 			locked, hasLock := baselineHashes[b.TargetName]
 			if !hasLock || locked != sha256Hex(existing) {
 				suggested := filepath.Join(filepath.Dir(path), b.TargetName+".suggested.json")
 				if err := writeFileAtomic(suggested, ociBytes); err != nil {
 					return nil, err
 				}
-				chownToSudoUser(suggested)
 				updated = append(updated, suggested)
 				continue
 			}
@@ -546,7 +588,6 @@ func SyncCommittedProfiles(
 		if err := writeFileAtomic(path, ociBytes); err != nil {
 			return nil, err
 		}
-		chownToSudoUser(path)
 		lock.Files[b.TargetName] = sha256Hex(ociBytes)
 		lockDirty = true
 		updated = append(updated, path)
@@ -623,73 +664,11 @@ func ValidateTargetName(name string) error {
 	return nil
 }
 
-func mkdirAllChown(dir string, perm os.FileMode) error {
-	if strings.TrimSpace(dir) == "" || dir == "." {
-		return nil
-	}
-	var missing []string
-	cur := filepath.Clean(dir)
-	for {
-		if _, err := os.Lstat(cur); err == nil {
-			break
-		} else if !os.IsNotExist(err) {
-			return err
-		}
-		missing = append(missing, cur)
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			break
-		}
-		cur = parent
-	}
-	if err := os.MkdirAll(dir, perm); err != nil {
-		return err
-	}
-	for i := len(missing) - 1; i >= 0; i-- {
-		chownToSudoUser(missing[i])
-	}
-	return nil
-}
-
-func writeFileAtomic(path string, data []byte) error {
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to overwrite symlink %s", path)
-	} else if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".seccomp-profiler-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	chownToSudoUser(tmpName)
-	return os.Rename(tmpName, path)
-}
-
-// chownToSudoUser hands root-owned output files back to the CI runner user
-// (sudo sets SUDO_UID/SUDO_GID for the daemon process).
-func chownToSudoUser(paths ...string) {
+func sudoUserIDs() (int, int) {
 	uidStr := os.Getenv("SUDO_UID")
 	gidStr := os.Getenv("SUDO_GID")
 	if uidStr == "" && gidStr == "" {
-		return
+		return -1, -1
 	}
 	uid := -1
 	gid := -1
@@ -699,28 +678,252 @@ func chownToSudoUser(paths ...string) {
 	if v, err := strconv.Atoi(gidStr); err == nil && v >= 0 {
 		gid = v
 	}
-	if uid < 0 && gid < 0 {
-		return
-	}
-	for _, p := range paths {
-		_ = os.Chown(p, uid, gid)
-	}
+	return uid, gid
 }
 
-func LoadOCIProfile(path string) (*OCISeccompProfile, error) {
-	data, err := os.ReadFile(path)
+// openNoSymlinkDir verifies every existing directory component via os.Lstat
+// (rejecting any symlink component), opens the deepest existing directory via
+// os.OpenRoot, and traverses/creates any remaining components inside os.Root
+// without following symlinks.
+func openNoSymlinkDir(dir string, create bool, perm os.FileMode) (*os.Root, error) {
+	if strings.TrimSpace(dir) == "" {
+		dir = "."
+	}
+	absDir, err := filepath.Abs(filepath.Clean(dir))
 	if err != nil {
 		return nil, err
 	}
-	var p OCISeccompProfile
-	if err := json.Unmarshal(data, &p); err != nil {
+	var rootBase, rel string
+	if vol := filepath.VolumeName(absDir); vol != "" {
+		rootBase = vol + string(filepath.Separator)
+		rel = strings.TrimPrefix(absDir, rootBase)
+	} else {
+		rootBase = string(filepath.Separator)
+		rel = strings.TrimPrefix(absDir, rootBase)
+	}
+
+	var parts []string
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if seg == "" || seg == "." {
+			continue
+		}
+		if seg == ".." {
+			return nil, fmt.Errorf("refusing path traversal segment %q in %q", seg, dir)
+		}
+		parts = append(parts, seg)
+	}
+
+	existingAnc := rootBase
+	nextIdx := 0
+	for i, seg := range parts {
+		candidate := filepath.Join(existingAnc, seg)
+		fi, lErr := os.Lstat(candidate)
+		if lErr != nil {
+			if os.IsNotExist(lErr) {
+				if !create {
+					return nil, lErr
+				}
+				break
+			}
+			return nil, lErr
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing to traverse symlink directory %q in %q", candidate, dir)
+		}
+		if !fi.IsDir() {
+			return nil, fmt.Errorf("path component %q in %q is not a directory", candidate, dir)
+		}
+		existingAnc = candidate
+		nextIdx = i + 1
+	}
+
+	cur, err := os.OpenRoot(existingAnc)
+	if err != nil {
 		return nil, err
+	}
+	uid, gid := sudoUserIDs()
+	for _, seg := range parts[nextIdx:] {
+		fi, lErr := cur.Lstat(seg)
+		if lErr != nil {
+			if os.IsNotExist(lErr) && create {
+				if mkErr := cur.Mkdir(seg, perm); mkErr != nil {
+					if !os.IsExist(mkErr) {
+						_ = cur.Close()
+						return nil, mkErr
+					}
+					fi2, lErr2 := cur.Lstat(seg)
+					if lErr2 != nil {
+						_ = cur.Close()
+						return nil, lErr2
+					}
+					if fi2.Mode()&os.ModeSymlink != 0 || !fi2.IsDir() {
+						_ = cur.Close()
+						return nil, fmt.Errorf("refusing non-directory or symlink segment %q in %q", seg, dir)
+					}
+				} else if uid >= 0 || gid >= 0 {
+					_ = cur.Lchown(seg, uid, gid)
+				}
+			} else {
+				_ = cur.Close()
+				return nil, lErr
+			}
+		} else {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				_ = cur.Close()
+				return nil, fmt.Errorf("refusing to traverse symlink directory %q in %q", seg, dir)
+			}
+			if !fi.IsDir() {
+				_ = cur.Close()
+				return nil, fmt.Errorf("path component %q in %q is not a directory", seg, dir)
+			}
+		}
+		next, oErr := cur.OpenRoot(seg)
+		_ = cur.Close()
+		if oErr != nil {
+			return nil, oErr
+		}
+		cur = next
+	}
+	return cur, nil
+}
+
+func mkdirAllChown(dir string, perm os.FileMode) error {
+	if strings.TrimSpace(dir) == "" || dir == "." {
+		return nil
+	}
+	r, err := openNoSymlinkDir(dir, true, perm)
+	if err != nil {
+		return err
+	}
+	return r.Close()
+}
+
+// WriteFileAtomicNoSymlink atomically writes data to path while verifying no
+// parent directory or destination is a symlink and assigning SUDO_UID:SUDO_GID
+// ownership on the open file descriptor before Rename (zero post-rename Chown TOCTOU).
+func WriteFileAtomicNoSymlink(path string, data []byte, chownToSudo bool) error {
+	clean := filepath.Clean(path)
+	dirRoot, err := openNoSymlinkDir(filepath.Dir(clean), true, 0o755)
+	if err != nil {
+		return err
+	}
+	defer dirRoot.Close()
+
+	base := filepath.Base(clean)
+	if base == "" || base == "." || base == ".." {
+		return fmt.Errorf("invalid target file name %q", path)
+	}
+	if info, err := dirRoot.Lstat(base); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to overwrite symlink %s", path)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return err
+	}
+	tmpName := ".seccomp-profiler-" + hex.EncodeToString(rnd[:])
+	tmp, err := dirRoot.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = dirRoot.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if chownToSudo {
+		if uid, gid := sudoUserIDs(); uid >= 0 || gid >= 0 {
+			_ = tmp.Chown(uid, gid)
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		if err := os.Rename(filepath.Join(filepath.Dir(clean), tmpName), clean); err != nil {
+			return err
+		}
+	} else {
+		if err := dirRoot.Rename(tmpName, base); err != nil {
+			return err
+		}
+	}
+	cleanupTmp = false
+	return nil
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	return WriteFileAtomicNoSymlink(path, data, true)
+}
+
+// ReadFileNoSymlink reads path without following symlinks in any directory
+// component or in the final path element.
+func ReadFileNoSymlink(path string) ([]byte, error) {
+	clean := filepath.Clean(path)
+	dirRoot, err := openNoSymlinkDir(filepath.Dir(clean), false, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dirRoot.Close()
+
+	base := filepath.Base(clean)
+	fi, err := dirRoot.Lstat(base)
+	if err != nil {
+		return nil, err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing to read symlink %s", path)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing to read non-regular file %s", path)
+	}
+	return dirRoot.ReadFile(base)
+}
+
+func LoadOCIProfile(path string) (*OCISeccompProfile, error) {
+	data, err := ReadFileNoSymlink(path)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var p OCISeccompProfile
+	if err := dec.Decode(&p); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, fmt.Errorf("seccomp profile %q: unexpected trailing JSON data", path)
+	}
+	if strings.TrimSpace(p.ListenerPath) != "" {
+		return nil, fmt.Errorf("seccomp profile %q uses unsupported listenerPath %q", path, p.ListenerPath)
+	}
+	for i, r := range p.Syscalls {
+		if r.Includes != nil || r.Excludes != nil {
+			return nil, fmt.Errorf("seccomp profile %q rule %d uses Docker conditional includes/excludes filters which cannot be safely flattened to static OCI rules", path, i)
+		}
 	}
 	return &p, nil
 }
 
 func LoadRawProfileV1(path string) (*RawProfileV1, error) {
-	data, err := os.ReadFile(path)
+	data, err := ReadFileNoSymlink(path)
 	if err != nil {
 		return nil, err
 	}
@@ -984,19 +1187,79 @@ func canonicalOCIArgs(args []OCISyscallArg) ([]OCISyscallArg, string) {
 	return canon, string(raw)
 }
 
+func isHardDenyAction(action string) bool {
+	switch strings.TrimSpace(action) {
+	case "SCMP_ACT_KILL", "SCMP_ACT_KILL_THREAD", "SCMP_ACT_KILL_PROCESS", "SCMP_ACT_TRAP":
+		return true
+	default:
+		return false
+	}
+}
+
+func uncondRulePriority(action string, errnoRet *uint32, fromCurr bool) int {
+	base := 0
+	switch strings.TrimSpace(action) {
+	case "SCMP_ACT_KILL_PROCESS":
+		base = 700
+	case "SCMP_ACT_KILL_THREAD":
+		base = 600
+	case "SCMP_ACT_KILL":
+		base = 500
+	case "SCMP_ACT_TRAP":
+		base = 400
+	case "SCMP_ACT_ERRNO":
+		base = 300
+	case "SCMP_ACT_TRACE":
+		base = 200
+	case "SCMP_ACT_NOTIFY":
+		base = 100
+	case "SCMP_ACT_LOG":
+		base = 50
+	}
+	if errnoRet != nil {
+		base += 10
+	}
+	if fromCurr {
+		base++
+	}
+	return base
+}
+
 func MergeCommittedIntoOCI(curr *OCISeccompProfile, committed *OCISeccompProfile) {
 	if curr == nil || committed == nil {
 		return
 	}
-	allowSet := make(map[string]bool)
-	allRules := make([]OCISyscallRule, 0, len(curr.Syscalls)+len(committed.Syscalls))
-	allRules = append(allRules, curr.Syscalls...)
-	allRules = append(allRules, committed.Syscalls...)
-
-	for _, r := range allRules {
+	committedUncondAllow := make(map[string]bool)
+	committedProtected := make(map[string]bool)
+	for _, r := range committed.Syscalls {
+		if r.Action == "" {
+			continue
+		}
 		if len(r.Args) == 0 && r.ErrnoRet == nil && r.Action == "SCMP_ACT_ALLOW" {
 			for _, n := range r.Names {
 				if n != "" {
+					committedUncondAllow[n] = true
+				}
+			}
+			continue
+		}
+		if len(r.Args) > 0 || isHardDenyAction(r.Action) {
+			for _, n := range r.Names {
+				if n != "" {
+					committedProtected[n] = true
+				}
+			}
+		}
+	}
+
+	allowSet := make(map[string]bool)
+	for n := range committedUncondAllow {
+		allowSet[n] = true
+	}
+	for _, r := range curr.Syscalls {
+		if len(r.Args) == 0 && r.ErrnoRet == nil && r.Action == "SCMP_ACT_ALLOW" {
+			for _, n := range r.Names {
+				if n != "" && !committedProtected[n] {
 					allowSet[n] = true
 				}
 			}
@@ -1009,45 +1272,113 @@ func MergeCommittedIntoOCI(curr *OCISeccompProfile, committed *OCISeccompProfile
 		args     []OCISyscallArg
 		nameSet  map[string]bool
 	}
-	var extraOrder []string
-	extraByKey := make(map[string]*extraRuleBucket)
+	var condOrder []string
+	condByKey := make(map[string]*extraRuleBucket)
 
-	for _, r := range allRules {
-		if r.Action == "" || (len(r.Args) == 0 && r.ErrnoRet == nil && r.Action == "SCMP_ACT_ALLOW") {
-			continue
-		}
-		var kept []string
-		for _, n := range r.Names {
-			if n != "" && !allowSet[n] {
-				kept = append(kept, n)
+	type uncondChoice struct {
+		action   string
+		errnoRet *uint32
+		prio     int
+	}
+	uncondBest := make(map[string]uncondChoice)
+
+	processRules := func(rules []OCISyscallRule, fromCurr bool) {
+		for _, r := range rules {
+			if r.Action == "" || (len(r.Args) == 0 && r.ErrnoRet == nil && r.Action == "SCMP_ACT_ALLOW") {
+				continue
+			}
+			if len(r.Args) > 0 {
+				var kept []string
+				for _, n := range r.Names {
+					if n != "" && !allowSet[n] {
+						kept = append(kept, n)
+					}
+				}
+				if len(kept) == 0 {
+					continue
+				}
+				canonArgs, argsKey := canonicalOCIArgs(r.Args)
+				errnoKey := ""
+				var errnoCopy *uint32
+				if r.ErrnoRet != nil {
+					v := *r.ErrnoRet
+					errnoCopy = &v
+					errnoKey = strconv.FormatUint(uint64(v), 10)
+				}
+				key := r.Action + "|" + errnoKey + "|" + argsKey
+				bucket, ok := condByKey[key]
+				if !ok {
+					bucket = &extraRuleBucket{
+						action:   r.Action,
+						errnoRet: errnoCopy,
+						args:     canonArgs,
+						nameSet:  make(map[string]bool),
+					}
+					condByKey[key] = bucket
+					condOrder = append(condOrder, key)
+				}
+				for _, n := range kept {
+					bucket.nameSet[n] = true
+				}
+				continue
+			}
+			// Unconditional non-ALLOW rule: deduplicate per syscall by priority so
+			// conflicting actions/errnos never emit duplicate rules for libseccomp (-EEXIST).
+			prio := uncondRulePriority(r.Action, r.ErrnoRet, fromCurr)
+			var errnoCopy *uint32
+			if r.ErrnoRet != nil {
+				v := *r.ErrnoRet
+				errnoCopy = &v
+			}
+			for _, n := range r.Names {
+				if n == "" || allowSet[n] {
+					continue
+				}
+				prev, exists := uncondBest[n]
+				if !exists || prio > prev.prio {
+					uncondBest[n] = uncondChoice{
+						action:   r.Action,
+						errnoRet: errnoCopy,
+						prio:     prio,
+					}
+				}
 			}
 		}
-		if len(kept) == 0 {
-			continue
-		}
-		canonArgs, argsKey := canonicalOCIArgs(r.Args)
+	}
+
+	processRules(curr.Syscalls, true)
+	processRules(committed.Syscalls, false)
+
+	var uncondOrder []string
+	uncondBuckets := make(map[string]*extraRuleBucket)
+	var uncondNames []string
+	for n := range uncondBest {
+		uncondNames = append(uncondNames, n)
+	}
+	sort.Strings(uncondNames)
+	for _, n := range uncondNames {
+		c := uncondBest[n]
 		errnoKey := ""
-		var errnoCopy *uint32
-		if r.ErrnoRet != nil {
-			v := *r.ErrnoRet
-			errnoCopy = &v
-			errnoKey = strconv.FormatUint(uint64(v), 10)
+		if c.errnoRet != nil {
+			errnoKey = strconv.FormatUint(uint64(*c.errnoRet), 10)
 		}
-		key := r.Action + "|" + errnoKey + "|" + argsKey
-		bucket, ok := extraByKey[key]
+		key := c.action + "|" + errnoKey
+		b, ok := uncondBuckets[key]
 		if !ok {
-			bucket = &extraRuleBucket{
-				action:   r.Action,
+			var errnoCopy *uint32
+			if c.errnoRet != nil {
+				v := *c.errnoRet
+				errnoCopy = &v
+			}
+			b = &extraRuleBucket{
+				action:   c.action,
 				errnoRet: errnoCopy,
-				args:     canonArgs,
 				nameSet:  make(map[string]bool),
 			}
-			extraByKey[key] = bucket
-			extraOrder = append(extraOrder, key)
+			uncondBuckets[key] = b
+			uncondOrder = append(uncondOrder, key)
 		}
-		for _, n := range kept {
-			bucket.nameSet[n] = true
-		}
+		b.nameSet[n] = true
 	}
 
 	var names []string
@@ -1056,12 +1387,12 @@ func MergeCommittedIntoOCI(curr *OCISeccompProfile, committed *OCISeccompProfile
 	}
 	sort.Strings(names)
 
-	merged := make([]OCISyscallRule, 0, 1+len(extraOrder))
+	merged := make([]OCISyscallRule, 0, 1+len(condOrder)+len(uncondOrder))
 	if len(names) > 0 {
 		merged = append(merged, OCISyscallRule{Names: names, Action: "SCMP_ACT_ALLOW"})
 	}
-	for _, key := range extraOrder {
-		bucket := extraByKey[key]
+	for _, key := range condOrder {
+		bucket := condByKey[key]
 		extraNames := make([]string, 0, len(bucket.nameSet))
 		for n := range bucket.nameSet {
 			extraNames = append(extraNames, n)
@@ -1075,14 +1406,32 @@ func MergeCommittedIntoOCI(curr *OCISeccompProfile, committed *OCISeccompProfile
 			v := *bucket.errnoRet
 			errnoCopy = &v
 		}
-		var argsCopy []OCISyscallArg
-		if len(bucket.args) > 0 {
-			argsCopy = append([]OCISyscallArg(nil), bucket.args...)
-		}
+		argsCopy := append([]OCISyscallArg(nil), bucket.args...)
 		merged = append(merged, OCISyscallRule{
 			Names:    extraNames,
 			Action:   bucket.action,
 			Args:     argsCopy,
+			ErrnoRet: errnoCopy,
+		})
+	}
+	for _, key := range uncondOrder {
+		bucket := uncondBuckets[key]
+		extraNames := make([]string, 0, len(bucket.nameSet))
+		for n := range bucket.nameSet {
+			extraNames = append(extraNames, n)
+		}
+		sort.Strings(extraNames)
+		if len(extraNames) == 0 {
+			continue
+		}
+		var errnoCopy *uint32
+		if bucket.errnoRet != nil {
+			v := *bucket.errnoRet
+			errnoCopy = &v
+		}
+		merged = append(merged, OCISyscallRule{
+			Names:    extraNames,
+			Action:   bucket.action,
 			ErrnoRet: errnoCopy,
 		})
 	}

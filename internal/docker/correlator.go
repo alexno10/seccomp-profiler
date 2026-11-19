@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -443,7 +444,9 @@ func StreamDockerEvents(ctx context.Context, onEvent func(DockerEvent)) error {
 
 func streamDockerEventsSince(ctx context.Context, sinceTime time.Time, onEvent func(DockerEvent)) error {
 	since := fmt.Sprintf("%d", sinceTime.Unix())
-	cmd := exec.CommandContext(ctx, "docker", "events", "--since", since, "--filter", "type=container", "--format", "{{json .}}")
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
+	cmd := exec.CommandContext(streamCtx, "docker", "events", "--since", since, "--filter", "type=container", "--format", "{{json .}}")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -453,7 +456,7 @@ func streamDockerEventsSince(ctx context.Context, sinceTime time.Time, onEvent f
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	return readDockerEventStream(ctx, stdout, onEvent, func() error {
+	return readDockerEventStreamWithCancel(ctx, stdout, onEvent, streamCancel, func() error {
 		err := cmd.Wait()
 		if err != nil && stderr.String() != "" {
 			return fmt.Errorf("%w: %s", err, stderr.String())
@@ -463,15 +466,66 @@ func streamDockerEventsSince(ctx context.Context, sinceTime time.Time, onEvent f
 }
 
 func readDockerEventStream(ctx context.Context, r io.Reader, onEvent func(DockerEvent), waitFn func() error) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	for sc.Scan() {
-		ev, err := ParseDockerEventJSON(sc.Bytes())
-		if err == nil && ev.ID != "" && onEvent != nil {
-			onEvent(ev)
+	return readDockerEventStreamWithCancel(ctx, r, onEvent, nil, waitFn)
+}
+
+func readLineBounded(br *bufio.Reader, maxLineBytes int) ([]byte, error) {
+	frag, err := br.ReadSlice('\n')
+	if err == nil {
+		return bytes.TrimRight(frag, "\r\n"), nil
+	}
+	if !errors.Is(err, bufio.ErrBufferFull) {
+		return bytes.TrimRight(frag, "\r\n"), err
+	}
+	var buf []byte
+	buf = append(buf, frag...)
+	oversized := len(buf) > maxLineBytes
+	for errors.Is(err, bufio.ErrBufferFull) {
+		frag, err = br.ReadSlice('\n')
+		if !oversized {
+			if len(buf)+len(frag) > maxLineBytes {
+				oversized = true
+				buf = nil
+			} else {
+				buf = append(buf, frag...)
+			}
 		}
 	}
-	scanErr := sc.Err()
+	if oversized {
+		// Skip oversized event line cleanly rather than wedging or killing the stream.
+		return nil, err
+	}
+	return bytes.TrimRight(buf, "\r\n"), err
+}
+
+func readDockerEventStreamWithCancel(
+	ctx context.Context,
+	r io.Reader,
+	onEvent func(DockerEvent),
+	cancelFn func(),
+	waitFn func() error,
+) error {
+	const maxLineBytes = 1024 * 1024
+	br := bufio.NewReaderSize(r, 64*1024)
+	var readErr error
+	for {
+		line, err := readLineBounded(br, maxLineBytes)
+		if len(line) > 0 {
+			ev, pErr := ParseDockerEventJSON(line)
+			if pErr == nil && ev.ID != "" && onEvent != nil {
+				onEvent(ev)
+			}
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				readErr = err
+			}
+			break
+		}
+	}
+	if cancelFn != nil {
+		cancelFn()
+	}
 	var waitErr error
 	if waitFn != nil {
 		waitErr = waitFn()
@@ -479,8 +533,8 @@ func readDockerEventStream(ctx context.Context, r io.Reader, onEvent func(Docker
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if scanErr != nil {
-		return fmt.Errorf("read docker events stream: %w", scanErr)
+	if readErr != nil {
+		return fmt.Errorf("read docker events stream: %w", readErr)
 	}
 	if waitErr != nil {
 		return fmt.Errorf("docker events exited: %w", waitErr)
