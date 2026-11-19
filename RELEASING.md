@@ -25,8 +25,8 @@ After the release is published:
 
 1. `sha256sum dist/seccomp-profiler-linux-amd64 dist/seccomp-profiler-linux-arm64` (same values as the release's `checksums.txt`).
 2. Update `PINNED_RELEASE_VERSION` and both `PINNED_BINARY_SHA256` entries in `action/lib.js`.
-3. Update the matching version and SHA-256 assertions in `action/action.test.js` and the `/opt/seccomp-profiler/vX.Y.Z/` binary cache path assertions in `.github/workflows/ci.yml`.
+3. Update the matching version and SHA-256 assertions in `action/action.test.js` and the `/usr/lib/seccomp-profiler/vX.Y.Z/` binary cache path assertions in `.github/workflows/ci.yml`.
 4. Commit the updated pins to `main`, create the corresponding action tag (or re-tag if no consumers exist yet, e.g. `vX.Y.Z+1` patch release when needed) so tag refs never point at outdated `PINNED_RELEASE_VERSION` digests, and update the pinned `@<sha> # vX.Y.Z` references in `README.md` to match.
 5. Commit and push to `main`. Users who pin by commit SHA keep getting the exact binary they pinned; users tracking `main` get the new one.
 
-Until step 2 is done, CI in this repo still exercises freshly built binaries (`SECCOMP_PROFILER_BIN=/usr/local/bin/seccomp-profiler` in `ci.yml`), so the pin refresh is not on the critical path of testing the first job (`test-and-ebpf-integration`).
+Until step 2 is done, CI in this repo still exercises freshly built binaries (`SECCOMP_PROFILER_BIN=/usr/lib/seccomp-profiler/seccomp-profiler` in `ci.yml`), so the pin refresh is not on the critical path of testing the first job (`test-and-ebpf-integration`).

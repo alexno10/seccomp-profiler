@@ -283,9 +283,16 @@ test("installBinaryAtomically creates root cache dir, installs staging file, and
   const fakeExec = (cmd, args, opts) => {
     calls.push({ cmd, args, env: opts && opts.env });
   };
-  lib.installBinaryAtomically("/tmp/dl/bin", "/opt/seccomp-profiler/v1.2.0", "/opt/seccomp-profiler/v1.2.0/seccomp-profiler", fakeExec);
+  lib.installBinaryAtomically(
+    "/tmp/dl/bin",
+    "/usr/lib/seccomp-profiler/v1.2.0",
+    "/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler",
+    fakeExec
+  );
   assert.equal(calls.length, 3);
   assert.deepEqual(calls[0].args.slice(0, 2), ["install", "-d"]);
+  assert.equal(calls[0].args.includes("/usr/lib/seccomp-profiler"), true);
+  assert.equal(calls[0].args.includes("/usr/lib/seccomp-profiler/v1.2.0"), true);
   assert.equal(calls[1].args[0], "install");
   assert.equal(calls[2].args[0], "mv");
   assert.equal(calls[2].args.includes("-f"), true);
@@ -457,6 +464,8 @@ test("daemonArgs enforces baselineDir containment and rejects traversal or exter
 
 test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writable dirs on POSIX", () => {
   const lib = require("./lib.js");
+  assert.equal(lib.BIN_CACHE_BASE_DIR, "/usr/lib/seccomp-profiler");
+  assert.equal(lib.BIN_CACHE_DIR.startsWith("/usr/lib/seccomp-profiler/"), true);
   const makeStat = ({ uid = 0, mode = 0o100755, isFile = true, isSymlink = false }) => ({
     uid,
     mode,
@@ -465,7 +474,7 @@ test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writab
   });
 
   // Strict root chain passes.
-  lib.assertRootOwnedFile("/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+  lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
     platform: "linux",
     lstatSync: (p) =>
       p.endsWith("seccomp-profiler") && p.includes("v1.2.0/")
@@ -476,10 +485,10 @@ test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writab
   // Group-writable parent directory rejected.
   assert.throws(
     () =>
-      lib.assertRootOwnedFile("/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
         platform: "linux",
         lstatSync: (p) =>
-          p === "/opt/seccomp-profiler"
+          p === "/usr/lib/seccomp-profiler"
             ? makeStat({ uid: 0, mode: 0o040775, isFile: false })
             : makeStat({ uid: 0, mode: 0o100755 }),
       }),
@@ -489,7 +498,7 @@ test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writab
   // Non-root owner rejected.
   assert.throws(
     () =>
-      lib.assertRootOwnedFile("/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
         platform: "linux",
         lstatSync: (p) =>
           p.includes("v1.2.0/") ? makeStat({ uid: 1001, mode: 0o100755 }) : makeStat({ uid: 0, mode: 0o040755 }),
@@ -500,10 +509,10 @@ test("assertRootOwnedFile rejects symlinks, non-root uid, and group/world-writab
   // Symlink parent rejected.
   assert.throws(
     () =>
-      lib.assertRootOwnedFile("/opt/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
+      lib.assertRootOwnedFile("/usr/lib/seccomp-profiler/v1.2.0/seccomp-profiler", "bin", {
         platform: "linux",
         lstatSync: (p) =>
-          p === "/opt" ? makeStat({ uid: 0, mode: 0o120777, isSymlink: true, isFile: false }) : makeStat({ uid: 0, mode: 0o100755 }),
+          p === "/usr/lib" ? makeStat({ uid: 0, mode: 0o120777, isSymlink: true, isFile: false }) : makeStat({ uid: 0, mode: 0o100755 }),
       }),
     /symlink/
   );

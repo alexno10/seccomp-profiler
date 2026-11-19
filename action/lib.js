@@ -21,9 +21,10 @@ const PINNED_RELEASE_REPO = "alexno10/seccomp-profiler";
 const PINNED_RELEASE_VERSION = "v1.2.0";
 
 // Versioned cache location: a new pinned release automatically uses a new
-// cache path, and any file found there is verified against the pinned digest
-// before it is executed (never trust a cached binary blindly).
-const BIN_CACHE_DIR = `/opt/seccomp-profiler/${PINNED_RELEASE_VERSION}`;
+// cache path under /usr/lib/seccomp-profiler (0755 root:root), and any file
+// found there is verified against the pinned digest before execution.
+const BIN_CACHE_BASE_DIR = "/usr/lib/seccomp-profiler";
+const BIN_CACHE_DIR = `${BIN_CACHE_BASE_DIR}/${PINNED_RELEASE_VERSION}`;
 const BIN_CACHE_PATH = `${BIN_CACHE_DIR}/seccomp-profiler`;
 
 const COSIGN_VERSION = "v2.4.1";
@@ -345,7 +346,9 @@ function installBinaryAtomically(
 ) {
   const sudo = sudoBin();
   const env = buildDaemonEnv();
-  execFn(sudo, ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", destDir], { stdio: "inherit", env });
+  const parentDir = path.posix.dirname(destDir);
+  const mkdirDirs = parentDir === BIN_CACHE_BASE_DIR ? [BIN_CACHE_BASE_DIR, destDir] : [destDir];
+  execFn(sudo, ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", ...mkdirDirs], { stdio: "inherit", env });
   const stagePath = `${destPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
   try {
     execFn(sudo, ["install", "-o", "root", "-g", "root", "-m", "0755", srcPath, stagePath], { stdio: "inherit", env });
@@ -743,6 +746,7 @@ module.exports = {
   BASELINE_DIR_PREFIX,
   SOCKET_PATH,
   STOPPED_MARKER,
+  BIN_CACHE_BASE_DIR,
   BIN_CACHE_DIR,
   BIN_CACHE_PATH,
   SAFE_SYSTEM_PATH,

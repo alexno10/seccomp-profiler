@@ -167,7 +167,7 @@ Unapproved syscalls that violate `fail-on` (`high-risk` or `any-new`) fail the C
 2. **Commit-Locked Version & Binary Digests:**
    - Every Action commit pins `PINNED_RELEASE_REPO`, `PINNED_RELEASE_VERSION`, and `PINNED_BINARY_SHA256` (`amd64` and `arm64`) in `action/lib.js`. Pinning `uses: alexno10/seccomp-profiler@<commit-sha>` guarantees immutable binary execution. Releases are cut only from tag pushes; published release assets are never overwritten.
 3. **Verified Binary Cache:**
-   - Binaries cache under `/opt/seccomp-profiler/<version>/`. A cached binary is re-verified against the commit-locked SHA-256 on every run and re-downloaded on mismatch. `SECCOMP_PROFILER_BIN` provides an explicit trusted override (used by this repo's CI to exercise freshly built binaries).
+   - Binaries cache under `/usr/lib/seccomp-profiler/<version>/`. A cached binary is re-verified against the commit-locked SHA-256 on every run and re-downloaded on mismatch. `SECCOMP_PROFILER_BIN` provides an explicit trusted override (used by this repo's CI to exercise freshly built binaries).
 4. **Pinned Cosign Bootstrap:**
    - `ensureCosign` downloads `cosign` `v2.4.1` and verifies its SHA-256 against the hardcoded `COSIGN_SHA256` table before marking it executable.
 5. **Anchored Keyless OIDC Verification of `checksums.txt` and Binaries:**
